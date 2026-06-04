@@ -21,6 +21,8 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
+from dataclasses import dataclass
 
 # Backend registration (side-effect imports)
 import tokenspeed_kernel.ops.attention.cuda  # noqa: F401
@@ -44,8 +46,10 @@ def _attention_format_signature(**roles: torch.Tensor):
 
 
 __all__ = [
+    "MLAPrefixChunk",
     "mha_prefill",
     "mla_prefill",
+    "mla_chunked_prefill",
     "mha_extend_with_kvcache",
     "mha_decode_with_kvcache",
     "mla_decode_with_kvcache",
@@ -54,6 +58,17 @@ __all__ = [
 ]
 
 LSE_LN = math.log2(math.e)
+
+
+@dataclass(frozen=True)
+class MLAPrefixChunk:
+    """Existing chunked-prefill metadata for one prefix replay pass."""
+
+    k: torch.Tensor
+    v: torch.Tensor
+    seq_lens: torch.Tensor
+    cum_seq_lens: torch.Tensor
+    max_seq_len: int
 
 
 def mha_prefill(
@@ -263,6 +278,81 @@ def mla_prefill(
             max_seq_len_q=max_seq_len_q,
             out=out,
         )
+
+
+def mla_chunked_prefill(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    seq_lens: torch.Tensor,
+    cum_seq_lens: torch.Tensor,
+    max_seq_len: int,
+    batch_size: int,
+    softmax_scale: float,
+    *,
+    prefix_chunks: Sequence[MLAPrefixChunk],
+    return_lse: bool = False,
+    out: torch.Tensor | None = None,
+    override: str | None = None,
+    solution: str | None = None,
+) -> AttentionResult:
+    """Compose chunked MLA prefill from the same ragged MLA prefill contract.
+
+    ``q/k/v`` are the current chunk rows. ``prefix_chunks`` are existing
+    scheduler/backend-owned prefix metadata; this function consumes those
+    arrays directly and does not reconstruct page or scheduler state.
+    """
+    local_result = mla_prefill(
+        q,
+        k,
+        v,
+        seq_lens,
+        cum_seq_lens,
+        max_seq_len,
+        batch_size,
+        softmax_scale,
+        is_causal=True,
+        return_lse=True,
+        out=out,
+        override=override,
+        solution=solution,
+    )
+    accum_out, accum_lse = local_result
+
+    for prefix_chunk in prefix_chunks:
+        if prefix_chunk.seq_lens.shape[0] != batch_size:
+            raise ValueError(
+                "prefix chunk seq_lens must have batch_size entries, got "
+                f"{prefix_chunk.seq_lens.shape[0]}"
+            )
+        prefix_result = mla_prefill(
+            q,
+            prefix_chunk.k,
+            prefix_chunk.v,
+            prefix_chunk.seq_lens,
+            prefix_chunk.cum_seq_lens,
+            prefix_chunk.max_seq_len,
+            batch_size,
+            softmax_scale,
+            is_causal=False,
+            return_lse=True,
+            cum_seq_lens_q=cum_seq_lens,
+            max_seq_len_q=max_seq_len,
+            override=override,
+            solution=solution,
+        )
+        prefix_out, prefix_lse = prefix_result
+        accum_out, accum_lse = mha_merge_state(
+            accum_out.contiguous(),
+            accum_lse.contiguous(),
+            prefix_out.contiguous(),
+            prefix_lse.contiguous(),
+            lse_scale_log2=1.0,
+        )
+
+    if return_lse:
+        return accum_out, accum_lse
+    return accum_out
 
 
 def mha_extend_with_kvcache(
