@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Local FP8 MoE expert GEMM Gluon kernel for AMD GFX950."""
+"""Local sorted-dispatch MoE expert GEMM Gluon kernels for AMD GFX950."""
 
 from __future__ import annotations
 
@@ -34,6 +34,90 @@ from tokenspeed_kernel.signature import format_signatures
 _EXPERT_SIGNATURES = format_signatures(
     "x", "dense", {torch.float16, torch.bfloat16}
 )
+
+
+@gluon.jit
+def _dense_sorted_expert_gemm_kernel(
+    A_ptr,
+    B_ptr,
+    C_ptr,
+    topk_weights_ptr,
+    sorted_token_ids_ptr,
+    expert_ids_ptr,
+    num_tokens_post_padded_ptr,
+    A_STRIDE_M: gl.constexpr,
+    A_STRIDE_K: gl.constexpr,
+    B_STRIDE_E: gl.constexpr,
+    B_STRIDE_N: gl.constexpr,
+    B_STRIDE_K: gl.constexpr,
+    C_STRIDE_M: gl.constexpr,
+    C_STRIDE_N: gl.constexpr,
+    NUM_VALID_SLOTS: gl.constexpr,
+    INPUT_K: gl.constexpr,
+    OUTPUT_N: gl.constexpr,
+    TOP_K: gl.constexpr,
+    BLOCK_SIZE_M: gl.constexpr,
+    BLOCK_K: gl.constexpr,
+    BLOCK_K_ELEMS_PER_THREAD: gl.constexpr,
+    MUL_ROUTED_WEIGHT: gl.constexpr,
+    C_SORTED: gl.constexpr,
+):
+    sorted_row = gl.program_id(0)
+    out_n = gl.program_id(1)
+    num_tokens_post_padded = gl.load(num_tokens_post_padded_ptr).to(gl.int32)
+    row_active = sorted_row < num_tokens_post_padded
+
+    sorted_slot = gl.load(
+        sorted_token_ids_ptr + sorted_row,
+        mask=row_active,
+        other=NUM_VALID_SLOTS,
+    ).to(gl.int32)
+    slot_valid = sorted_slot < NUM_VALID_SLOTS
+    expert_id = gl.load(
+        expert_ids_ptr + sorted_row // BLOCK_SIZE_M,
+        mask=row_active,
+        other=-1,
+    ).to(gl.int32)
+    expert_valid = expert_id >= 0
+    source_row = sorted_slot // TOP_K
+
+    layout: gl.constexpr = gl.BlockedLayout(
+        [BLOCK_K_ELEMS_PER_THREAD], [64], [1], [0]
+    )
+    offs_k = gl.arange(0, BLOCK_K, layout=layout)
+    k_valid = offs_k < INPUT_K
+    load_valid = row_active & slot_valid & expert_valid & k_valid
+    a = gl.load(
+        A_ptr + source_row * A_STRIDE_M + offs_k * A_STRIDE_K,
+        mask=load_valid,
+        other=0.0,
+    ).to(gl.float32)
+    weight = gl.load(
+        B_ptr + expert_id * B_STRIDE_E + out_n * B_STRIDE_N + offs_k * B_STRIDE_K,
+        mask=load_valid,
+        other=0.0,
+    ).to(gl.float32)
+    acc = gl.sum(a * weight, axis=0)
+
+    if MUL_ROUTED_WEIGHT:
+        routed_weight = gl.load(
+            topk_weights_ptr + sorted_slot,
+            mask=row_active & slot_valid,
+            other=0.0,
+        ).to(gl.float32)
+        acc *= routed_weight
+
+    if C_SORTED:
+        c_row = sorted_row
+        store_valid = row_active
+    else:
+        c_row = sorted_slot
+        store_valid = row_active & slot_valid
+    gl.store(
+        C_ptr + c_row * C_STRIDE_M + out_n * C_STRIDE_N,
+        acc.to(C_ptr.dtype.element_ty),
+        mask=store_valid,
+    )
 
 
 @gluon.jit
@@ -231,6 +315,65 @@ def gluon_fp8_local_experts_gfx950(
     c_sorted: bool = False,
     filter_expert: bool = True,
 ) -> None:
+    if (
+        not use_fp8_w8a8
+        and not use_int8_w8a16
+        and not use_int4_w4a16
+        and not per_channel_quant
+        and A_scale is None
+        and B_scale is None
+        and block_shape is None
+        and bias is None
+        and not a_use_tma
+        and not b_use_tma
+        and filter_expert
+        and B.ndim == 3
+    ):
+        if A.ndim != 2:
+            raise ValueError(f"A must be rank-2, got shape {tuple(A.shape)}")
+        if C.shape[-1] != B.shape[1]:
+            raise ValueError(
+                f"C output dim {C.shape[-1]} does not match B N {B.shape[1]}"
+            )
+        if B.shape[2] != A.shape[1]:
+            raise ValueError(f"B K {B.shape[2]} does not match A K {A.shape[1]}")
+        if topk_weights.numel() != topk_ids.numel():
+            raise ValueError("topk_weights and topk_ids must have matching element counts")
+
+        output_n = B.shape[1]
+        input_k = B.shape[2]
+        if sorted_token_ids.numel() == 0 or output_n == 0:
+            return
+        block_k = max(64, 1 << (input_k - 1).bit_length())
+        grid = (sorted_token_ids.shape[0], output_n)
+        _dense_sorted_expert_gemm_kernel[grid](
+            A,
+            B,
+            C,
+            topk_weights,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            A.stride(0),
+            A.stride(1),
+            B.stride(0),
+            B.stride(1),
+            B.stride(2),
+            C.stride(-2),
+            C.stride(-1),
+            topk_ids.numel(),
+            input_k,
+            output_n,
+            top_k,
+            config["BLOCK_SIZE_M"],
+            block_k,
+            block_k // 64,
+            mul_routed_weight,
+            c_sorted,
+            num_warps=1,
+        )
+        return
+
     if (
         not use_fp8_w8a8
         or use_int8_w8a16

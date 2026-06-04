@@ -145,7 +145,7 @@ def _reference_slots(
         if expert < 0 or expert >= weight.shape[0]:
             continue
         source_row = slot // top_k
-        out[slot] = A[source_row].float() @ weight[expert].T
+        out[slot] = A[source_row].float() @ weight[expert].float().T
         if mul_routed_weight:
             out[slot] *= flat_weights[slot].float()
 
@@ -193,6 +193,191 @@ def _call_experts(
         features={"dispatch_sorted"},
         expected_kernel_name="gluon_fp8_local_experts_gfx950",
     )
+
+
+def _call_bf16_experts(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    C: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    sorted_token_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor,
+    *,
+    block_size: int,
+    top_k: int,
+    mul_routed_weight: bool,
+) -> None:
+    tokenspeed_kernel.moe_experts(
+        A,
+        B,
+        None,
+        C,
+        None,
+        None,
+        topk_weights,
+        topk_ids,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        mul_routed_weight,
+        top_k,
+        _expert_config(block_size, (16, 16)),
+        tl.bfloat16,
+        False,
+        False,
+        False,
+        False,
+        block_shape=None,
+        dtype=A.dtype,
+        features={"dispatch_sorted"},
+        expected_kernel_name="gluon_fp8_local_experts_gfx950",
+    )
+
+
+def test_gluon_bf16_experts_gate_up_matches_dense_reference(device: str) -> None:
+    _require_cdna4_gpu()
+    torch.manual_seed(7201)
+    num_tokens = 8
+    top_k = 2
+    num_experts = 4
+    hidden = 32
+    intermediate_tp = 24
+    block_size = 16
+    topk_ids = torch.tensor(
+        [
+            [0, 1],
+            [1, 3],
+            [3, 0],
+            [0, 3],
+            [1, 0],
+            [3, 1],
+            [0, 1],
+            [1, 3],
+        ],
+        device=device,
+        dtype=torch.int32,
+    )
+    topk_weights = torch.linspace(
+        0.25,
+        1.0,
+        steps=num_tokens * top_k,
+        device=device,
+        dtype=torch.float32,
+    ).view(num_tokens, top_k)
+    A = (torch.randn(num_tokens, hidden, device=device) * 0.25).bfloat16()
+    B = (
+        torch.randn(num_experts, 2 * intermediate_tp, hidden, device=device) * 0.20
+    ).bfloat16()
+    C = torch.zeros((num_tokens * top_k, 2 * intermediate_tp), device=device).bfloat16()
+
+    sorted_ids, expert_ids, num_post = _dispatch_metadata(
+        topk_ids,
+        block_size=block_size,
+        num_experts=num_experts,
+    )
+    _call_bf16_experts(
+        A,
+        B,
+        C,
+        topk_weights,
+        topk_ids,
+        sorted_ids,
+        expert_ids,
+        num_post,
+        block_size=block_size,
+        top_k=top_k,
+        mul_routed_weight=False,
+    )
+    torch.cuda.synchronize()
+
+    expected = _reference_slots(
+        A,
+        B,
+        topk_ids,
+        topk_weights,
+        top_k=top_k,
+        mul_routed_weight=False,
+    )
+    assert not topk_ids.eq(2).any()
+    assert_finite_close(C, expected, atol=4e-2, rtol=4e-2)
+
+
+def test_gluon_bf16_experts_down_matches_dense_reference_with_routed_weights(
+    device: str,
+) -> None:
+    _require_cdna4_gpu()
+    torch.manual_seed(7202)
+    num_tokens = 6
+    top_k = 2
+    num_experts = 4
+    intermediate_tp = 24
+    hidden_tp = 32
+    block_size = 16
+    topk_ids = torch.tensor(
+        [
+            [0, 1],
+            [2, -1],
+            [3, 0],
+            [4, 1],
+            [1, 0],
+            [3, 2],
+        ],
+        device=device,
+        dtype=torch.int32,
+    )
+    topk_weights = torch.linspace(
+        0.15,
+        0.90,
+        steps=num_tokens * top_k,
+        device=device,
+        dtype=torch.float32,
+    ).view(num_tokens, top_k)
+    A = (
+        torch.randn(num_tokens * top_k, intermediate_tp, device=device) * 0.20
+    ).bfloat16()
+    B = (
+        torch.randn(num_experts, hidden_tp, intermediate_tp, device=device) * 0.18
+    ).bfloat16()
+    C = torch.full(
+        (num_tokens, top_k, hidden_tp),
+        9.0,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+
+    sorted_ids, expert_ids, num_post = _dispatch_metadata(
+        topk_ids,
+        block_size=block_size,
+        num_experts=num_experts,
+    )
+    _call_bf16_experts(
+        A,
+        B,
+        C,
+        topk_weights,
+        topk_ids,
+        sorted_ids,
+        expert_ids,
+        num_post,
+        block_size=block_size,
+        top_k=1,
+        mul_routed_weight=True,
+    )
+    torch.cuda.synchronize()
+
+    expected = _reference_slots(
+        A,
+        B,
+        topk_ids,
+        topk_weights,
+        top_k=1,
+        mul_routed_weight=True,
+    )
+    assert bool(topk_ids.eq(-1).any().item())
+    assert bool(topk_ids.ge(num_experts).any().item())
+    assert_finite_close(C.view(-1, hidden_tp), expected, atol=3e-2, rtol=4e-2)
 
 
 def test_gluon_fp8_experts_gate_up_matches_reference_with_empty_expert(
