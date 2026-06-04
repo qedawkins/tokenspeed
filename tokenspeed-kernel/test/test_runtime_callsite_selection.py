@@ -46,6 +46,7 @@ import tokenspeed_kernel.ops.moe.flashinfer
 import tokenspeed_kernel.ops.moe.gluon
 import tokenspeed_kernel.ops.moe.gluon.combine_gfx950
 import tokenspeed_kernel.ops.moe.gluon.dispatch_gfx950
+import tokenspeed_kernel.ops.moe.gluon.ep_metadata_gfx950
 import tokenspeed_kernel.ops.moe.gluon.experts_fp8_gfx950
 import tokenspeed_kernel.ops.moe.gluon.route_topk_gfx950
 import tokenspeed_kernel.ops.moe.triton
@@ -72,6 +73,7 @@ _RELOAD_MODULES = [
     tokenspeed_kernel.ops.moe.deepep,
     tokenspeed_kernel.ops.moe.gluon.route_topk_gfx950,
     tokenspeed_kernel.ops.moe.gluon.dispatch_gfx950,
+    tokenspeed_kernel.ops.moe.gluon.ep_metadata_gfx950,
     tokenspeed_kernel.ops.moe.gluon.experts_fp8_gfx950,
     tokenspeed_kernel.ops.moe.gluon.combine_gfx950,
     tokenspeed_kernel.ops.moe.gluon,

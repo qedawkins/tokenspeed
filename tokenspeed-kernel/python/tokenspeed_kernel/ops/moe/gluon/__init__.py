@@ -26,6 +26,10 @@ from tokenspeed_kernel.ops.moe.gluon.combine_gfx950 import (  # noqa: F401
 from tokenspeed_kernel.ops.moe.gluon.dispatch_gfx950 import (  # noqa: F401
     gluon_local_dispatch_gfx950,
 )
+from tokenspeed_kernel.ops.moe.gluon.ep_metadata_gfx950 import (  # noqa: F401
+    EPDispatchMetadata,
+    gluon_ep_metadata_gfx950,
+)
 from tokenspeed_kernel.ops.moe.gluon.experts_fp8_gfx950 import (  # noqa: F401
     gluon_fp8_local_experts_gfx950,
 )
@@ -34,6 +38,8 @@ from tokenspeed_kernel.ops.moe.gluon.route_topk_gfx950 import (  # noqa: F401
 )
 
 __all__ = [
+    "EPDispatchMetadata",
+    "gluon_ep_metadata_gfx950",
     "gluon_fp8_local_experts_gfx950",
     "gluon_grouped_biased_topk_gfx950",
     "gluon_local_sum_reduce_gfx950",
