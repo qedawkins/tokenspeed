@@ -28,7 +28,10 @@ import pytest
 import torch
 import torch.distributed as dist
 
-from tokenspeed.runtime.layers.moe.backends.ep_dispatch import owner_directed_dispatch
+from tokenspeed.runtime.layers.moe.backends.ep_dispatch import (
+    owner_directed_dispatch,
+    prepare_owner_directed_dispatch,
+)
 from tokenspeed.runtime.layers.moe.backends.ep_workspace import (
     EPCommunicationWorkspace,
     EPWorkspaceError,
@@ -39,6 +42,7 @@ def _metadata(
     owner_counts: list[int],
     combine_rows: list[list[int]],
     *,
+    owner_expert_counts: list[list[int]] | None = None,
     device: torch.device | str = "cpu",
 ) -> SimpleNamespace:
     world_size = len(owner_counts)
@@ -57,11 +61,22 @@ def _metadata(
                 device=device,
             )
     counts = torch.tensor(owner_counts, dtype=torch.int32, device=device)
+    if owner_expert_counts is None:
+        owner_expert_counts = [[count] for count in owner_counts]
+    expert_counts = torch.tensor(owner_expert_counts, dtype=torch.int32, device=device)
+    expert_offsets = torch.zeros(
+        (world_size, expert_counts.shape[1] + 1),
+        dtype=torch.int32,
+        device=device,
+    )
+    expert_offsets[:, 1:] = torch.cumsum(expert_counts, dim=1, dtype=torch.int32)
     owner_offsets = torch.zeros((world_size + 1,), dtype=torch.int32, device=device)
     owner_offsets[1:] = torch.cumsum(counts, dim=0, dtype=torch.int32)
     return SimpleNamespace(
         owner_counts=counts,
         owner_offsets=owner_offsets,
+        owner_expert_counts=expert_counts,
+        owner_expert_offsets=expert_offsets,
         combine_offsets=combine_offsets,
     )
 
@@ -164,6 +179,45 @@ def test_owner_directed_dispatch_all_local_and_all_remote_single_source(
         )
     else:
         assert step.dispatch_buffer.shape == (0, 4)
+
+
+def test_prepare_owner_directed_dispatch_aggregates_owner_expert_offsets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    metadata = _metadata(
+        [3, 1],
+        [[0, 1, 2], [3]],
+        owner_expert_counts=[[2, 1], [0, 1]],
+    )
+    workspace = _workspace(world_size=2, rank=1, hidden_size=4)
+    source0_owner_counts = torch.tensor([2, 1], dtype=torch.int32)
+    source1_owner_counts = metadata.owner_counts
+    source0_owner_expert_counts = torch.tensor(
+        [[1, 1], [1, 0]],
+        dtype=torch.int32,
+    )
+    source1_owner_expert_counts = metadata.owner_expert_counts
+
+    def fake_all_gather(outputs: list[torch.Tensor], tensor: torch.Tensor) -> None:
+        sources = (
+            [source0_owner_counts, source1_owner_counts]
+            if tensor.ndim == 1
+            else [source0_owner_expert_counts, source1_owner_expert_counts]
+        )
+        for output, source in zip(outputs, sources):
+            output.copy_(source)
+
+    monkeypatch.setattr(dist, "is_available", lambda: True)
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(dist, "all_gather", fake_all_gather)
+
+    plan = prepare_owner_directed_dispatch(metadata, workspace)
+
+    assert plan.owner_expert_base_offsets.tolist() == [[1, 1], [1, 0]]
+    assert plan.local_expert_counts.tolist() == [1, 1]
+    assert plan.local_expert_offsets.tolist() == [0, 1, 2]
+    assert workspace.rank_counts.tolist() == [1, 1]
+    assert workspace.rank_offsets.tolist() == [0, 1, 2]
 
 
 def test_owner_directed_dispatch_rejects_shape_mismatch() -> None:
