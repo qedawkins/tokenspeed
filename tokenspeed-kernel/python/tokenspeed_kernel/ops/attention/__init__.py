@@ -47,6 +47,7 @@ __all__ = [
     "mha_prefill",
     "mha_extend_with_kvcache",
     "mha_decode_with_kvcache",
+    "mla_decode_with_kvcache",
     "mha_merge_state",
     "mha_decode_scheduler_metadata",
 ]
@@ -366,6 +367,132 @@ def mha_decode_with_kvcache(
         if scheduler_metadata is not None:
             kernel_kwargs["scheduler_metadata"] = scheduler_metadata
         return kernel(**kernel_kwargs)
+
+
+def mla_decode_with_kvcache(
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    max_seqlen_k: int,
+    *,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    value_head_dim: int | None = None,
+    softmax_scale: float | None = None,
+    override: str | None = None,
+    solution: str | None = None,
+) -> torch.Tensor:
+    """MLA decode with paged latent-KV cache.
+
+    The query is the absorbed MLA query produced by the model layer, with shape
+    [decode_rows, num_q_heads, kv_lora_rank + qk_rope_head_dim]. The cache rows
+    store latent KV channels followed by RoPE key channels.
+    """
+    if q.dim() != 3:
+        raise ValueError(f"q must be rank-3 [M,H,D], got shape {tuple(q.shape)}")
+    if kv_cache.dim() == 4:
+        if kv_cache.shape[1] != 1:
+            raise ValueError(
+                "4D MLA kv_cache must have singleton axis 1, got "
+                f"shape {tuple(kv_cache.shape)}"
+            )
+        kv_cache = kv_cache.squeeze(1)
+    if kv_cache.dim() != 3:
+        raise ValueError(
+            "kv_cache must be rank-3 [pages,page_size,D] or rank-4 "
+            f"[pages,1,page_size,D], got shape {tuple(kv_cache.shape)}"
+        )
+
+    expected_cache_dim = kv_lora_rank + qk_rope_head_dim
+    if q.shape[-1] != expected_cache_dim:
+        raise ValueError(
+            f"q last dim must be kv_lora_rank + qk_rope_head_dim "
+            f"({expected_cache_dim}), got {q.shape[-1]}"
+        )
+    if kv_cache.shape[-1] != expected_cache_dim:
+        raise ValueError(
+            f"kv_cache last dim must be kv_lora_rank + qk_rope_head_dim "
+            f"({expected_cache_dim}), got {kv_cache.shape[-1]}"
+        )
+
+    value_head_dim = kv_lora_rank if value_head_dim is None else value_head_dim
+    if not (0 < value_head_dim <= kv_lora_rank):
+        raise ValueError(
+            f"value_head_dim must be in [1, {kv_lora_rank}], got {value_head_dim}"
+        )
+    if page_table.shape[0] != q.shape[0]:
+        raise ValueError(
+            f"page_table rows {page_table.shape[0]} must match q rows {q.shape[0]}"
+        )
+    if cache_seqlens.shape[0] != q.shape[0]:
+        raise ValueError(
+            f"cache_seqlens length {cache_seqlens.shape[0]} must match q rows {q.shape[0]}"
+        )
+
+    softmax_scale = (
+        1.0 / math.sqrt(expected_cache_dim)
+        if softmax_scale is None
+        else softmax_scale
+    )
+
+    traits = {
+        "num_q_heads": q.shape[1],
+        "query_dim": q.shape[-1],
+        "kv_lora_rank": kv_lora_rank,
+        "qk_rope_head_dim": qk_rope_head_dim,
+        "value_head_dim": value_head_dim,
+        "page_size": kv_cache.shape[1],
+    }
+    signature = _attention_format_signature(q=q, kv_cache=kv_cache)
+    kernel = select_kernel(
+        "attention",
+        "mla_decode_with_kvcache",
+        signature,
+        features=frozenset({"paged", "mla"}),
+        traits=traits,
+        solution=solution,
+        override=override,
+    )
+
+    shape_params = {
+        "decode_rows": q.shape[0],
+        "num_pages": kv_cache.shape[0],
+        "page_size": kv_cache.shape[1],
+        "max_pages_per_seq": page_table.shape[1],
+        "num_q_heads": q.shape[1],
+        "query_dim": q.shape[-1],
+        "kv_lora_rank": kv_lora_rank,
+        "qk_rope_head_dim": qk_rope_head_dim,
+        "value_head_dim": value_head_dim,
+        "max_seqlen_k": max_seqlen_k,
+    }
+    ShapeCapture.get().record(
+        "attention",
+        "mla_decode_with_kvcache",
+        kernel.name,
+        q.dtype,
+        shape_params,
+    )
+
+    with kernel_scope(
+        "attention",
+        "mla_decode_with_kvcache",
+        q.dtype,
+        kernel_name=kernel.name,
+        **shape_params,
+    ):
+        return kernel(
+            q=q,
+            kv_cache=kv_cache,
+            page_table=page_table,
+            cache_seqlens=cache_seqlens,
+            max_seqlen_k=max_seqlen_k,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+            value_head_dim=value_head_dim,
+            softmax_scale=softmax_scale,
+        )
 
 
 def mha_merge_state(
