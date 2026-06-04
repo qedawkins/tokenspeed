@@ -20,13 +20,13 @@
 
 from __future__ import annotations
 
-import functools
 from functools import partial
 
 import tokenspeed_kernel
 import torch
 import triton.language as tl
 from torch import nn
+from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.layers.moe.backends.triton_config import (
     try_get_optimal_moe_config,
@@ -35,11 +35,34 @@ from tokenspeed.runtime.layers.moe.core.types import MoELayerSpec
 from tokenspeed.runtime.utils.env import envs
 
 __all__ = [
-    "support_tensor_descriptor",
     "triton_forward",
 ]
 
 padding_size = 128 if envs.TOKENSPEED_MOE_PADDING.get() else 0
+
+
+def _use_cdna4_gluon_moe() -> bool:
+    return current_platform().is_cdna4
+
+
+def _expected_local_dispatch_kernel() -> str:
+    if _use_cdna4_gluon_moe():
+        return "gluon_local_dispatch_gfx950"
+    return "triton_moe_align_block_size"
+
+
+def _expected_dispatch_sorted_experts_kernel() -> str:
+    if _use_cdna4_gluon_moe():
+        return "gluon_fp8_local_experts_gfx950"
+    return "triton_moe_fused_experts"
+
+
+def _expected_local_combine_kernel(num_tokens: int) -> str:
+    if _use_cdna4_gluon_moe() and num_tokens <= 32:
+        return "gluon_local_sum_reduce_gfx950"
+    if num_tokens <= 32:
+        return "torch_compile_moe_sum_reduce"
+    return "triton_moe_sum_reduce"
 
 
 def build_triton_gemms(
@@ -69,7 +92,7 @@ def build_triton_gemms(
         **common,
         dtype=torch.bfloat16,
         features={"dispatch_sorted"},
-        expected_kernel_name="triton_moe_fused_experts",
+        expected_kernel_name=_expected_dispatch_sorted_experts_kernel(),
     )
     gemm = partial(tokenspeed_kernel.moe_experts, **_experts_common)
     gate_up_gemm = partial(
@@ -150,7 +173,8 @@ def triton_forward(
             config["BLOCK_SIZE_M"],
             num_experts,
             dtype=torch.int32,
-            expected_kernel_name="triton_moe_align_block_size",
+            traits={"comm_strategy": "local"},
+            expected_kernel_name=_expected_local_dispatch_kernel(),
         )
     )
 
@@ -214,10 +238,6 @@ def triton_forward(
     )
 
     out_hidden_states = torch.empty_like(hidden_states)
-    # Current limitation: Should avoid using runtime shapes as traits
-    expected_combine_kernel = (
-        "torch_compile_moe_sum_reduce" if m_tokens <= 32 else "triton_moe_sum_reduce"
-    )
     routed_scaling_factor = 1.0
     tokenspeed_kernel.moe_combine(
         intermediate_cache3,
@@ -225,6 +245,6 @@ def triton_forward(
         routed_scaling_factor,
         dtype=dtype,
         traits={"num_tokens": m_tokens, "comm_strategy": None},
-        expected_kernel_name=expected_combine_kernel,
+        expected_kernel_name=_expected_local_combine_kernel(m_tokens),
     )
     return out_hidden_states

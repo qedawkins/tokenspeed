@@ -25,6 +25,7 @@ from __future__ import annotations
 import ast
 import importlib
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Optional
 
 import pytest
@@ -42,6 +43,11 @@ import tokenspeed_kernel.ops.moe as _moe_pkg
 import tokenspeed_kernel.ops.moe.cuda
 import tokenspeed_kernel.ops.moe.deepep
 import tokenspeed_kernel.ops.moe.flashinfer
+import tokenspeed_kernel.ops.moe.gluon
+import tokenspeed_kernel.ops.moe.gluon.combine_gfx950
+import tokenspeed_kernel.ops.moe.gluon.dispatch_gfx950
+import tokenspeed_kernel.ops.moe.gluon.experts_fp8_gfx950
+import tokenspeed_kernel.ops.moe.gluon.route_topk_gfx950
 import tokenspeed_kernel.ops.moe.triton
 import tokenspeed_kernel.ops.moe.triton_kernels
 import torch
@@ -64,6 +70,11 @@ _RELOAD_MODULES = [
     tokenspeed_kernel.ops.moe.triton_kernels,
     tokenspeed_kernel.ops.moe.flashinfer,
     tokenspeed_kernel.ops.moe.deepep,
+    tokenspeed_kernel.ops.moe.gluon.route_topk_gfx950,
+    tokenspeed_kernel.ops.moe.gluon.dispatch_gfx950,
+    tokenspeed_kernel.ops.moe.gluon.experts_fp8_gfx950,
+    tokenspeed_kernel.ops.moe.gluon.combine_gfx950,
+    tokenspeed_kernel.ops.moe.gluon,
     _moe_pkg,  # re-registers _MoEOracle
     # GEMM
     tokenspeed_kernel.numerics.reference.gemm,
@@ -255,6 +266,47 @@ _AUTO_SITES = _collect_call_sites(_SEARCH_DIR)
 # expected_kernel_name, oracle-dependent num_tokens branching, etc.)
 _MANUAL_CALL_SITES: list[CallSite] = [
     # -- MoE --
+    # topk.py: biased grouped S1 route path uses platform selection.
+    (
+        "moe",
+        "route",
+        torch.bfloat16,
+        None,
+        {
+            "output_type": "topk",
+            "biased": True,
+            "grouped": True,
+            "ep": True,
+            "num_expert_group": 8,
+            "topk_group": 4,
+            "topk": 8,
+            "num_fused_shared_experts": 0,
+        },
+        None,
+        "gluon_grouped_biased_topk_gfx950",
+        "manual:topk/biased_grouped_s1_cdna4",
+    ),
+    # triton_common.py: local dispatch expected kernel is platform-dependent.
+    (
+        "moe",
+        "dispatch",
+        torch.int32,
+        None,
+        {"comm_strategy": "local"},
+        None,
+        "triton_moe_align_block_size",
+        "manual:triton_common/dispatch_local",
+    ),
+    (
+        "moe",
+        "dispatch",
+        torch.int32,
+        None,
+        {"comm_strategy": "local"},
+        None,
+        "gluon_local_dispatch_gfx950",
+        "manual:triton_common/dispatch_local_cdna4",
+    ),
     # triton_common.py: partial(tokenspeed_kernel.moe_experts, **_experts_common)
     (
         "moe",
@@ -265,6 +317,16 @@ _MANUAL_CALL_SITES: list[CallSite] = [
         None,
         "triton_moe_fused_experts",
         "manual:triton_common/experts",
+    ),
+    (
+        "moe",
+        "experts",
+        torch.bfloat16,
+        {"dispatch_sorted"},
+        {},
+        None,
+        "gluon_fp8_local_experts_gfx950",
+        "manual:triton_common/experts_cdna4",
     ),
     # triton_common.py: moe_combine(..., expected_kernel_name=expected_combine_kernel)
     (
@@ -286,6 +348,16 @@ _MANUAL_CALL_SITES: list[CallSite] = [
         None,
         "torch_compile_moe_sum_reduce",
         "manual:triton_common/combine_small",
+    ),
+    (
+        "moe",
+        "combine",
+        torch.bfloat16,
+        None,
+        {"num_tokens": 8, "comm_strategy": None},
+        None,
+        "gluon_local_sum_reduce_gfx950",
+        "manual:triton_common/combine_small_cdna4",
     ),
 ]
 
@@ -358,6 +430,24 @@ def _site_id(site: CallSite) -> str:
     return f"{expected}@{location}"
 
 
+_CDNA4_OVERRIDDEN_MANUAL_SITES = frozenset(
+    {
+        "manual:triton_common/dispatch_local",
+        "manual:triton_common/experts",
+        "manual:triton_common/combine_small",
+    }
+)
+
+
+def _site_applies_to_platform(site: CallSite, platform) -> bool:
+    location = site[7]
+    if location.endswith("_cdna4"):
+        return platform.is_cdna4
+    if platform.is_cdna4 and location in _CDNA4_OVERRIDDEN_MANUAL_SITES:
+        return False
+    return True
+
+
 # ---------------------------------------------------------------------------
 # 4. Parametrized test
 # ---------------------------------------------------------------------------
@@ -379,6 +469,9 @@ def _site_id(site: CallSite) -> str:
 def test_kernel_selection(site, platform_name, request):
     platform = request.getfixturevalue(platform_name)
     family, mode, raw_dtype, features, traits, weight_format, expected, location = site
+
+    if not _site_applies_to_platform(site, platform):
+        pytest.skip(f"{location} is not the expected path on {platform.device_name}")
 
     reg = KernelRegistry.get()
     spec = reg.get_by_name(expected)
@@ -406,3 +499,78 @@ def test_kernel_selection(site, platform_name, request):
         f"at {location} on {platform.device_name} "
         f"for {family}.{mode}(signature={signature}, features={features}, traits={traits})"
     )
+
+
+def test_s1_fp8_tp_runtime_components_construct(monkeypatch, mi350_platform):
+    import tokenspeed.runtime.layers.moe.backends.triton_common as triton_common
+    import tokenspeed.runtime.layers.moe.topk as topk_mod
+    from tokenspeed.runtime.layers.moe.core.types import MoELayerSpec
+
+    monkeypatch.setattr(triton_common, "current_platform", lambda: mi350_platform)
+    monkeypatch.setattr(topk_mod, "current_platform", lambda: mi350_platform)
+
+    topk = topk_mod.TopK(
+        8,
+        use_grouped_topk=True,
+        topk_group=4,
+        num_expert_group=8,
+        correction_bias=torch.zeros(16),
+        routed_scaling_factor=1.0,
+        apply_routed_scaling_factor_on_output=True,
+    )
+    route_traits = {
+        "output_type": "topk",
+        "biased": True,
+        "grouped": True,
+        "ep": True,
+        "num_expert_group": topk.topk_config.num_expert_group,
+        "topk_group": topk.topk_config.topk_group,
+        "topk": topk.topk_config.top_k,
+        "num_fused_shared_experts": topk.topk_config.num_fused_shared_experts,
+    }
+    assert (
+        topk_mod._expected_biased_grouped_topk_kernel(route_traits)
+        == "gluon_grouped_biased_topk_gfx950"
+    )
+
+    spec = MoELayerSpec(
+        top_k=8,
+        num_experts=16,
+        num_local_experts=16,
+        hidden_size=32,
+        intermediate_size=24,
+        activation="silu",
+        tp_rank=0,
+        tp_size=1,
+        ep_rank=0,
+        ep_size=1,
+    )
+    layer = SimpleNamespace(
+        w13_weight=torch.empty((16, 48, 32), dtype=torch.float8_e4m3fn),
+        w2_weight=torch.empty((16, 32, 24), dtype=torch.float8_e4m3fn),
+    )
+
+    gate_up_gemm, down_gemm, get_config_func = triton_common.build_triton_gemms(
+        layer,
+        spec,
+        use_fp8_w8a8=True,
+        block_shape=[16, 16],
+        dtype_tag="fp8_w8a8",
+        gate_up_B_scale=torch.empty((16, 3, 2), dtype=torch.float32),
+        down_B_scale=torch.empty((16, 2, 2), dtype=torch.float32),
+    )
+
+    assert callable(gate_up_gemm)
+    assert callable(down_gemm)
+    assert callable(get_config_func)
+    assert (
+        gate_up_gemm.keywords["expected_kernel_name"]
+        == "gluon_fp8_local_experts_gfx950"
+    )
+    assert (
+        down_gemm.keywords["expected_kernel_name"]
+        == "gluon_fp8_local_experts_gfx950"
+    )
+    assert triton_common._expected_local_dispatch_kernel() == "gluon_local_dispatch_gfx950"
+    assert triton_common._expected_local_combine_kernel(8) == "gluon_local_sum_reduce_gfx950"
+    assert triton_common._expected_local_combine_kernel(257) == "triton_moe_sum_reduce"

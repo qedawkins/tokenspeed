@@ -30,6 +30,7 @@ from tokenspeed_kernel.ops.moe import (
     ExpertLocationDispatchInfo,
     topk_ids_logical_to_physical,
 )
+from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.moe.distribution_recorder import (
     get_global_expert_distribution_recorder,
@@ -89,6 +90,24 @@ class BypassedTopKOutput(NamedTuple):
     @property
     def format(self) -> TopKOutputFormat:
         return TopKOutputFormat.BYPASSED
+
+
+_COMMON_GLUON_ROUTE_GROUPS = frozenset({1, 2, 4, 8, 16, 32})
+_COMMON_GLUON_ROUTE_TOPK = frozenset(range(1, 17))
+
+
+def _expected_biased_grouped_topk_kernel(route_traits: dict) -> str | None:
+    if not current_platform().is_cdna4:
+        return None
+    if route_traits.get("num_fused_shared_experts") != 0:
+        return None
+    if route_traits.get("num_expert_group") not in _COMMON_GLUON_ROUTE_GROUPS:
+        return None
+    if route_traits.get("topk_group") not in _COMMON_GLUON_ROUTE_GROUPS:
+        return None
+    if route_traits.get("topk") not in _COMMON_GLUON_ROUTE_TOPK:
+        return None
+    return "gluon_grouped_biased_topk_gfx950"
 
 
 @runtime_checkable
@@ -287,6 +306,9 @@ def select_experts(
                 apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
                 dtype=router_logits.dtype,
                 traits=route_traits,
+                expected_kernel_name=_expected_biased_grouped_topk_kernel(
+                    route_traits
+                ),
             )
     elif torch_native and custom_routing_function is None:
         assert (

@@ -51,6 +51,12 @@ def get_scalar_type(num_bits: int, has_zp: bool):
     return scalar_types.uint4b8 if num_bits == 4 else scalar_types.uint8b128
 
 
+def _expected_local_dispatch_kernel() -> str:
+    if current_platform().is_cdna4:
+        return "gluon_local_dispatch_gfx950"
+    return "triton_moe_align_block_size"
+
+
 def _check_shape(input: torch.Tensor, output: torch.Tensor) -> None:
     assert input.ndim == output.ndim, f"{input.ndim} != {output.ndim}"
     assert (
@@ -131,7 +137,8 @@ def fused_marlin_moe(
             block_size_m,
             global_num_experts,
             dtype=torch.int32,
-            expected_kernel_name="triton_moe_align_block_size",
+            traits={"comm_strategy": "local"},
+            expected_kernel_name=_expected_local_dispatch_kernel(),
         )
     )
 

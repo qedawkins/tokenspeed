@@ -47,6 +47,11 @@ import tokenspeed_kernel.ops.moe as _moe_pkg
 import tokenspeed_kernel.ops.moe.cuda as _moe_cuda
 import tokenspeed_kernel.ops.moe.deepep as _moe_deepep
 import tokenspeed_kernel.ops.moe.flashinfer as _moe_flashinfer
+import tokenspeed_kernel.ops.moe.gluon as _moe_gluon
+import tokenspeed_kernel.ops.moe.gluon.combine_gfx950 as _moe_gluon_combine
+import tokenspeed_kernel.ops.moe.gluon.dispatch_gfx950 as _moe_gluon_dispatch
+import tokenspeed_kernel.ops.moe.gluon.experts_fp8_gfx950 as _moe_gluon_experts
+import tokenspeed_kernel.ops.moe.gluon.route_topk_gfx950 as _moe_gluon_route
 import tokenspeed_kernel.ops.moe.triton as _moe_triton
 import tokenspeed_kernel.ops.moe.triton_kernels as _moe_triton_kernels
 import tokenspeed_kernel.ops.moe.trtllm as _moe_trtllm
@@ -80,6 +85,11 @@ _RELOAD_MODULES = [
     _moe_triton,
     _moe_triton_kernels,
     _moe_trtllm,
+    _moe_gluon_route,
+    _moe_gluon_dispatch,
+    _moe_gluon_experts,
+    _moe_gluon_combine,
+    _moe_gluon,
     _moe_pkg,
     # Top-level public API re-exports.
     tokenspeed_kernel,
@@ -130,6 +140,10 @@ def _is_cdna4(platform: PlatformInfo) -> bool:
 
 def _is_supported_gpu(platform: PlatformInfo) -> bool:
     return platform.is_nvidia or platform.is_amd
+
+
+def _is_supported_gpu_non_cdna4(platform: PlatformInfo) -> bool:
+    return _is_supported_gpu(platform) and not platform.is_cdna4
 
 
 def _fp8_dtype() -> torch.dtype:
@@ -352,6 +366,22 @@ def _moe_route_biased_topk() -> object:
             "biased": True,
             "grouped": False,
             "ep": False,
+        },
+    )
+
+
+def _moe_route_biased_grouped_topk_s1() -> object:
+    return tokenspeed_kernel.moe_route(
+        dtype=torch.bfloat16,
+        traits={
+            "output_type": "topk",
+            "biased": True,
+            "grouped": True,
+            "ep": True,
+            "num_expert_group": 8,
+            "topk_group": 4,
+            "topk": 8,
+            "num_fused_shared_experts": 0,
         },
     )
 
@@ -671,11 +701,19 @@ _CASES = [
         _moe_route_ragged_metadata,
     ),
     _case(
-        _is_supported_gpu,
+        _is_supported_gpu_non_cdna4,
         "supported-gpu",
         "moe",
         "dispatch",
         "triton_moe_align_block_size",
+        _moe_dispatch_local,
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "moe",
+        "dispatch",
+        "gluon_local_dispatch_gfx950",
         _moe_dispatch_local,
     ),
     _case(
@@ -687,11 +725,19 @@ _CASES = [
         _moe_dispatch_deepep,
     ),
     _case(
-        _is_supported_gpu,
+        _is_supported_gpu_non_cdna4,
         "supported-gpu",
         "moe",
         "combine",
         "torch_compile_moe_sum_reduce",
+        _moe_combine_small,
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "moe",
+        "combine",
+        "gluon_local_sum_reduce_gfx950",
         _moe_combine_small,
     ),
     _case(
@@ -711,12 +757,28 @@ _CASES = [
         _moe_combine_deepep,
     ),
     _case(
-        _is_supported_gpu,
+        _is_supported_gpu_non_cdna4,
         "supported-gpu",
         "moe",
         "experts",
         "triton_moe_fused_experts",
         _moe_experts_dispatch_sorted,
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "moe",
+        "experts",
+        "gluon_fp8_local_experts_gfx950",
+        _moe_experts_dispatch_sorted,
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "moe",
+        "route",
+        "gluon_grouped_biased_topk_gfx950",
+        _moe_route_biased_grouped_topk_s1,
     ),
     _case(
         _is_supported_gpu,
