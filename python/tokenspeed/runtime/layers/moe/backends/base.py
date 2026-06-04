@@ -23,7 +23,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from functools import partial
-from typing import ClassVar
+from typing import Any, ClassVar
 
 import torch
 from torch import nn
@@ -35,7 +35,6 @@ from tokenspeed.runtime.layers.moe.backends.weight_loaders import (
     load_per_tensor_weight_scale,
 )
 from tokenspeed.runtime.layers.moe.core.types import BackendKey, MoELayerSpec
-from tokenspeed.runtime.layers.moe.topk import TopKOutputFormat
 
 
 class MoEBackend(ABC):
@@ -54,6 +53,7 @@ class MoEBackend(ABC):
         self.spec = spec
         self.quant_config = quant_config
         self.routing_config = routing_config
+        self._ep_workspace = None
 
     @classmethod
     @abstractmethod
@@ -96,8 +96,52 @@ class MoEBackend(ABC):
         return False
 
     @property
-    def topk_output_format(self) -> TopKOutputFormat:
+    def topk_output_format(self):
+        from tokenspeed.runtime.layers.moe.topk import TopKOutputFormat
+
         return TopKOutputFormat.STANDARD
+
+    def ensure_ep_workspace(
+        self,
+        *,
+        max_tokens_per_rank: int,
+        dtype: torch.dtype,
+        device: torch.device | str | None = None,
+        iris_mode: str = "auto",
+        iris_context: Any | None = None,
+    ):
+        from tokenspeed.runtime.layers.moe.backends.ep_workspace import (
+            EPCommunicationWorkspace,
+        )
+
+        workspace = self._ep_workspace
+        requested_rows = max_tokens_per_rank * self.spec.top_k * self.spec.ep_size
+        requested_device = _normalize_optional_workspace_device(device)
+        if (
+            workspace is not None
+            and workspace.max_dispatch_rows >= requested_rows
+            and workspace.hidden_size == self.spec.hidden_size
+            and workspace.top_k == self.spec.top_k
+            and workspace.world_size == self.spec.ep_size
+            and workspace.rank == self.spec.ep_rank
+            and workspace.dtype == dtype
+            and (requested_device is None or workspace.device == requested_device)
+        ):
+            return workspace
+
+        workspace = EPCommunicationWorkspace.allocate(
+            max_tokens_per_rank=max_tokens_per_rank,
+            hidden_size=self.spec.hidden_size,
+            top_k=self.spec.top_k,
+            world_size=self.spec.ep_size,
+            rank=self.spec.ep_rank,
+            dtype=dtype,
+            device=device,
+            iris_mode=iris_mode,
+            iris_context=iris_context,
+        )
+        self._ep_workspace = workspace
+        return workspace
 
     def _make_weight_loader(
         self,
@@ -132,3 +176,14 @@ class MoEBackend(ABC):
     @staticmethod
     def _per_tensor_scale_loader() -> Callable:
         return load_per_tensor_weight_scale
+
+
+def _normalize_optional_workspace_device(
+    device: torch.device | str | None,
+) -> torch.device | None:
+    if device is None:
+        return None
+    requested_device = torch.device(device)
+    if requested_device.type == "cuda" and requested_device.index is None:
+        return torch.device("cuda", torch.cuda.current_device())
+    return requested_device
