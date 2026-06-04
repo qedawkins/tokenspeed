@@ -574,3 +574,149 @@ def test_s1_fp8_tp_runtime_components_construct(monkeypatch, mi350_platform):
     assert triton_common._expected_local_dispatch_kernel() == "gluon_local_dispatch_gfx950"
     assert triton_common._expected_local_combine_kernel(8) == "gluon_local_sum_reduce_gfx950"
     assert triton_common._expected_local_combine_kernel(257) == "triton_moe_sum_reduce"
+
+
+def _reference_bf16_local_moe(
+    hidden_states: torch.Tensor,
+    w13_weight: torch.Tensor,
+    w2_weight: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+) -> torch.Tensor:
+    output = torch.zeros_like(hidden_states, dtype=torch.float32)
+    intermediate_size = w2_weight.shape[-1]
+    for token in range(hidden_states.shape[0]):
+        hidden = hidden_states[token].float()
+        for slot in range(topk_ids.shape[1]):
+            expert = int(topk_ids[token, slot].item())
+            gate_up = (hidden @ w13_weight[expert].float().T).to(torch.bfloat16)
+            activated = (
+                torch.nn.functional.silu(gate_up[:intermediate_size])
+                * gate_up[intermediate_size:]
+            ).to(torch.bfloat16)
+            down = activated.float() @ w2_weight[expert].float().T
+            down *= topk_weights[token, slot].float()
+            output[token] += down.to(torch.bfloat16).float()
+    return output.to(hidden_states.dtype)
+
+
+def test_s2_bf16_tp_runtime_forward_uses_existing_contracts(
+    device: str,
+    monkeypatch,
+    mi350_platform,
+) -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA/HIP GPU is required for BF16 TP runtime forward coverage")
+
+    import tokenspeed.runtime.layers.moe.backends.triton_common as triton_common
+    import tokenspeed.runtime.layers.moe.topk as topk_mod
+    from tokenspeed.runtime.layers.moe.core.types import MoELayerSpec
+
+    monkeypatch.setattr(triton_common, "current_platform", lambda: mi350_platform)
+    monkeypatch.setattr(topk_mod, "current_platform", lambda: mi350_platform)
+
+    torch.manual_seed(7303)
+    num_tokens = 8
+    hidden_size = 32
+    intermediate_size = 24
+    num_experts = 4
+    top_k = 2
+    spec = MoELayerSpec(
+        top_k=top_k,
+        num_experts=num_experts,
+        num_local_experts=num_experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        activation="silu",
+        tp_rank=0,
+        tp_size=1,
+        ep_rank=0,
+        ep_size=1,
+    )
+    layer = SimpleNamespace(
+        w13_weight=(
+            torch.randn(
+                num_experts,
+                2 * intermediate_size,
+                hidden_size,
+                device=device,
+            )
+            * 0.15
+        ).bfloat16(),
+        w2_weight=(
+            torch.randn(num_experts, hidden_size, intermediate_size, device=device)
+            * 0.12
+        ).bfloat16(),
+    )
+    hidden_states = (
+        torch.randn(num_tokens, hidden_size, device=device) * 0.20
+    ).bfloat16()
+    topk_ids = torch.tensor(
+        [
+            [0, 1],
+            [2, 3],
+            [3, 0],
+            [1, 2],
+            [0, 3],
+            [2, 1],
+            [3, 2],
+            [1, 0],
+        ],
+        device=device,
+        dtype=torch.int32,
+    )
+    topk_weights = torch.linspace(
+        0.2,
+        0.9,
+        steps=num_tokens * top_k,
+        device=device,
+        dtype=torch.float32,
+    ).view(num_tokens, top_k)
+
+    gate_up_gemm, down_gemm, get_config_func = triton_common.build_triton_gemms(
+        layer,
+        spec,
+        use_fp8_w8a8=False,
+        block_shape=None,
+        dtype_tag="bf16",
+        gate_up_B_scale=None,
+        down_B_scale=None,
+    )
+    assert (
+        gate_up_gemm.keywords["expected_kernel_name"]
+        == "gluon_fp8_local_experts_gfx950"
+    )
+    assert (
+        down_gemm.keywords["expected_kernel_name"]
+        == "gluon_fp8_local_experts_gfx950"
+    )
+    assert triton_common._expected_local_dispatch_kernel() == "gluon_local_dispatch_gfx950"
+    assert triton_common._expected_local_combine_kernel(num_tokens) == (
+        "gluon_local_sum_reduce_gfx950"
+    )
+
+    actual = triton_common.triton_forward(
+        gate_up_gemm,
+        down_gemm,
+        get_config_func,
+        "silu",
+        layer,
+        hidden_states.contiguous(),
+        SimpleNamespace(topk_ids=topk_ids, topk_weights=topk_weights),
+    )
+    torch.cuda.synchronize()
+
+    expected = _reference_bf16_local_moe(
+        hidden_states,
+        layer.w13_weight,
+        layer.w2_weight,
+        topk_ids,
+        topk_weights,
+    )
+    torch.testing.assert_close(
+        actual.float(),
+        expected.float(),
+        atol=0.08,
+        rtol=0.05,
+        check_dtype=False,
+    )
