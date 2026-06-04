@@ -206,6 +206,9 @@ def owner_directed_combine(
     out.zero_()
 
     if topk_ids.numel() == 0:
+        if workspace.backend == "iris" and synchronize:
+            workspace.barrier()
+            workspace.barrier()
         return out
 
     if workspace.backend == "iris":

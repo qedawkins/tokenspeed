@@ -1,0 +1,519 @@
+# Copyright (c) 2026 LightSeek Foundation
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+from __future__ import annotations
+
+import math
+from types import SimpleNamespace
+
+import pytest
+import torch
+import torch.nn.functional as F
+
+
+def _require_cdna4_gpu() -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("GPU is required for FP8 EP backend wiring validation")
+    from tokenspeed_kernel.platform import current_platform
+
+    if not current_platform().is_cdna4_plus:
+        pytest.skip("AMD CDNA4 GPU is required for FP8 EP backend wiring validation")
+
+
+def test_fp8_ep_selects_existing_triton_backend_key() -> None:
+    _require_cdna4_gpu()
+    from tokenspeed.runtime.layers.moe.backends.fp8.triton import Fp8TritonBackend
+    from tokenspeed.runtime.layers.moe.core.selector import select_backend
+    from tokenspeed.runtime.layers.moe.core.types import MoELayerSpec
+    from tokenspeed.runtime.layers.quantization import Fp8Config
+
+    spec = MoELayerSpec(
+        top_k=2,
+        num_experts=8,
+        num_local_experts=2,
+        hidden_size=32,
+        intermediate_size=16,
+        activation="silu",
+        tp_rank=0,
+        tp_size=1,
+        ep_rank=0,
+        ep_size=4,
+    )
+    backend = select_backend(
+        spec,
+        Fp8Config(
+            is_checkpoint_fp8_serialized=True,
+            weight_block_size=[16, 16],
+        ),
+    )
+
+    assert isinstance(backend, Fp8TritonBackend)
+    assert backend.key.quant == "fp8"
+    assert backend.key.impl == "triton"
+
+
+def test_fp8_ep_supports_requires_cdna4_silu(monkeypatch: pytest.MonkeyPatch) -> None:
+    _require_cdna4_gpu()
+    from tokenspeed.runtime.layers.moe.backends.fp8 import triton as fp8_triton
+    from tokenspeed.runtime.layers.moe.core.types import MoELayerSpec
+    from tokenspeed.runtime.layers.quantization import Fp8Config
+
+    spec = MoELayerSpec(
+        top_k=2,
+        num_experts=8,
+        num_local_experts=2,
+        hidden_size=32,
+        intermediate_size=16,
+        activation="silu",
+        tp_rank=0,
+        tp_size=1,
+        ep_rank=0,
+        ep_size=4,
+    )
+    quant_config = Fp8Config(
+        is_checkpoint_fp8_serialized=True,
+        weight_block_size=[16, 16],
+    )
+
+    monkeypatch.setattr(
+        fp8_triton,
+        "_current_platform",
+        lambda: SimpleNamespace(is_amd=False, is_cdna4_plus=False),
+    )
+    assert not fp8_triton.Fp8TritonBackend.supports(spec, quant_config)
+
+    monkeypatch.setattr(
+        fp8_triton,
+        "_current_platform",
+        lambda: SimpleNamespace(is_amd=True, is_cdna4_plus=True),
+    )
+    assert fp8_triton.Fp8TritonBackend.supports(spec, quant_config)
+    unsupported_activation = MoELayerSpec(
+        top_k=spec.top_k,
+        num_experts=spec.num_experts,
+        num_local_experts=spec.num_local_experts,
+        hidden_size=spec.hidden_size,
+        intermediate_size=spec.intermediate_size,
+        activation="gelu",
+        tp_rank=spec.tp_rank,
+        tp_size=spec.tp_size,
+        ep_rank=spec.ep_rank,
+        ep_size=spec.ep_size,
+    )
+    assert not fp8_triton.Fp8TritonBackend.supports(
+        unsupported_activation,
+        quant_config,
+    )
+
+
+@pytest.mark.parametrize("ep_rank", [0, 1])
+def test_fp8_triton_backend_ep_forward_matches_dense_reference(ep_rank: int) -> None:
+    _require_cdna4_gpu()
+    torch.manual_seed(8707 + ep_rank)
+    from tokenspeed.runtime.layers.moe.backends.fp8.triton import Fp8TritonBackend
+    from tokenspeed.runtime.layers.moe.core.types import BackendKey, MoELayerSpec
+    from tokenspeed.runtime.layers.quantization import Fp8Config
+
+    device = "cuda"
+    num_tokens = 6
+    top_k = 2
+    ep_size = 2
+    num_local_experts = 2
+    num_experts = ep_size * num_local_experts
+    hidden_size = 32
+    intermediate_size = 16
+    block_shape = (16, 16)
+    local_start = ep_rank * num_local_experts
+    local_experts = torch.arange(
+        local_start,
+        local_start + num_local_experts,
+        dtype=torch.int32,
+        device=device,
+    )
+    topk_ids = local_experts[(torch.arange(num_tokens * top_k, device=device) + ep_rank) % 2]
+    topk_ids = topk_ids.reshape(num_tokens, top_k).contiguous()
+    topk_weights = torch.linspace(
+        0.2,
+        0.9,
+        steps=num_tokens * top_k,
+        dtype=torch.float32,
+        device=device,
+    ).reshape(num_tokens, top_k)
+    hidden_states = (
+        torch.randn(num_tokens, hidden_size, device=device, dtype=torch.float32) * 0.12
+    ).to(torch.bfloat16)
+    dense_w13 = (
+        torch.randn(num_experts, 2 * intermediate_size, hidden_size, device=device)
+        * 0.12
+    )
+    dense_w2 = (
+        torch.randn(num_experts, hidden_size, intermediate_size, device=device) * 0.12
+    )
+    fp8_w13, fp8_w13_scale = _make_fp8_weight(dense_w13, block_shape)
+    fp8_w2, fp8_w2_scale = _make_fp8_weight(dense_w2, block_shape)
+    spec = MoELayerSpec(
+        top_k=top_k,
+        num_experts=num_experts,
+        num_local_experts=num_local_experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        activation="silu",
+        tp_rank=0,
+        tp_size=1,
+        ep_rank=ep_rank,
+        ep_size=ep_size,
+    )
+    backend = Fp8TritonBackend(
+        key=BackendKey(arch="gfx950", quant="fp8", impl="triton"),
+        spec=spec,
+        quant_config=Fp8Config(
+            is_checkpoint_fp8_serialized=True,
+            weight_block_size=list(block_shape),
+        ),
+    )
+    layer = SimpleNamespace(
+        activation="silu",
+        w13_weight=fp8_w13[local_start : local_start + num_local_experts],
+        w13_weight_scale_inv=fp8_w13_scale[local_start : local_start + num_local_experts],
+        w2_weight=fp8_w2[local_start : local_start + num_local_experts],
+        w2_weight_scale_inv=fp8_w2_scale[local_start : local_start + num_local_experts],
+    )
+    topk_output = SimpleNamespace(topk_ids=topk_ids, topk_weights=topk_weights)
+
+    out = backend.forward(
+        layer,
+        hidden_states,
+        topk_output,
+        num_global_tokens=num_tokens * ep_size,
+        max_num_tokens_per_gpu=num_tokens,
+    )
+    torch.cuda.synchronize()
+
+    expected = _dense_moe_reference(
+        hidden_states,
+        _dequantize_fp8_weight(fp8_w13, fp8_w13_scale, block_shape),
+        _dequantize_fp8_weight(fp8_w2, fp8_w2_scale, block_shape),
+        topk_ids,
+        topk_weights,
+    ).to(torch.bfloat16)
+    torch.testing.assert_close(out, expected, atol=7e-2, rtol=7e-2)
+
+
+def test_fp8_triton_backend_ep_forward_handles_empty_rank() -> None:
+    _require_cdna4_gpu()
+    from tokenspeed.runtime.layers.moe.backends.fp8.triton import Fp8TritonBackend
+    from tokenspeed.runtime.layers.moe.core.types import BackendKey, MoELayerSpec
+    from tokenspeed.runtime.layers.quantization import Fp8Config
+
+    spec = MoELayerSpec(
+        top_k=2,
+        num_experts=4,
+        num_local_experts=2,
+        hidden_size=32,
+        intermediate_size=16,
+        activation="silu",
+        tp_rank=0,
+        tp_size=1,
+        ep_rank=0,
+        ep_size=2,
+    )
+    backend = Fp8TritonBackend(
+        key=BackendKey(arch="gfx950", quant="fp8", impl="triton"),
+        spec=spec,
+        quant_config=Fp8Config(
+            is_checkpoint_fp8_serialized=True,
+            weight_block_size=[16, 16],
+        ),
+    )
+    layer = SimpleNamespace(activation="silu")
+    topk_output = SimpleNamespace(
+        topk_ids=torch.empty((0, 2), dtype=torch.int32, device="cuda"),
+        topk_weights=torch.empty((0, 2), dtype=torch.float32, device="cuda"),
+    )
+    hidden_states = torch.empty((0, 32), dtype=torch.bfloat16, device="cuda")
+
+    out = backend.forward(
+        layer,
+        hidden_states,
+        topk_output,
+        num_global_tokens=0,
+        max_num_tokens_per_gpu=0,
+    )
+
+    assert out.shape == (0, 32)
+    assert out.dtype == torch.bfloat16
+
+
+def test_fp8_triton_backend_zero_local_rank_participates_when_global_nonzero(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _require_cdna4_gpu()
+    import tokenspeed_kernel
+
+    from tokenspeed.runtime.layers import activation
+    from tokenspeed.runtime.layers.moe.backends import (
+        ep_combine,
+        ep_dispatch,
+        ep_experts,
+        ep_reduce,
+    )
+    from tokenspeed.runtime.layers.moe.backends.fp8.triton import Fp8TritonBackend
+    from tokenspeed.runtime.layers.moe.core.types import BackendKey, MoELayerSpec
+    from tokenspeed.runtime.layers.quantization import Fp8Config
+
+    hidden_size = 32
+    intermediate_size = 16
+    top_k = 2
+    ep_size = 2
+    num_local_experts = 2
+    device = "cuda"
+    calls: list[str] = []
+
+    def fake_moe_dispatch(*args, **kwargs):
+        del args, kwargs
+        calls.append("metadata")
+        return SimpleNamespace(
+            owner_counts=torch.zeros((ep_size,), dtype=torch.int32, device=device),
+            owner_expert_counts=torch.zeros(
+                (ep_size, num_local_experts),
+                dtype=torch.int32,
+                device=device,
+            ),
+            owner_expert_offsets=torch.zeros(
+                (ep_size, num_local_experts + 1),
+                dtype=torch.int32,
+                device=device,
+            ),
+            combine_offsets=torch.empty((ep_size, 0), dtype=torch.int32, device=device),
+            dispatch_offsets=torch.empty((0, top_k), dtype=torch.int32, device=device),
+        )
+
+    def fake_prepare(metadata, workspace):
+        del metadata
+        calls.append("prepare")
+        zero_counts = torch.zeros(
+            (ep_size, num_local_experts),
+            dtype=torch.int32,
+            device=workspace.device,
+        )
+        zero_offsets = torch.zeros(
+            (ep_size, num_local_experts + 1),
+            dtype=torch.int32,
+            device=workspace.device,
+        )
+        return ep_dispatch.EPOwnerDispatchPlan(
+            owner_base_offsets=torch.zeros(
+                (ep_size,),
+                dtype=torch.int32,
+                device=workspace.device,
+            ),
+            owner_expert_base_offsets=zero_counts,
+            aggregate_owner_expert_counts=zero_counts,
+            aggregate_owner_expert_offsets=zero_offsets,
+            local_expert_counts=zero_counts[0],
+            local_expert_offsets=zero_offsets[0],
+        )
+
+    def fake_dispatch(hidden_states, topk_ids, metadata, workspace, **kwargs):
+        del hidden_states, topk_ids, metadata, kwargs
+        calls.append("dispatch")
+        return workspace.view(0)
+
+    def fake_gemm(A, B, B_scale, counts, **kwargs):
+        del A, B_scale, counts, kwargs
+        calls.append("gemm")
+        return torch.empty((0, B.shape[1]), dtype=torch.bfloat16, device=device)
+
+    def fake_combine(
+        owner_outputs,
+        topk_ids,
+        metadata,
+        dispatch_plan,
+        workspace,
+        expert_owner,
+        local_expert_id,
+        **kwargs,
+    ):
+        del metadata, dispatch_plan, workspace, expert_owner, local_expert_id, kwargs
+        calls.append("combine")
+        return torch.empty(
+            (0, topk_ids.shape[1], owner_outputs.shape[1]),
+            dtype=owner_outputs.dtype,
+            device=owner_outputs.device,
+        )
+
+    def fake_reduce(returned_slots, topk_weights):
+        del topk_weights
+        calls.append("reduce")
+        return torch.empty(
+            (0, hidden_size),
+            dtype=returned_slots.dtype,
+            device=returned_slots.device,
+        )
+
+    monkeypatch.setattr(tokenspeed_kernel, "moe_dispatch", fake_moe_dispatch)
+    monkeypatch.setattr(ep_dispatch, "prepare_owner_directed_dispatch", fake_prepare)
+    monkeypatch.setattr(ep_dispatch, "owner_directed_dispatch", fake_dispatch)
+    monkeypatch.setattr(ep_experts, "owner_rank_fp8_expert_gemm", fake_gemm)
+    monkeypatch.setattr(activation, "silu_and_mul", lambda gate_up, out: None)
+    monkeypatch.setattr(ep_combine, "owner_directed_combine", fake_combine)
+    monkeypatch.setattr(ep_reduce, "ep_weighted_reduce", fake_reduce)
+
+    spec = MoELayerSpec(
+        top_k=top_k,
+        num_experts=ep_size * num_local_experts,
+        num_local_experts=num_local_experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        activation="silu",
+        tp_rank=0,
+        tp_size=1,
+        ep_rank=0,
+        ep_size=ep_size,
+    )
+    backend = Fp8TritonBackend(
+        key=BackendKey(arch="gfx950", quant="fp8", impl="triton"),
+        spec=spec,
+        quant_config=Fp8Config(
+            is_checkpoint_fp8_serialized=True,
+            weight_block_size=[16, 16],
+        ),
+    )
+    layer = SimpleNamespace(
+        activation="silu",
+        w13_weight=torch.empty(
+            (num_local_experts, 2 * intermediate_size, hidden_size),
+            dtype=torch.bfloat16,
+            device=device,
+        ),
+        w13_weight_scale_inv=torch.empty(
+            (num_local_experts, 2, 2),
+            dtype=torch.float32,
+            device=device,
+        ),
+        w2_weight=torch.empty(
+            (num_local_experts, hidden_size, intermediate_size),
+            dtype=torch.bfloat16,
+            device=device,
+        ),
+        w2_weight_scale_inv=torch.empty(
+            (num_local_experts, 2, 1),
+            dtype=torch.float32,
+            device=device,
+        ),
+    )
+    hidden_states = torch.empty((0, hidden_size), dtype=torch.bfloat16, device=device)
+    topk_output = SimpleNamespace(
+        topk_ids=torch.empty((0, top_k), dtype=torch.int32, device=device),
+        topk_weights=torch.empty((0, top_k), dtype=torch.float32, device=device),
+    )
+
+    out = backend.forward(
+        layer,
+        hidden_states,
+        topk_output,
+        num_global_tokens=3,
+        max_num_tokens_per_gpu=0,
+    )
+
+    assert out.shape == (0, hidden_size)
+    assert backend._ep_workspace.max_tokens_per_rank == 2
+    assert calls == ["metadata", "prepare", "dispatch", "gemm", "gemm", "combine", "reduce"]
+
+
+def _dense_moe_reference(
+    hidden_states: torch.Tensor,
+    w13: torch.Tensor,
+    w2: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+) -> torch.Tensor:
+    out = torch.zeros(
+        (hidden_states.shape[0], hidden_states.shape[1]),
+        dtype=torch.float32,
+        device=hidden_states.device,
+    )
+    for token in range(topk_ids.shape[0]):
+        for topk_idx in range(topk_ids.shape[1]):
+            expert = int(topk_ids[token, topk_idx].item())
+            gate_up = (hidden_states[token].float() @ w13[expert].float().T).to(
+                torch.bfloat16
+            )
+            intermediate = (
+                F.silu(gate_up[: gate_up.numel() // 2]) * gate_up[gate_up.numel() // 2 :]
+            ).to(torch.bfloat16)
+            slot = intermediate.float() @ w2[expert].float().T
+            out[token] += slot * topk_weights[token, topk_idx].float()
+    return out
+
+
+def _make_fp8_weight(
+    dense: torch.Tensor,
+    block_shape: tuple[int, int],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    from tokenspeed_kernel.platform import current_platform
+
+    fp8 = current_platform().fp8e4m3fn
+    block_n, block_k = block_shape
+    num_experts, n_size, k_size = dense.shape
+    scale = torch.empty(
+        (
+            num_experts,
+            math.ceil(n_size / block_n),
+            math.ceil(k_size / block_k),
+        ),
+        device=dense.device,
+        dtype=torch.float32,
+    )
+    quantized = torch.empty(dense.shape, device=dense.device, dtype=fp8.dtype)
+    for expert in range(num_experts):
+        for n_block, n_start in enumerate(range(0, n_size, block_n)):
+            n_end = min(n_start + block_n, n_size)
+            for k_block, k_start in enumerate(range(0, k_size, block_k)):
+                k_end = min(k_start + block_k, k_size)
+                block = dense[expert, n_start:n_end, k_start:k_end].float()
+                block_scale = torch.clamp(block.abs().max() / fp8.max, min=1e-6)
+                scale[expert, n_block, k_block] = block_scale
+                quantized[expert, n_start:n_end, k_start:k_end] = torch.clamp(
+                    block / block_scale,
+                    min=fp8.min,
+                    max=fp8.max,
+                ).to(fp8.dtype)
+    return quantized, scale
+
+
+def _dequantize_fp8_weight(
+    quantized: torch.Tensor,
+    scale: torch.Tensor,
+    block_shape: tuple[int, int],
+) -> torch.Tensor:
+    block_n, block_k = block_shape
+    num_experts, n_size, k_size = quantized.shape
+    dense = torch.empty(quantized.shape, device=quantized.device, dtype=torch.float32)
+    for expert in range(num_experts):
+        for n_block, n_start in enumerate(range(0, n_size, block_n)):
+            n_end = min(n_start + block_n, n_size)
+            for k_block, k_start in enumerate(range(0, k_size, block_k)):
+                k_end = min(k_start + block_k, k_size)
+                dense[expert, n_start:n_end, k_start:k_end] = (
+                    quantized[expert, n_start:n_end, k_start:k_end].float()
+                    * scale[expert, n_block, k_block]
+                )
+    return dense

@@ -235,6 +235,39 @@ def test_owner_directed_combine_handles_empty_source_rank() -> None:
     assert returned.shape == (0, 2, 4)
 
 
+def test_owner_directed_combine_empty_source_rank_keeps_iris_barriers() -> None:
+    class FakeIrisContext:
+        def __init__(self) -> None:
+            self.barrier_count = 0
+
+        def barrier(self) -> None:
+            self.barrier_count += 1
+
+    workspace = _workspace(world_size=2, rank=1, hidden_size=4, max_tokens_per_rank=1)
+    fake_context = FakeIrisContext()
+    workspace.backend = "iris"
+    workspace._iris_context = fake_context
+    topk_ids = torch.empty((0, 2), dtype=torch.int32)
+    metadata = _metadata([], [[0], [1]], top_k=2)
+    dispatch_plan = _plan([[0], [1]], rank=1)
+    owner_outputs = workspace.combine_buffer[:1]
+    expert_owner = torch.tensor([1], dtype=torch.int32)
+    local_expert_id = torch.tensor([0], dtype=torch.int32)
+
+    returned = owner_directed_combine(
+        owner_outputs,
+        topk_ids,
+        metadata,
+        dispatch_plan,
+        workspace,
+        expert_owner,
+        local_expert_id,
+    )
+
+    assert returned.shape == (0, 2, 4)
+    assert fake_context.barrier_count == 2
+
+
 def test_owner_directed_combine_rejects_remote_owner_without_iris() -> None:
     workspace = _workspace(world_size=2, rank=0, hidden_size=2)
     topk_ids = torch.tensor([[1]], dtype=torch.int32)
