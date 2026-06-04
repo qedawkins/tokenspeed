@@ -45,6 +45,8 @@ from tokenspeed.runtime.layers.moe.backends.ep_workspace import (
 class EPOwnerDispatchPlan:
     owner_base_offsets: torch.Tensor
     owner_expert_base_offsets: torch.Tensor
+    aggregate_owner_expert_counts: torch.Tensor
+    aggregate_owner_expert_offsets: torch.Tensor
     local_expert_counts: torch.Tensor
     local_expert_offsets: torch.Tensor
 
@@ -73,7 +75,7 @@ if gluon is not None:
         owner_counts_ptr,
         owner_expert_offsets_ptr,
         owner_expert_base_offsets_ptr,
-        local_expert_offsets_ptr,
+        aggregate_owner_expert_offsets_ptr,
         DST_STRIDE_M: gl.constexpr,
         SRC_STRIDE_M: gl.constexpr,
         COMBINE_STRIDE_OWNER: gl.constexpr,
@@ -82,6 +84,8 @@ if gluon is not None:
         OWNER_EXPERT_STRIDE_LOCAL: gl.constexpr,
         OWNER_EXPERT_BASE_STRIDE_OWNER: gl.constexpr,
         OWNER_EXPERT_BASE_STRIDE_LOCAL: gl.constexpr,
+        AGGREGATE_OWNER_EXPERT_STRIDE_OWNER: gl.constexpr,
+        AGGREGATE_OWNER_EXPERT_STRIDE_LOCAL: gl.constexpr,
         HIDDEN_SIZE: gl.constexpr,
         TOPK: gl.constexpr,
         MAX_OWNER_ROWS: gl.constexpr,
@@ -125,7 +129,11 @@ if gluon is not None:
                         local_id = candidate
                         local_start = start
                 token = flat_slot // TOPK
-                expert_base = gl.load(local_expert_offsets_ptr + local_id).to(gl.int32)
+                expert_base = gl.load(
+                    aggregate_owner_expert_offsets_ptr
+                    + owner * AGGREGATE_OWNER_EXPERT_STRIDE_OWNER
+                    + local_id * AGGREGATE_OWNER_EXPERT_STRIDE_LOCAL,
+                ).to(gl.int32)
                 source_expert_base = gl.load(
                     owner_expert_base_offsets_ptr
                     + owner * OWNER_EXPERT_BASE_STRIDE_OWNER
@@ -219,11 +227,16 @@ def prepare_owner_directed_dispatch(
         local_expert_counts = all_expert_counts[:, workspace.rank, :].sum(dim=0).to(
             torch.int32
         )
+        aggregate_owner_expert_counts = all_expert_counts.sum(dim=0).to(torch.int32)
     else:
         recv_counts = torch.zeros_like(owner_counts)
         recv_counts[workspace.rank] = owner_counts[workspace.rank]
         owner_base_offsets = torch.zeros_like(owner_counts)
         owner_expert_base_offsets = torch.zeros_like(metadata.owner_expert_counts)
+        aggregate_owner_expert_counts = torch.zeros_like(metadata.owner_expert_counts)
+        aggregate_owner_expert_counts[workspace.rank] = metadata.owner_expert_counts[
+            workspace.rank
+        ]
         local_expert_counts = metadata.owner_expert_counts[workspace.rank].contiguous()
 
     recv_offsets = torch.empty(
@@ -237,6 +250,10 @@ def prepare_owner_directed_dispatch(
     return EPOwnerDispatchPlan(
         owner_base_offsets=owner_base_offsets,
         owner_expert_base_offsets=owner_expert_base_offsets,
+        aggregate_owner_expert_counts=aggregate_owner_expert_counts,
+        aggregate_owner_expert_offsets=_owner_offsets_from_counts(
+            aggregate_owner_expert_counts
+        ),
         local_expert_counts=local_expert_counts,
         local_expert_offsets=_offsets_from_counts(local_expert_counts),
     )
@@ -274,7 +291,7 @@ def _dispatch_with_iris_gluon(
         metadata.owner_counts,
         metadata.owner_expert_offsets,
         dispatch_plan.owner_expert_base_offsets,
-        dispatch_plan.local_expert_offsets,
+        dispatch_plan.aggregate_owner_expert_offsets,
         workspace.dispatch_buffer.stride(0),
         hidden_states.stride(0),
         metadata.combine_offsets.stride(0),
@@ -283,6 +300,8 @@ def _dispatch_with_iris_gluon(
         metadata.owner_expert_offsets.stride(1),
         dispatch_plan.owner_expert_base_offsets.stride(0),
         dispatch_plan.owner_expert_base_offsets.stride(1),
+        dispatch_plan.aggregate_owner_expert_offsets.stride(0),
+        dispatch_plan.aggregate_owner_expert_offsets.stride(1),
         hidden_size,
         topk_ids.shape[1],
         max_owner_rows,
@@ -313,7 +332,7 @@ def _dispatch_local_torch(
             continue
         local_id, local_start = _local_expert_for_owner_row(metadata, owner, owner_row)
         dst_row = (
-            int(dispatch_plan.local_expert_offsets[local_id].item())
+            int(dispatch_plan.aggregate_owner_expert_offsets[owner, local_id].item())
             + int(dispatch_plan.owner_expert_base_offsets[owner, local_id].item())
             + owner_row
             - local_start
@@ -466,6 +485,7 @@ def _validate_dispatch_plan(
     _validate_owner_base_offsets(dispatch_plan.owner_base_offsets, workspace)
     num_local_experts = metadata.owner_expert_counts.shape[1]
     expected_expert_base_shape = (workspace.world_size, num_local_experts)
+    expected_expert_offsets_shape = (workspace.world_size, num_local_experts + 1)
     if dispatch_plan.owner_expert_base_offsets.shape != expected_expert_base_shape:
         raise EPWorkspaceError(
             "owner_expert_base_offsets shape "
@@ -477,6 +497,16 @@ def _validate_dispatch_plan(
             "owner_expert_base_offsets",
             dispatch_plan.owner_expert_base_offsets,
             expected_expert_base_shape,
+        ),
+        (
+            "aggregate_owner_expert_counts",
+            dispatch_plan.aggregate_owner_expert_counts,
+            expected_expert_base_shape,
+        ),
+        (
+            "aggregate_owner_expert_offsets",
+            dispatch_plan.aggregate_owner_expert_offsets,
+            expected_expert_offsets_shape,
         ),
         ("local_expert_counts", dispatch_plan.local_expert_counts, (num_local_experts,)),
         (
@@ -502,6 +532,19 @@ def _validate_dispatch_plan(
         raise EPWorkspaceError(
             "local_expert_offsets must match local_expert_counts prefix sums"
         )
+    if bool(
+        (
+            dispatch_plan.aggregate_owner_expert_offsets[:, 1:]
+            - dispatch_plan.aggregate_owner_expert_offsets[:, :-1]
+        )
+        .ne(dispatch_plan.aggregate_owner_expert_counts)
+        .any()
+        .item()
+    ):
+        raise EPWorkspaceError(
+            "aggregate_owner_expert_offsets must match "
+            "aggregate_owner_expert_counts prefix sums"
+        )
 
 
 def _source_major_compat_plan(
@@ -514,6 +557,10 @@ def _source_major_compat_plan(
     plan = EPOwnerDispatchPlan(
         owner_base_offsets=owner_base_offsets,
         owner_expert_base_offsets=torch.zeros_like(metadata.owner_expert_counts),
+        aggregate_owner_expert_counts=metadata.owner_expert_counts,
+        aggregate_owner_expert_offsets=_owner_offsets_from_counts(
+            metadata.owner_expert_counts
+        ),
         local_expert_counts=local_expert_counts,
         local_expert_offsets=_offsets_from_counts(local_expert_counts),
     )
@@ -529,6 +576,17 @@ def _offsets_from_counts(counts: torch.Tensor) -> torch.Tensor:
     )
     offsets[0] = 0
     offsets[1:] = torch.cumsum(counts, dim=0, dtype=torch.int32)
+    return offsets
+
+
+def _owner_offsets_from_counts(counts: torch.Tensor) -> torch.Tensor:
+    offsets = torch.empty(
+        (counts.shape[0], counts.shape[1] + 1),
+        dtype=torch.int32,
+        device=counts.device,
+    )
+    offsets[:, 0] = 0
+    offsets[:, 1:] = torch.cumsum(counts, dim=1, dtype=torch.int32)
     return offsets
 
 

@@ -29,6 +29,7 @@ import torch
 import torch.distributed as dist
 
 from tokenspeed.runtime.layers.moe.backends.ep_dispatch import (
+    EPOwnerDispatchPlan,
     owner_directed_dispatch,
     prepare_owner_directed_dispatch,
 )
@@ -214,10 +215,50 @@ def test_prepare_owner_directed_dispatch_aggregates_owner_expert_offsets(
     plan = prepare_owner_directed_dispatch(metadata, workspace)
 
     assert plan.owner_expert_base_offsets.tolist() == [[1, 1], [1, 0]]
+    assert plan.aggregate_owner_expert_counts.tolist() == [[3, 2], [1, 1]]
+    assert plan.aggregate_owner_expert_offsets.tolist() == [[0, 3, 5], [0, 1, 2]]
     assert plan.local_expert_counts.tolist() == [1, 1]
     assert plan.local_expert_offsets.tolist() == [0, 1, 2]
     assert workspace.rank_counts.tolist() == [1, 1]
     assert workspace.rank_offsets.tolist() == [0, 1, 2]
+
+
+def test_owner_directed_dispatch_uses_aggregate_offsets_for_owner_rows() -> None:
+    hidden_states = torch.tensor([[11.0, 12.0]])
+    topk_ids = torch.tensor([[0, 1]], dtype=torch.int32)
+    metadata = _metadata([2, 0], [[0, 1], []], owner_expert_counts=[[1, 1], [0, 0]])
+    workspace = _workspace(world_size=2, rank=0, hidden_size=2)
+    dispatch_plan = EPOwnerDispatchPlan(
+        owner_base_offsets=torch.zeros((2,), dtype=torch.int32),
+        owner_expert_base_offsets=torch.tensor(
+            [[2, 1], [0, 0]],
+            dtype=torch.int32,
+        ),
+        aggregate_owner_expert_counts=torch.tensor(
+            [[3, 2], [0, 0]],
+            dtype=torch.int32,
+        ),
+        aggregate_owner_expert_offsets=torch.tensor(
+            [[0, 3, 5], [0, 0, 0]],
+            dtype=torch.int32,
+        ),
+        local_expert_counts=torch.tensor([3, 2], dtype=torch.int32),
+        local_expert_offsets=torch.tensor([0, 3, 5], dtype=torch.int32),
+    )
+    workspace.dispatch_buffer.zero_()
+
+    step = owner_directed_dispatch(
+        hidden_states,
+        topk_ids,
+        metadata,
+        workspace,
+        dispatch_plan=dispatch_plan,
+    )
+
+    expected = torch.zeros((5, 2), dtype=torch.float32)
+    expected[2] = hidden_states[0]
+    expected[4] = hidden_states[0]
+    torch.testing.assert_close(step.dispatch_buffer, expected)
 
 
 def test_owner_directed_dispatch_rejects_shape_mismatch() -> None:
