@@ -31,3 +31,6 @@ from tokenspeed_kernel.ops.attention.gluon.mha_prefill_fp16_gfx950 import (  # n
 from tokenspeed_kernel.ops.attention.gluon.mla_decode_gfx950 import (  # noqa: F401
     gluon_mla_decode_gfx950,
 )
+from tokenspeed_kernel.ops.attention.gluon.mla_prefill_gfx950 import (  # noqa: F401
+    gluon_mla_prefill_gfx950,
+)

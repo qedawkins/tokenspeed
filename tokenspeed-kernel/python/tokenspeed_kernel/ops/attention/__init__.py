@@ -45,6 +45,7 @@ def _attention_format_signature(**roles: torch.Tensor):
 
 __all__ = [
     "mha_prefill",
+    "mla_prefill",
     "mha_extend_with_kvcache",
     "mha_decode_with_kvcache",
     "mla_decode_with_kvcache",
@@ -150,6 +151,117 @@ def mha_prefill(
             logit_cap=logit_cap,
             sinks=sinks,
             return_lse=return_lse,
+        )
+
+
+def mla_prefill(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    seq_lens: torch.Tensor,
+    cum_seq_lens: torch.Tensor,
+    max_seq_len: int,
+    batch_size: int,
+    softmax_scale: float,
+    *,
+    is_causal: bool = True,
+    return_lse: bool = False,
+    cum_seq_lens_q: torch.Tensor | None = None,
+    max_seq_len_q: int | None = None,
+    out: torch.Tensor | None = None,
+    override: str | None = None,
+    solution: str | None = None,
+) -> AttentionResult:
+    """MLA ragged prefill over Q/K/V rows.
+
+    Shapes match the existing tokenspeed MLA prefill backend contract:
+    q=[sum(q_lens), H_q, D_qk], k=[sum(kv_lens), H_k, D_qk], and
+    v=[sum(kv_lens), H_k, D_v]. Q and KV sequence boundaries may differ.
+    """
+    if q.dim() != 3 or k.dim() != 3 or v.dim() != 3:
+        raise ValueError(
+            f"q/k/v must be rank-3, got {tuple(q.shape)}, {tuple(k.shape)}, {tuple(v.shape)}"
+        )
+    if q.shape[-1] != k.shape[-1]:
+        raise ValueError(f"q and k head dims must match, got {q.shape[-1]} and {k.shape[-1]}")
+    if k.shape[1] != v.shape[1]:
+        raise ValueError(f"k/v head counts must match, got {k.shape[1]} and {v.shape[1]}")
+    if q.shape[1] % k.shape[1] != 0:
+        raise ValueError(f"q heads {q.shape[1]} must be divisible by k heads {k.shape[1]}")
+    if seq_lens.shape[0] != batch_size:
+        raise ValueError(
+            f"seq_lens must have batch_size entries, got {seq_lens.shape[0]}"
+        )
+
+    cum_seq_lens_q = cum_seq_lens if cum_seq_lens_q is None else cum_seq_lens_q
+    max_seq_len_q = max_seq_len if max_seq_len_q is None else max_seq_len_q
+    if cum_seq_lens_q.shape[0] != batch_size + 1:
+        raise ValueError(
+            f"cum_seq_lens_q must have batch_size+1 entries, got {cum_seq_lens_q.shape[0]}"
+        )
+    if cum_seq_lens.shape[0] != batch_size + 1:
+        raise ValueError(
+            f"cum_seq_lens must have batch_size+1 entries, got {cum_seq_lens.shape[0]}"
+        )
+
+    traits = {
+        "num_q_heads": q.shape[1],
+        "num_kv_heads": k.shape[1],
+        "query_dim": q.shape[-1],
+        "value_head_dim": v.shape[-1],
+        "is_causal": is_causal,
+        "return_lse": return_lse,
+    }
+    signature = _attention_format_signature(q=q, k=k, v=v)
+    kernel = select_kernel(
+        "attention",
+        "mla_prefill",
+        signature,
+        features=frozenset({"mla"}),
+        traits=traits,
+        solution=solution,
+        override=override,
+    )
+
+    shape_params = {
+        "batch_size": batch_size,
+        "total_q": q.shape[0],
+        "total_kv": k.shape[0],
+        "num_q_heads": q.shape[1],
+        "num_kv_heads": k.shape[1],
+        "query_dim": q.shape[-1],
+        "value_head_dim": v.shape[-1],
+        "max_seq_len_q": max_seq_len_q,
+        "max_seq_len_kv": max_seq_len,
+    }
+    ShapeCapture.get().record(
+        "attention",
+        "mla_prefill",
+        kernel.name,
+        q.dtype,
+        shape_params,
+    )
+
+    with kernel_scope(
+        "attention",
+        "mla_prefill",
+        q.dtype,
+        kernel_name=kernel.name,
+        **shape_params,
+    ):
+        return kernel(
+            q=q,
+            k=k,
+            v=v,
+            cum_seq_lens=cum_seq_lens,
+            max_seq_len=max_seq_len,
+            batch_size=batch_size,
+            softmax_scale=softmax_scale,
+            is_causal=is_causal,
+            return_lse=return_lse,
+            cum_seq_lens_q=cum_seq_lens_q,
+            max_seq_len_q=max_seq_len_q,
+            out=out,
         )
 
 
