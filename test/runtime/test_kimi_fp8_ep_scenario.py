@@ -412,27 +412,33 @@ def _run_kimi_ep_language_logits_case(
         rtol=0.18,
         check_dtype=False,
     )
-    assert any(
-        call.get("expected_kernel_name") == "gluon_grouped_biased_topk_gfx950"
-        and call.get("traits", {}).get("biased") is True
-        and call.get("traits", {}).get("grouped") is True
-        and call.get("traits", {}).get("ep") is True
-        for call in actual_route_calls
-    )
-    assert any(
-        call.get("expected_kernel_name") == "gluon_ep_metadata_gfx950"
-        and call.get("traits", {}).get("comm_strategy") == "ep_metadata"
-        for call in actual_dispatch_calls
-    )
-    assert sum(
-        call.get("expected_kernel_name") == "gluon_fp8_local_experts_gfx950"
-        for call in actual_expert_calls
-    ) >= 2
-    assert any(
-        call.get("expected_kernel_name") == "gluon_local_sum_reduce_gfx950"
-        and call.get("traits", {}).get("comm_strategy") is None
-        for call in actual_combine_calls
-    )
+    if total_tokens == 0:
+        assert not actual_route_calls
+        assert not actual_dispatch_calls
+        assert not actual_expert_calls
+        assert not actual_combine_calls
+    else:
+        assert any(
+            call.get("expected_kernel_name") == "gluon_grouped_biased_topk_gfx950"
+            and call.get("traits", {}).get("biased") is True
+            and call.get("traits", {}).get("grouped") is True
+            and call.get("traits", {}).get("ep") is True
+            for call in actual_route_calls
+        )
+        assert any(
+            call.get("expected_kernel_name") == "gluon_ep_metadata_gfx950"
+            and call.get("traits", {}).get("comm_strategy") == "ep_metadata"
+            for call in actual_dispatch_calls
+        )
+        assert sum(
+            call.get("expected_kernel_name") == "gluon_fp8_local_experts_gfx950"
+            for call in actual_expert_calls
+        ) >= 2
+        assert any(
+            call.get("expected_kernel_name") == "gluon_local_sum_reduce_gfx950"
+            and call.get("traits", {}).get("comm_strategy") is None
+            for call in actual_combine_calls
+        )
     if is_prefill:
         assert attn_backend.prefill_calls >= 1
     else:
@@ -440,10 +446,13 @@ def _run_kimi_ep_language_logits_case(
 
     experts = model.language_model.model.layers[0].mlp.experts
     workspace = experts.backend._ep_workspace
-    assert workspace is not None
-    assert workspace.backend == "torch"
-    assert workspace.world_size == experts.ep_size
-    assert workspace.rank == experts.ep_rank
+    if total_tokens == 0:
+        assert workspace is None
+    else:
+        assert workspace is not None
+        assert workspace.backend == "torch"
+        assert workspace.world_size == experts.ep_size
+        assert workspace.rank == experts.ep_rank
     return output.next_token_logits
 
 

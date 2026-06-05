@@ -373,7 +373,7 @@ class _S1GluonMLABackend:
             seq_lens=meta.extend_seq_lens,
             batch_size=meta.extend_seq_lens.numel(),
             causal=True,
-        )[0].reshape(q.shape[0], -1)
+        )[0].reshape(q.shape[0], q.shape[1] * v.shape[-1])
 
     def forward_extend_chunked(
         self,
@@ -457,7 +457,7 @@ class _S1GluonMLABackend:
             qk_rope_head_dim=token_to_kv_pool.qk_rope_head_dim,
             value_head_dim=layer.v_head_dim,
             softmax_scale=layer.scaling,
-        ).reshape(q.shape[0], -1)
+        ).reshape(q.shape[0], q.shape[1] * layer.v_head_dim)
 
 
 class _S1GluonMLAAttention(torch.nn.Module):
@@ -541,7 +541,10 @@ class _S1GluonMLAAttention(torch.nn.Module):
                 batch_size=meta.extend_seq_lens.numel(),
                 causal=True,
             )
-            attn = attn.reshape(hidden_states.shape[0], -1)
+            attn = attn.reshape(
+                hidden_states.shape[0],
+                self.num_heads * self.v_head_dim,
+            )
 
         return self.o_proj(attn)
 
@@ -711,7 +714,7 @@ class _TinyMLAKVPool:
         self.kv_buffer[layer.layer_id][loc.long()] = cache_k
 
 
-def _make_mla_kv_pool(device: torch.device, *, total_slots: int = 192):
+def _make_mla_kv_pool(device: torch.device, *, total_slots: int = 512):
     return _TinyMLAKVPool(
         device,
         total_slots=total_slots,
@@ -786,13 +789,16 @@ def _run_kimi_language_logits_case(
         rtol=0.18,
         check_dtype=False,
     )
-    assert actual_route_calls, "Kimi runtime did not call MoE route"
-    assert any(
-        call.get("expected_kernel_name") == "gluon_grouped_biased_topk_gfx950"
-        and call.get("traits", {}).get("biased") is True
-        and call.get("traits", {}).get("grouped") is True
-        for call in actual_route_calls
-    )
+    if total_tokens == 0:
+        assert not actual_route_calls
+    else:
+        assert actual_route_calls, "Kimi runtime did not call MoE route"
+        assert any(
+            call.get("expected_kernel_name") == "gluon_grouped_biased_topk_gfx950"
+            and call.get("traits", {}).get("biased") is True
+            and call.get("traits", {}).get("grouped") is True
+            for call in actual_route_calls
+        )
     if is_prefill:
         assert attn_backend.prefill_calls >= 1
     else:

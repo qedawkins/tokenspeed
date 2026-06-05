@@ -324,10 +324,18 @@ def _run_model_case(
     )
     experts = model.language_model.model.layers[0].mlp.experts
     workspace = experts.backend._ep_workspace
-    assert workspace is not None
-    assert workspace.backend == "torch"
-    assert workspace.world_size == experts.ep_size
-    assert workspace.rank == experts.ep_rank
+    if total_tokens == 0:
+        assert not route_calls
+        assert not dispatch_calls
+        assert not expert_calls
+        assert not combine_calls
+        assert all(value == 0 for value in path_delta.values())
+        assert workspace is None
+    else:
+        assert workspace is not None
+        assert workspace.backend == "torch"
+        assert workspace.world_size == experts.ep_size
+        assert workspace.rank == experts.ep_rank
     assert elapsed_ms > 0.0
     assert math.isfinite(elapsed_ms)
     return _S6Run(
