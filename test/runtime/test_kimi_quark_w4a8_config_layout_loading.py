@@ -137,9 +137,6 @@ def test_quark_w4a8_selector_uses_distinct_backend_and_rejects_fused_features(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from tokenspeed.runtime.layers.moe import utils as moe_utils
-    from tokenspeed.runtime.layers.moe.backends.w4a8_quark.triton import (
-        W4A8QuarkTritonBackend,
-    )
     from tokenspeed.runtime.layers.moe.core import selector as selector_module
     from tokenspeed.runtime.layers.moe.core.selector import select_backend
     from tokenspeed.runtime.layers.moe.utils import MoeBackend
@@ -154,16 +151,10 @@ def test_quark_w4a8_selector_uses_distinct_backend_and_rejects_fused_features(
     monkeypatch.setattr(selector_module, "_detect_arch", lambda: "gfx950")
 
     quant_config = W4A8QuarkConfig.from_config(quark_kimi_w4a8_quantization_config())
-    backend = select_backend(_make_spec(ep_rank=0, ep_size=1), quant_config)
+    with pytest.raises(RuntimeError, match="gfx950/w4a8_quark.*triton:unsupported"):
+        select_backend(_make_spec(ep_rank=0, ep_size=1), quant_config)
 
-    assert isinstance(backend, W4A8QuarkTritonBackend)
-    assert backend.key.quant == "w4a8_quark"
-    assert backend.key.impl == "triton"
-    assert backend.expert_weight_format_signature.name == (
-        "quark_w4a8_int4_per_channel"
-    )
-
-    with pytest.raises(RuntimeError, match="unsupported-packed-fused\\(self_routing\\)"):
+    with pytest.raises(RuntimeError, match="gfx950/w4a8_quark.*triton:unsupported"):
         select_backend(
             _make_spec(ep_rank=0, ep_size=1),
             quant_config,

@@ -154,7 +154,7 @@ _W4A8_QUARK_INT4_SCALE = ScaleFormat(
 )
 W4A8_QUARK_MISSING_KERNEL_MESSAGE = (
     "Quark W4A8 MoE expert kernel is not registered for dynamic 8-bit "
-    "activations plus packed INT4 per-channel weights"
+    "activations plus packed INT4 per-channel weights (INT4 x dynamic-8-bit)"
 )
 
 

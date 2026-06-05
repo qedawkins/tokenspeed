@@ -37,7 +37,7 @@ from tokenspeed.runtime.utils import round_up
 
 
 class W4A8QuarkTritonBackend(MoEBackend):
-    supported_arches = frozenset({"gfx950"})
+    supported_arches = frozenset({"gfx95", "gfx950"})
 
     @classmethod
     def supports(cls, spec: MoELayerSpec, quant_config: object) -> bool:
@@ -48,7 +48,9 @@ class W4A8QuarkTritonBackend(MoEBackend):
             ignored_layers=getattr(quant_config, "ignored_layers", []) or [],
         ):
             return False
-        return spec.ep_size <= 1 and spec.activation in {"silu", "swiglu"}
+        # Weight layout and loading are available for preflight, but runtime
+        # expert execution is intentionally not selectable until forward is wired.
+        return False
 
     @property
     def expert_weight_format_signature(self):
@@ -78,11 +80,24 @@ class W4A8QuarkTritonBackend(MoEBackend):
         num_global_tokens,
         max_num_tokens_per_gpu,
     ):
-        del layer, hidden_states, topk_output, num_global_tokens, max_num_tokens_per_gpu
+        del layer, topk_output, num_global_tokens, max_num_tokens_per_gpu
+        import torch
+
+        from tokenspeed_kernel.ops.moe import select_w4a8_quark_experts_kernel
+        from tokenspeed_kernel.selection import NoKernelFoundError
+
+        dtype = getattr(hidden_states, "dtype", torch.bfloat16)
+        try:
+            select_w4a8_quark_experts_kernel(
+                dtype=dtype,
+                features={"dispatch_sorted"},
+            )
+        except NoKernelFoundError as exc:
+            raise NotImplementedError(str(exc)) from exc
+
         raise NotImplementedError(
-            "Quark W4A8 MoE expert kernel is not registered for dynamic 8-bit "
-            "activations plus packed INT4 per-channel weights; a gfx950 "
-            "INT4 x dynamic-8-bit expert kernel must be wired first"
+            "Quark W4A8 MoE expert kernel selected, but W4A8 runtime "
+            "forward wiring is not implemented"
         )
 
 
