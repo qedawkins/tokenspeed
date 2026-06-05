@@ -45,6 +45,7 @@ from tokenspeed.runtime.layers.moe.backends.mxfp4.weights import (
     MXFP4_E2M1_BLOCK32_FORMAT,
     create_mxfp4_fp8_input_scales,
     create_mxfp4_weights,
+    prepare_mxfp4_for_layout_conversion,
 )
 from tokenspeed.runtime.layers.moe.core.types import MoELayerSpec
 from tokenspeed.runtime.layers.moe.topk import TopKOutputFormat
@@ -84,9 +85,8 @@ def swizzle_mxfp4(quant_tensor, scale, num_warps):
             "block_k": 256,
         }
         opt_flags.update_opt_flags_constraints(constraints)
-    # transpose the tensor so that the quantization axis is on dim1
-    quant_tensor = quant_tensor.transpose(-2, -1)
-    scale = scale.transpose(-2, -1)
+    # Transpose the tensor so that the quantization axis is on dim1.
+    quant_tensor, scale = prepare_mxfp4_for_layout_conversion(quant_tensor, scale)
     quant_tensor = convert_layout(
         wrap_torch_tensor(quant_tensor, dtype=FP4), value_layout
     )

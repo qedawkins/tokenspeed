@@ -197,6 +197,24 @@ def validate_mxfp4_expert_weight_format(
     )
 
 
+def prepare_mxfp4_for_layout_conversion(
+    packed_weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Transpose packed MXFP4 tensors for TokenSpeed layout conversion."""
+
+    return packed_weight.transpose(-2, -1), weight_scale.transpose(-2, -1)
+
+
+def restore_mxfp4_from_layout_conversion(
+    prepared_weight: torch.Tensor,
+    prepared_scale: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Invert ``prepare_mxfp4_for_layout_conversion`` for CPU validation."""
+
+    return prepared_weight.transpose(-2, -1), prepared_scale.transpose(-2, -1)
+
+
 def _normalize_logical_shape(
     logical_shape: tuple[int, int, int],
 ) -> tuple[int, int, int]:
@@ -335,6 +353,8 @@ __all__ = [
     "PackedScaleGranularity",
     "create_mxfp4_weights",
     "create_mxfp4_fp8_input_scales",
+    "prepare_mxfp4_for_layout_conversion",
+    "restore_mxfp4_from_layout_conversion",
     "validate_mxfp4_expert_weight_format",
     "validate_packed_expert_weight_format",
 ]
