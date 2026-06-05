@@ -20,6 +20,8 @@
 
 from __future__ import annotations
 
+import copy
+
 import tokenspeed_kernel
 import torch
 from tokenspeed_kernel.ops.moe.triton_kernels import (
@@ -40,6 +42,10 @@ from torch import nn
 from torch.nn.parameter import Parameter
 
 from tokenspeed.runtime.layers.moe.backends.base import MoEBackend
+from tokenspeed.runtime.layers.moe.backends.mxfp4.activation import (
+    MXFP4_ACTIVATION_SCALE_LAYOUT,
+    quantize_mxfp4_activation,
+)
 from tokenspeed.runtime.layers.moe.backends.mxfp4.weights import (
     MXFP4_BLOCK,
     MXFP4_E2M1_BLOCK32_FORMAT,
@@ -113,6 +119,12 @@ class Mxfp4TritonKernelBackend(MoEBackend):
         self._is_w4a8_fp8 = (
             isinstance(quant_config, Mxfp4Config)
             and quant_config.is_w4a8_fp8
+            and current_platform().is_amd
+        )
+        self._use_dynamic_mxfp4_activations = (
+            isinstance(quant_config, Mxfp4Config)
+            and quant_config.is_checkpoint_mxfp4_serialized
+            and not self._is_w4a8_fp8
             and current_platform().is_amd
         )
 
@@ -219,7 +231,7 @@ class Mxfp4TritonKernelBackend(MoEBackend):
         else:
             w13_lhs = InFlexData()
             w2_lhs = InFlexData()
-            out_dtype = None
+            out_dtype = torch.bfloat16 if self._use_dynamic_mxfp4_activations else None
 
         layer.w13_precision_config = PrecisionConfig(
             flex_ctx=FlexCtx(lhs_data=w13_lhs, rhs_data=w13_flex),
@@ -285,8 +297,17 @@ class Mxfp4TritonKernelBackend(MoEBackend):
                 scale=layer.w13_act_scale,
                 solution="triton",
             )
+            gemm1_dtype = hidden_states.dtype
+        elif self._use_dynamic_mxfp4_activations:
+            gemm1_input, gemm1_scale = quantize_mxfp4_activation(
+                hidden_states,
+                scale_layout=MXFP4_ACTIVATION_SCALE_LAYOUT,
+            )
+            w13_pc = _with_activation_mx_scale(w13_pc, gemm1_scale)
+            gemm1_dtype = torch.uint8
         else:
             gemm1_input = hidden_states
+            gemm1_dtype = hidden_states.dtype
 
         # First GEMM: gate_up projection with fused activation
         intermediate_cache = tokenspeed_kernel.moe_experts(
@@ -297,7 +318,7 @@ class Mxfp4TritonKernelBackend(MoEBackend):
             gather_indx=gather_indx,
             precision_config=w13_pc,
             fused_activation=act,
-            dtype=hidden_states.dtype,
+            dtype=gemm1_dtype,
             features={"ragged_metadata", "dispatch_gemm"},
             expected_kernel_name="triton_kernels_dispatch_gemm",
         )
@@ -308,8 +329,17 @@ class Mxfp4TritonKernelBackend(MoEBackend):
                 scale=layer.w2_act_scale,
                 solution="triton",
             )
+            gemm2_dtype = hidden_states.dtype
+        elif self._use_dynamic_mxfp4_activations:
+            gemm2_input, gemm2_scale = quantize_mxfp4_activation(
+                intermediate_cache,
+                scale_layout=MXFP4_ACTIVATION_SCALE_LAYOUT,
+            )
+            w2_pc = _with_activation_mx_scale(w2_pc, gemm2_scale)
+            gemm2_dtype = torch.uint8
         else:
             gemm2_input = intermediate_cache
+            gemm2_dtype = hidden_states.dtype
 
         # Second GEMM: down projection with scatter (combine)
         # gammas applies the routing weights (expert contribution weights)
@@ -323,10 +353,22 @@ class Mxfp4TritonKernelBackend(MoEBackend):
             gammas=gate_scal,
             n_tokens=n_tokens,
             n_expts_act=top_k,
-            dtype=hidden_states.dtype,
+            dtype=gemm2_dtype,
             features={"ragged_metadata", "gemm_combine"},
             expected_kernel_name="triton_kernels_gemm_combine",
         )
+
+
+def _with_activation_mx_scale(
+    precision_config: PrecisionConfig | None,
+    activation_scale: torch.Tensor,
+) -> PrecisionConfig:
+    if precision_config is None:
+        precision_config = PrecisionConfig()
+    precision_config = copy.copy(precision_config)
+    precision_config.a_mx_scale = activation_scale
+    precision_config.a_microblock_size = MXFP4_BLOCK
+    return precision_config
 
 
 __all__ = ["Mxfp4TritonKernelBackend"]
