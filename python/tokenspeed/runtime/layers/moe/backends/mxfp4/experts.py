@@ -31,6 +31,7 @@ import torch
 
 from tokenspeed.runtime.layers.moe.backends.mxfp4.activation import (
     dequantize_mxfp4_activation,
+    quantize_mxfp4_activation,
 )
 from tokenspeed.runtime.layers.moe.backends.mxfp4.weights import (
     MXFP4_E2M1_BLOCK32_FORMAT,
@@ -175,6 +176,113 @@ def owner_rank_mxfp4_gate_up_gemm(
         output_dtype=output_dtype,
         out=out,
     )
+
+
+def owner_rank_mxfp4_down_gemm(
+    intermediate: torch.Tensor,
+    local_packed_weight: torch.Tensor,
+    local_weight_scale: torch.Tensor,
+    local_expert_counts: torch.Tensor,
+    *,
+    local_expert_offsets: torch.Tensor | None = None,
+    bias: torch.Tensor | None = None,
+    output_dtype: torch.dtype | None = None,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Run local MXFP4 down-projection expert GEMM over sorted expert rows."""
+
+    _validate_down_weight_shape(local_packed_weight, intermediate)
+    packed_intermediate, intermediate_scale = quantize_mxfp4_activation(intermediate)
+    dequant_intermediate = dequantize_mxfp4_activation(
+        packed_intermediate,
+        intermediate_scale,
+        logical_shape=tuple(intermediate.shape),
+        output_dtype=torch.float32,
+    )
+    return owner_rank_mxfp4_expert_gemm(
+        dequant_intermediate,
+        local_packed_weight,
+        local_weight_scale,
+        local_expert_counts,
+        local_expert_offsets=local_expert_offsets,
+        bias=bias,
+        output_dtype=output_dtype or intermediate.dtype,
+        out=out,
+    )
+
+
+def local_mxfp4_down_gemm_combine(
+    intermediate: torch.Tensor,
+    local_packed_weight: torch.Tensor,
+    local_weight_scale: torch.Tensor,
+    local_expert_counts: torch.Tensor,
+    *,
+    scatter_indices: torch.Tensor,
+    routed_weights: torch.Tensor,
+    num_tokens: int,
+    top_k: int,
+    local_expert_offsets: torch.Tensor | None = None,
+    bias: torch.Tensor | None = None,
+    output_dtype: torch.dtype | None = None,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Run local MXFP4 down GEMM and reduce sorted top-k slots to tokens."""
+
+    owner_outputs = owner_rank_mxfp4_down_gemm(
+        intermediate,
+        local_packed_weight,
+        local_weight_scale,
+        local_expert_counts,
+        local_expert_offsets=local_expert_offsets,
+        bias=bias,
+        output_dtype=torch.float32,
+    )
+    return combine_mxfp4_routed_down_outputs(
+        owner_outputs,
+        scatter_indices,
+        routed_weights,
+        num_tokens=num_tokens,
+        top_k=top_k,
+        output_dtype=output_dtype or intermediate.dtype,
+        out=out,
+    )
+
+
+def combine_mxfp4_routed_down_outputs(
+    sorted_outputs: torch.Tensor,
+    scatter_indices: torch.Tensor,
+    routed_weights: torch.Tensor,
+    *,
+    num_tokens: int,
+    top_k: int,
+    output_dtype: torch.dtype | None = None,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Map sorted expert rows back to top-k slots and apply routed weights."""
+
+    _validate_combine_inputs(
+        sorted_outputs,
+        scatter_indices,
+        routed_weights,
+        num_tokens=num_tokens,
+        top_k=top_k,
+        out=out,
+    )
+    output_dtype = output_dtype or sorted_outputs.dtype
+    hidden_size = sorted_outputs.shape[1]
+    slot_outputs = torch.zeros(
+        (num_tokens * top_k, hidden_size),
+        dtype=torch.float32,
+        device=sorted_outputs.device,
+    )
+    weighted = sorted_outputs.float() * routed_weights.reshape(-1, 1).float()
+    slot_outputs.index_add_(0, scatter_indices.long(), weighted)
+    reduced = slot_outputs.view(num_tokens, top_k, hidden_size).sum(dim=1)
+    reduced = reduced.to(output_dtype)
+    if out is None:
+        return reduced
+    out.copy_(reduced)
+    return out
 
 
 def kimi_swiglu_gate_up(
@@ -347,9 +455,92 @@ def _validate_gate_up_weight_shape(local_packed_weight: torch.Tensor) -> int:
     return int(local_packed_weight.shape[2]) * MXFP4_E2M1_BLOCK32_FORMAT.pack_factor
 
 
+def _validate_down_weight_shape(
+    local_packed_weight: torch.Tensor,
+    intermediate: torch.Tensor,
+) -> None:
+    if intermediate.ndim != 2:
+        raise ValueError(
+            f"intermediate must be rank-2, got {tuple(intermediate.shape)}"
+        )
+    if local_packed_weight.ndim != 3:
+        raise ValueError(
+            "local_packed_weight must be rank-3, got "
+            f"{tuple(local_packed_weight.shape)}"
+        )
+    logical_input = (
+        int(local_packed_weight.shape[2]) * MXFP4_E2M1_BLOCK32_FORMAT.pack_factor
+    )
+    if logical_input != intermediate.shape[1]:
+        raise ValueError(
+            f"local down weight input {logical_input} != intermediate hidden "
+            f"{intermediate.shape[1]}"
+        )
+
+
+def _validate_combine_inputs(
+    sorted_outputs: torch.Tensor,
+    scatter_indices: torch.Tensor,
+    routed_weights: torch.Tensor,
+    *,
+    num_tokens: int,
+    top_k: int,
+    out: torch.Tensor | None,
+) -> None:
+    if sorted_outputs.ndim != 2:
+        raise ValueError(
+            f"sorted_outputs must be rank-2, got {tuple(sorted_outputs.shape)}"
+        )
+    if scatter_indices.shape != (sorted_outputs.shape[0],):
+        raise ValueError(
+            f"scatter_indices shape {tuple(scatter_indices.shape)} != "
+            f"{(sorted_outputs.shape[0],)}"
+        )
+    if scatter_indices.dtype not in (torch.int32, torch.int64):
+        raise ValueError(
+            f"scatter_indices must be int32/int64, got {scatter_indices.dtype}"
+        )
+    if scatter_indices.device != sorted_outputs.device:
+        raise ValueError(
+            "scatter_indices must be on the same device as sorted_outputs"
+        )
+    if routed_weights.shape != (sorted_outputs.shape[0],):
+        raise ValueError(
+            f"routed_weights shape {tuple(routed_weights.shape)} != "
+            f"{(sorted_outputs.shape[0],)}"
+        )
+    if routed_weights.device != sorted_outputs.device:
+        raise ValueError("routed_weights must be on the same device as sorted_outputs")
+    if num_tokens < 0:
+        raise ValueError(f"num_tokens must be non-negative, got {num_tokens}")
+    if top_k <= 0:
+        raise ValueError(f"top_k must be positive, got {top_k}")
+    expected_slots = num_tokens * top_k
+    if sorted_outputs.shape[0] > 0:
+        min_scatter = int(scatter_indices.min().item())
+        max_scatter = int(scatter_indices.max().item())
+        if min_scatter < 0 or max_scatter >= expected_slots:
+            raise ValueError(
+                "scatter_indices must be in [0, num_tokens * top_k), got "
+                f"min={min_scatter} max={max_scatter} size={expected_slots}"
+            )
+    if out is not None:
+        expected_out_shape = (num_tokens, sorted_outputs.shape[1])
+        if out.shape != expected_out_shape:
+            raise ValueError(f"out shape {tuple(out.shape)} != {expected_out_shape}")
+        if out.device != sorted_outputs.device:
+            raise ValueError(
+                f"out device {out.device} != sorted_outputs device "
+                f"{sorted_outputs.device}"
+            )
+
+
 __all__ = [
+    "combine_mxfp4_routed_down_outputs",
     "dequantize_mxfp4_expert_weight",
     "kimi_swiglu_gate_up",
+    "local_mxfp4_down_gemm_combine",
+    "owner_rank_mxfp4_down_gemm",
     "owner_rank_mxfp4_expert_gemm",
     "owner_rank_mxfp4_gate_up_gemm",
 ]

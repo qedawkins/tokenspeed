@@ -8,8 +8,11 @@ from tokenspeed.runtime.layers.moe.backends.mxfp4.activation import (
     quantize_mxfp4_activation_reference,
 )
 from tokenspeed.runtime.layers.moe.backends.mxfp4.experts import (
+    combine_mxfp4_routed_down_outputs,
     dequantize_mxfp4_expert_weight,
     kimi_swiglu_gate_up,
+    local_mxfp4_down_gemm_combine,
+    owner_rank_mxfp4_down_gemm,
     owner_rank_mxfp4_expert_gemm,
     owner_rank_mxfp4_gate_up_gemm,
 )
@@ -163,6 +166,84 @@ def test_owner_rank_mxfp4_gate_up_handles_zero_rows_and_preallocated_out() -> No
     assert actual.shape == (0, 4)
 
 
+def test_local_mxfp4_down_gemm_combine_matches_dense_reference() -> None:
+    torch.manual_seed(1618)
+    num_experts = 3
+    hidden_size = 12
+    intermediate = 64
+    num_tokens = 4
+    top_k = 2
+    local_counts = torch.tensor([0, 5, 3], dtype=torch.int32)
+    local_offsets = torch.tensor([0, 0, 5, 8], dtype=torch.int32)
+    slot_intermediate = torch.randn(num_tokens * top_k, intermediate, dtype=torch.float32)
+    slot_intermediate[1].mul_(10.0)
+    packed_weight = _random_packed_weight(num_experts, hidden_size, intermediate)
+    weight_scale = _random_e8m0_scales(num_experts, hidden_size, intermediate)
+    bias = torch.randn(num_experts, hidden_size, dtype=torch.float32) * 0.03
+    scatter_indices = torch.tensor([3, 0, 6, 1, 4, 7, 2, 5], dtype=torch.int32)
+    routed_weights = torch.tensor(
+        [0.0, 1.0, 0.125, 0.875, 0.5, 1.0, 0.25, 0.75],
+        dtype=torch.float32,
+    )
+
+    actual = local_mxfp4_down_gemm_combine(
+        slot_intermediate.to(torch.bfloat16),
+        packed_weight,
+        weight_scale,
+        local_counts,
+        scatter_indices=scatter_indices,
+        routed_weights=routed_weights,
+        num_tokens=num_tokens,
+        top_k=top_k,
+        local_expert_offsets=local_offsets,
+        bias=bias,
+        output_dtype=torch.float32,
+    )
+
+    packed_intermediate, intermediate_scale = quantize_mxfp4_activation_reference(
+        slot_intermediate.to(torch.bfloat16)
+    )
+    dequant_intermediate = dequantize_mxfp4_activation(
+        packed_intermediate,
+        intermediate_scale,
+        logical_shape=tuple(slot_intermediate.shape),
+    )
+    dense_weight = dequantize_mxfp4_expert_weight(packed_weight, weight_scale)
+    sorted_outputs = _dense_owner_reference(
+        dequant_intermediate,
+        dense_weight,
+        local_counts,
+        local_expert_offsets=local_offsets,
+        bias=bias,
+    )
+    expected = _combine_reference(
+        sorted_outputs,
+        scatter_indices,
+        routed_weights,
+        num_tokens=num_tokens,
+        top_k=top_k,
+    )
+    torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
+
+
+def test_owner_rank_mxfp4_down_gemm_handles_zero_rows_and_preallocated_out() -> None:
+    intermediate = torch.empty(0, 64, dtype=torch.bfloat16)
+    packed_weight = _random_packed_weight(2, 8, 64)
+    weight_scale = _random_e8m0_scales(2, 8, 64)
+    out = torch.empty(0, 8, dtype=torch.bfloat16)
+
+    actual = owner_rank_mxfp4_down_gemm(
+        intermediate,
+        packed_weight,
+        weight_scale,
+        torch.tensor([0, 0], dtype=torch.int32),
+        out=out,
+    )
+
+    assert actual is out
+    assert actual.shape == (0, 8)
+
+
 def test_owner_rank_mxfp4_output_dtype_defaults_and_overrides() -> None:
     local_counts = torch.tensor([1], dtype=torch.int32)
     owner_tokens = torch.randn(1, 64, dtype=torch.float32).to(torch.bfloat16)
@@ -278,6 +359,45 @@ def test_owner_rank_mxfp4_gate_up_rejects_bad_activation_layouts() -> None:
         )
 
 
+def test_local_mxfp4_down_gemm_combine_rejects_bad_layouts() -> None:
+    sorted_outputs = torch.randn(2, 4)
+    scatter_indices = torch.tensor([0, 1], dtype=torch.int32)
+    routed_weights = torch.ones(2)
+
+    with pytest.raises(ValueError, match="local down weight input"):
+        owner_rank_mxfp4_down_gemm(
+            torch.randn(2, 32),
+            _random_packed_weight(1, 4, 64),
+            _random_e8m0_scales(1, 4, 64),
+            torch.tensor([2], dtype=torch.int32),
+        )
+    with pytest.raises(ValueError, match="scatter_indices shape"):
+        combine_mxfp4_routed_down_outputs(
+            sorted_outputs,
+            scatter_indices[:1],
+            routed_weights,
+            num_tokens=1,
+            top_k=2,
+        )
+    with pytest.raises(ValueError, match="scatter_indices must be in"):
+        combine_mxfp4_routed_down_outputs(
+            sorted_outputs,
+            torch.tensor([0, 2], dtype=torch.int32),
+            routed_weights,
+            num_tokens=1,
+            top_k=2,
+        )
+    with pytest.raises(ValueError, match="out shape"):
+        combine_mxfp4_routed_down_outputs(
+            sorted_outputs,
+            scatter_indices,
+            routed_weights,
+            num_tokens=1,
+            top_k=2,
+            out=torch.empty(1, 5),
+        )
+
+
 def _random_packed_weight(
     num_experts: int,
     out_features: int,
@@ -358,3 +478,17 @@ def _kimi_swiglu_reference(
         gate = gate.clamp(max=limit)
         up = up.clamp(min=-limit, max=limit)
     return gate * torch.sigmoid(alpha * gate) * (up + 1.0)
+
+
+def _combine_reference(
+    sorted_outputs: torch.Tensor,
+    scatter_indices: torch.Tensor,
+    routed_weights: torch.Tensor,
+    *,
+    num_tokens: int,
+    top_k: int,
+) -> torch.Tensor:
+    slot_outputs = torch.zeros(num_tokens * top_k, sorted_outputs.shape[1])
+    weighted = sorted_outputs.float() * routed_weights.reshape(-1, 1).float()
+    slot_outputs.index_add_(0, scatter_indices.long(), weighted)
+    return slot_outputs.view(num_tokens, top_k, sorted_outputs.shape[1]).sum(dim=1)
