@@ -46,6 +46,14 @@ _EXPLICIT_QUANTIZATIONS = frozenset(
     }
 )
 
+_MXFP4_PACK_FACTOR = 2
+_MXFP4_SCALE_BLOCK = 32
+_KIMI_MXFP4_BF16_PASSTHROUGH_PATTERNS = (
+    "self_attn",
+    "mlp.gate",
+    "lm_head",
+)
+
 
 @dataclass(frozen=True)
 class KimiQuantizationPreflight:
@@ -91,6 +99,91 @@ class KimiMxfp4ArtifactSummary:
     num_shared_experts: int | None
     num_hidden_layers: int | None
     first_k_dense_replace: int | None
+
+
+@dataclass(frozen=True)
+class KimiMxfp4ProjectionShard:
+    name: str
+    logical_shape: tuple[int, int]
+    checkpoint_weight_shape: tuple[int, int]
+    checkpoint_scale_shape: tuple[int, int]
+    rank_logical_shape: tuple[int, int]
+    rank_weight_shape: tuple[int, int]
+    rank_scale_shape: tuple[int, int]
+    checkpoint_weight_slice: tuple[tuple[int, int], tuple[int, int]]
+    checkpoint_scale_slice: tuple[tuple[int, int], tuple[int, int]]
+    destination_weight_slice: tuple[tuple[int, int], tuple[int, int]]
+    destination_scale_slice: tuple[tuple[int, int], tuple[int, int]]
+    logical_shard_axis: int
+    checkpoint_weight_shard_axis: int
+    checkpoint_scale_shard_axis: int
+
+
+@dataclass(frozen=True)
+class KimiMxfp4ExpertOwnership:
+    num_global_experts: int
+    ep_size: int
+    ep_rank: int
+    experts_per_ep_rank: int
+    global_expert_start: int
+    global_expert_end: int
+
+    def owner_rank(self, global_expert_id: int) -> int:
+        self._validate_global_expert(global_expert_id)
+        return global_expert_id // self.experts_per_ep_rank
+
+    def local_expert_id(self, global_expert_id: int) -> int:
+        self._validate_global_expert(global_expert_id)
+        return global_expert_id % self.experts_per_ep_rank
+
+    def owns_expert(self, global_expert_id: int) -> bool:
+        self._validate_global_expert(global_expert_id)
+        return self.global_expert_start <= global_expert_id < self.global_expert_end
+
+    def owned_expert_ids(self) -> range:
+        return range(self.global_expert_start, self.global_expert_end)
+
+    def _validate_global_expert(self, global_expert_id: int) -> None:
+        if not 0 <= global_expert_id < self.num_global_experts:
+            raise ValueError(
+                f"global expert id {global_expert_id} is outside "
+                f"[0, {self.num_global_experts})"
+            )
+
+
+@dataclass(frozen=True)
+class KimiMxfp4MlpShardContract:
+    name: str
+    checkpoint_prefix: str
+    uses_ep_ownership: bool
+    num_rank_local_experts: int | None
+    rank_local_w13_weight_shape: tuple[int, ...]
+    rank_local_w13_scale_shape: tuple[int, ...]
+    rank_local_w2_weight_shape: tuple[int, ...]
+    rank_local_w2_scale_shape: tuple[int, ...]
+    gate_proj: KimiMxfp4ProjectionShard
+    up_proj: KimiMxfp4ProjectionShard
+    down_proj: KimiMxfp4ProjectionShard
+
+
+@dataclass(frozen=True)
+class KimiMxfp4ShardingContract:
+    tp_size: int
+    ep_size: int
+    tp_rank: int
+    ep_rank: int
+    hidden_size: int
+    dense_intermediate_size: int
+    moe_intermediate_size: int
+    num_shared_experts: int
+    first_k_dense_replace: int
+    pack_factor: int
+    scale_block: int
+    bf16_passthrough_patterns: tuple[str, ...]
+    routed_ownership: KimiMxfp4ExpertOwnership
+    routed: KimiMxfp4MlpShardContract
+    shared: KimiMxfp4MlpShardContract
+    dense: KimiMxfp4MlpShardContract
 
 
 def normalize_cli_quantization(quantization: str | None) -> str | None:
@@ -401,6 +494,297 @@ def _as_optional_int(value: object, *, default: int | None = None) -> int | None
         return int(value)
     except (TypeError, ValueError):
         return default
+
+
+def build_kimi_mxfp4_sharding_contract(
+    model_config: Mapping[str, Any],
+    *,
+    tp_size: int = 4,
+    ep_size: int = 4,
+    tp_rank: int = 0,
+    ep_rank: int = 0,
+) -> KimiMxfp4ShardingContract:
+    quantization_config = _extract_quantization_config(model_config)
+    if quantization_config is None or not is_quark_mxfp4_dynamic_fp4_config(
+        quantization_config
+    ):
+        raise ValueError("Kimi MXFP4 sharding contract requires Quark dynamic-FP4 MXFP4")
+
+    text_config = model_config.get("text_config") or {}
+    if not isinstance(text_config, Mapping):
+        raise ValueError("Kimi MXFP4 sharding contract requires text_config metadata")
+
+    _validate_rank("TP", tp_size, tp_rank)
+    _validate_rank("EP", ep_size, ep_rank)
+
+    hidden_size = _required_text_int(text_config, "hidden_size")
+    dense_intermediate_size = _required_text_int(text_config, "intermediate_size")
+    moe_intermediate_size = _required_text_int(text_config, "moe_intermediate_size")
+    num_routed_experts = _required_text_int(text_config, "n_routed_experts")
+    num_shared_experts = _required_text_int(text_config, "n_shared_experts")
+    first_k_dense_replace = _required_text_int(text_config, "first_k_dense_replace")
+
+    if num_routed_experts % ep_size != 0:
+        raise ValueError(
+            "Kimi MXFP4 routed experts must be divisible by EP size: "
+            f"{num_routed_experts} vs {ep_size}"
+        )
+    if moe_intermediate_size % tp_size != 0:
+        raise ValueError(
+            "Kimi MXFP4 MoE intermediate size must be divisible by TP size: "
+            f"{moe_intermediate_size} vs {tp_size}"
+        )
+    if dense_intermediate_size % tp_size != 0:
+        raise ValueError(
+            "Kimi MXFP4 dense intermediate size must be divisible by TP size: "
+            f"{dense_intermediate_size} vs {tp_size}"
+        )
+    _validate_mxfp4_dims(moe_intermediate_size, hidden_size)
+    _validate_mxfp4_dims(dense_intermediate_size, hidden_size)
+    _validate_mxfp4_dims(hidden_size, moe_intermediate_size)
+    _validate_mxfp4_dims(hidden_size, dense_intermediate_size)
+
+    experts_per_ep_rank = num_routed_experts // ep_size
+    expert_start = ep_rank * experts_per_ep_rank
+    expert_end = expert_start + experts_per_ep_rank
+    routed_ownership = KimiMxfp4ExpertOwnership(
+        num_global_experts=num_routed_experts,
+        ep_size=ep_size,
+        ep_rank=ep_rank,
+        experts_per_ep_rank=experts_per_ep_rank,
+        global_expert_start=expert_start,
+        global_expert_end=expert_end,
+    )
+
+    routed = _make_mlp_shard_contract(
+        name="routed",
+        checkpoint_prefix="mlp.experts.<global_expert_id>",
+        hidden_size=hidden_size,
+        intermediate_size=moe_intermediate_size,
+        tp_size=tp_size,
+        tp_rank=tp_rank,
+        num_rank_local_experts=experts_per_ep_rank,
+        uses_ep_ownership=True,
+    )
+    shared = _make_mlp_shard_contract(
+        name="shared",
+        checkpoint_prefix="mlp.shared_experts",
+        hidden_size=hidden_size,
+        intermediate_size=moe_intermediate_size * num_shared_experts,
+        tp_size=tp_size,
+        tp_rank=tp_rank,
+        num_rank_local_experts=None,
+        uses_ep_ownership=False,
+    )
+    dense = _make_mlp_shard_contract(
+        name="dense",
+        checkpoint_prefix="mlp",
+        hidden_size=hidden_size,
+        intermediate_size=dense_intermediate_size,
+        tp_size=tp_size,
+        tp_rank=tp_rank,
+        num_rank_local_experts=None,
+        uses_ep_ownership=False,
+    )
+
+    return KimiMxfp4ShardingContract(
+        tp_size=tp_size,
+        ep_size=ep_size,
+        tp_rank=tp_rank,
+        ep_rank=ep_rank,
+        hidden_size=hidden_size,
+        dense_intermediate_size=dense_intermediate_size,
+        moe_intermediate_size=moe_intermediate_size,
+        num_shared_experts=num_shared_experts,
+        first_k_dense_replace=first_k_dense_replace,
+        pack_factor=_MXFP4_PACK_FACTOR,
+        scale_block=_MXFP4_SCALE_BLOCK,
+        bf16_passthrough_patterns=_KIMI_MXFP4_BF16_PASSTHROUGH_PATTERNS,
+        routed_ownership=routed_ownership,
+        routed=routed,
+        shared=shared,
+        dense=dense,
+    )
+
+
+def _validate_rank(name: str, size: int, rank: int) -> None:
+    if size <= 0:
+        raise ValueError(f"{name} size must be positive, got {size}")
+    if not 0 <= rank < size:
+        raise ValueError(f"{name} rank {rank} is outside [0, {size})")
+
+
+def _required_text_int(text_config: Mapping[str, Any], key: str) -> int:
+    value = _as_optional_int(text_config.get(key))
+    if value is None:
+        raise ValueError(f"Kimi MXFP4 text_config is missing integer {key!r}")
+    if value <= 0:
+        raise ValueError(f"Kimi MXFP4 text_config {key!r} must be positive")
+    return value
+
+
+def _validate_mxfp4_dims(out_features: int, in_features: int) -> None:
+    if in_features % _MXFP4_PACK_FACTOR != 0:
+        raise ValueError(
+            f"MXFP4 input dim {in_features} must be divisible by "
+            f"pack factor {_MXFP4_PACK_FACTOR}"
+        )
+    if in_features % _MXFP4_SCALE_BLOCK != 0:
+        raise ValueError(
+            f"MXFP4 input dim {in_features} must be divisible by "
+            f"scale block {_MXFP4_SCALE_BLOCK}"
+        )
+    if out_features <= 0:
+        raise ValueError(f"MXFP4 output dim must be positive, got {out_features}")
+
+
+def _make_mlp_shard_contract(
+    *,
+    name: str,
+    checkpoint_prefix: str,
+    hidden_size: int,
+    intermediate_size: int,
+    tp_size: int,
+    tp_rank: int,
+    num_rank_local_experts: int | None,
+    uses_ep_ownership: bool,
+) -> KimiMxfp4MlpShardContract:
+    local_intermediate = intermediate_size // tp_size
+    gate_proj = _make_column_sharded_projection(
+        name=f"{name}.gate_proj",
+        out_features=intermediate_size,
+        in_features=hidden_size,
+        tp_size=tp_size,
+        tp_rank=tp_rank,
+        destination_row_offset=0,
+    )
+    up_proj = _make_column_sharded_projection(
+        name=f"{name}.up_proj",
+        out_features=intermediate_size,
+        in_features=hidden_size,
+        tp_size=tp_size,
+        tp_rank=tp_rank,
+        destination_row_offset=local_intermediate,
+    )
+    down_proj = _make_row_sharded_projection(
+        name=f"{name}.down_proj",
+        out_features=hidden_size,
+        in_features=intermediate_size,
+        tp_size=tp_size,
+        tp_rank=tp_rank,
+    )
+
+    w13_shape = (2 * local_intermediate, hidden_size // _MXFP4_PACK_FACTOR)
+    w13_scale_shape = (2 * local_intermediate, hidden_size // _MXFP4_SCALE_BLOCK)
+    w2_shape = (hidden_size, local_intermediate // _MXFP4_PACK_FACTOR)
+    w2_scale_shape = (hidden_size, local_intermediate // _MXFP4_SCALE_BLOCK)
+    if num_rank_local_experts is not None:
+        rank_local_w13_weight_shape = (num_rank_local_experts, *w13_shape)
+        rank_local_w13_scale_shape = (num_rank_local_experts, *w13_scale_shape)
+        rank_local_w2_weight_shape = (num_rank_local_experts, *w2_shape)
+        rank_local_w2_scale_shape = (num_rank_local_experts, *w2_scale_shape)
+    else:
+        rank_local_w13_weight_shape = w13_shape
+        rank_local_w13_scale_shape = w13_scale_shape
+        rank_local_w2_weight_shape = w2_shape
+        rank_local_w2_scale_shape = w2_scale_shape
+
+    return KimiMxfp4MlpShardContract(
+        name=name,
+        checkpoint_prefix=checkpoint_prefix,
+        uses_ep_ownership=uses_ep_ownership,
+        num_rank_local_experts=num_rank_local_experts,
+        rank_local_w13_weight_shape=rank_local_w13_weight_shape,
+        rank_local_w13_scale_shape=rank_local_w13_scale_shape,
+        rank_local_w2_weight_shape=rank_local_w2_weight_shape,
+        rank_local_w2_scale_shape=rank_local_w2_scale_shape,
+        gate_proj=gate_proj,
+        up_proj=up_proj,
+        down_proj=down_proj,
+    )
+
+
+def _make_column_sharded_projection(
+    *,
+    name: str,
+    out_features: int,
+    in_features: int,
+    tp_size: int,
+    tp_rank: int,
+    destination_row_offset: int,
+) -> KimiMxfp4ProjectionShard:
+    local_out = out_features // tp_size
+    row_start = tp_rank * local_out
+    row_end = row_start + local_out
+    weight_cols = in_features // _MXFP4_PACK_FACTOR
+    scale_cols = in_features // _MXFP4_SCALE_BLOCK
+    destination_start = destination_row_offset
+    destination_end = destination_start + local_out
+    return KimiMxfp4ProjectionShard(
+        name=name,
+        logical_shape=(out_features, in_features),
+        checkpoint_weight_shape=(out_features, weight_cols),
+        checkpoint_scale_shape=(out_features, scale_cols),
+        rank_logical_shape=(local_out, in_features),
+        rank_weight_shape=(local_out, weight_cols),
+        rank_scale_shape=(local_out, scale_cols),
+        checkpoint_weight_slice=((row_start, row_end), (0, weight_cols)),
+        checkpoint_scale_slice=((row_start, row_end), (0, scale_cols)),
+        destination_weight_slice=(
+            (destination_start, destination_end),
+            (0, weight_cols),
+        ),
+        destination_scale_slice=(
+            (destination_start, destination_end),
+            (0, scale_cols),
+        ),
+        logical_shard_axis=0,
+        checkpoint_weight_shard_axis=0,
+        checkpoint_scale_shard_axis=0,
+    )
+
+
+def _make_row_sharded_projection(
+    *,
+    name: str,
+    out_features: int,
+    in_features: int,
+    tp_size: int,
+    tp_rank: int,
+) -> KimiMxfp4ProjectionShard:
+    local_in = in_features // tp_size
+    logical_start = tp_rank * local_in
+    logical_end = logical_start + local_in
+    weight_cols = in_features // _MXFP4_PACK_FACTOR
+    scale_cols = in_features // _MXFP4_SCALE_BLOCK
+    local_weight_cols = local_in // _MXFP4_PACK_FACTOR
+    local_scale_cols = local_in // _MXFP4_SCALE_BLOCK
+    weight_col_start = logical_start // _MXFP4_PACK_FACTOR
+    weight_col_end = logical_end // _MXFP4_PACK_FACTOR
+    scale_col_start = logical_start // _MXFP4_SCALE_BLOCK
+    scale_col_end = logical_end // _MXFP4_SCALE_BLOCK
+    return KimiMxfp4ProjectionShard(
+        name=name,
+        logical_shape=(out_features, in_features),
+        checkpoint_weight_shape=(out_features, weight_cols),
+        checkpoint_scale_shape=(out_features, scale_cols),
+        rank_logical_shape=(out_features, local_in),
+        rank_weight_shape=(out_features, local_weight_cols),
+        rank_scale_shape=(out_features, local_scale_cols),
+        checkpoint_weight_slice=(
+            (0, out_features),
+            (weight_col_start, weight_col_end),
+        ),
+        checkpoint_scale_slice=(
+            (0, out_features),
+            (scale_col_start, scale_col_end),
+        ),
+        destination_weight_slice=((0, out_features), (0, local_weight_cols)),
+        destination_scale_slice=((0, out_features), (0, local_scale_cols)),
+        logical_shard_axis=1,
+        checkpoint_weight_shard_axis=1,
+        checkpoint_scale_shard_axis=1,
+    )
 
 
 def preflight_kimi_quantization(
