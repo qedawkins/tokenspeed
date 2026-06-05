@@ -602,6 +602,78 @@ def _reference_bf16_local_moe(
     return output.to(hidden_states.dtype)
 
 
+def _make_per_channel_fp8_weight(
+    dense: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    from tokenspeed_kernel.platform import current_platform
+
+    fp8 = current_platform().fp8e4m3fn
+    scale = torch.clamp(
+        dense.float().abs().amax(dim=2, keepdim=True) / fp8.max,
+        min=1e-6,
+    )
+    quantized = torch.clamp(
+        dense.float() / scale,
+        min=fp8.min,
+        max=fp8.max,
+    ).to(fp8.dtype)
+    return quantized, scale
+
+
+def _w8a8_per_channel_matmul(
+    A: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    expert: int,
+) -> torch.Tensor:
+    from tokenspeed_kernel.ops.gemm.fp8_utils import scaled_fp8_quant
+
+    A_fp8, A_scale = scaled_fp8_quant(
+        A.contiguous(),
+        None,
+        use_per_token_if_dynamic=True,
+    )
+    A_dequantized = A_fp8.float() * A_scale.float()
+    weight_dequantized = weight[expert].float() * weight_scale[expert].float()
+    return A_dequantized @ weight_dequantized.T
+
+
+def _reference_w8a8_local_moe(
+    hidden_states: torch.Tensor,
+    w13_weight: torch.Tensor,
+    w13_weight_scale: torch.Tensor,
+    w2_weight: torch.Tensor,
+    w2_weight_scale: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+) -> torch.Tensor:
+    output = torch.zeros_like(hidden_states, dtype=torch.float32)
+    intermediate_size = w2_weight.shape[-1]
+    for token in range(hidden_states.shape[0]):
+        hidden = hidden_states[token : token + 1]
+        for slot in range(topk_ids.shape[1]):
+            expert = int(topk_ids[token, slot].item())
+            gate_up = _w8a8_per_channel_matmul(
+                hidden,
+                w13_weight,
+                w13_weight_scale,
+                expert,
+            )[0].to(torch.bfloat16)
+            activated = (
+                torch.nn.functional.silu(gate_up[:intermediate_size])
+                * gate_up[intermediate_size:]
+            ).reshape(1, intermediate_size).to(torch.bfloat16)
+            down = _w8a8_per_channel_matmul(
+                activated,
+                w2_weight,
+                w2_weight_scale,
+                expert,
+            )[0]
+            down *= topk_weights[token, slot].float()
+            output[token] += down.to(torch.bfloat16).float()
+    return output.to(hidden_states.dtype)
+
+
 def test_s2_bf16_tp_runtime_forward_uses_existing_contracts(
     device: str,
     monkeypatch,
@@ -720,5 +792,153 @@ def test_s2_bf16_tp_runtime_forward_uses_existing_contracts(
         expected.float(),
         atol=0.08,
         rtol=0.05,
+        check_dtype=False,
+    )
+
+
+def test_s3_w8a8_tp_runtime_forward_uses_existing_contracts(
+    device: str,
+    monkeypatch,
+    mi350_platform,
+) -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA/HIP GPU is required for W8A8 TP runtime forward coverage")
+
+    import tokenspeed.runtime.layers.moe.backends.triton_common as triton_common
+    from tokenspeed.runtime.layers.moe.core.types import MoELayerSpec
+
+    monkeypatch.setattr(triton_common, "current_platform", lambda: mi350_platform)
+
+    torch.manual_seed(7304)
+    num_tokens = 8
+    hidden_size = 32
+    intermediate_size = 24
+    num_experts = 4
+    top_k = 2
+    spec = MoELayerSpec(
+        top_k=top_k,
+        num_experts=num_experts,
+        num_local_experts=num_experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        activation="silu",
+        tp_rank=0,
+        tp_size=1,
+        ep_rank=0,
+        ep_size=1,
+    )
+    hidden_states = (
+        torch.randn(num_tokens, hidden_size, device=device)
+        * torch.linspace(
+            0.04,
+            0.90,
+            steps=num_tokens,
+            device=device,
+            dtype=torch.float32,
+        ).view(num_tokens, 1)
+    ).bfloat16()
+    gate_up_channel_scale = torch.linspace(
+        0.05,
+        1.70,
+        steps=2 * intermediate_size,
+        device=device,
+        dtype=torch.float32,
+    ).view(1, 2 * intermediate_size, 1)
+    down_channel_scale = torch.linspace(
+        0.03,
+        1.40,
+        steps=hidden_size,
+        device=device,
+        dtype=torch.float32,
+    ).view(1, hidden_size, 1)
+    w13_dense = (
+        torch.randn(
+            num_experts,
+            2 * intermediate_size,
+            hidden_size,
+            device=device,
+        )
+        * gate_up_channel_scale
+        * 0.16
+    )
+    w2_dense = (
+        torch.randn(num_experts, hidden_size, intermediate_size, device=device)
+        * down_channel_scale
+        * 0.14
+    )
+    w13_weight, w13_weight_scale = _make_per_channel_fp8_weight(w13_dense)
+    w2_weight, w2_weight_scale = _make_per_channel_fp8_weight(w2_dense)
+    layer = SimpleNamespace(
+        w13_weight=w13_weight,
+        w13_weight_scale=w13_weight_scale,
+        w2_weight=w2_weight,
+        w2_weight_scale=w2_weight_scale,
+    )
+    topk_ids = torch.tensor(
+        [
+            [0, 1],
+            [1, 3],
+            [3, 0],
+            [0, 3],
+            [1, 0],
+            [3, 1],
+            [0, 1],
+            [1, 3],
+        ],
+        device=device,
+        dtype=torch.int32,
+    )
+    topk_weights = torch.linspace(
+        0.2,
+        0.9,
+        steps=num_tokens * top_k,
+        device=device,
+        dtype=torch.float32,
+    ).view(num_tokens, top_k)
+
+    gate_up_gemm, down_gemm, get_config_func = triton_common.build_triton_gemms(
+        layer,
+        spec,
+        use_fp8_w8a8=True,
+        per_channel_quant=True,
+        dtype_tag="fp8_w8a8",
+        gate_up_B_scale=layer.w13_weight_scale,
+        down_B_scale=layer.w2_weight_scale,
+    )
+    assert (
+        gate_up_gemm.keywords["expected_kernel_name"]
+        == "gluon_fp8_local_experts_gfx950"
+    )
+    assert (
+        down_gemm.keywords["expected_kernel_name"]
+        == "gluon_fp8_local_experts_gfx950"
+    )
+    assert topk_ids.ne(2).all()
+
+    actual = triton_common.triton_forward(
+        gate_up_gemm,
+        down_gemm,
+        get_config_func,
+        "silu",
+        layer,
+        hidden_states.contiguous(),
+        SimpleNamespace(topk_ids=topk_ids, topk_weights=topk_weights),
+    )
+    torch.cuda.synchronize()
+
+    expected = _reference_w8a8_local_moe(
+        hidden_states,
+        layer.w13_weight,
+        layer.w13_weight_scale,
+        layer.w2_weight,
+        layer.w2_weight_scale,
+        topk_ids,
+        topk_weights,
+    )
+    torch.testing.assert_close(
+        actual.float(),
+        expected.float(),
+        atol=0.12,
+        rtol=0.08,
         check_dtype=False,
     )

@@ -550,6 +550,48 @@ def static_quant_fp8(
     return x_q, x_s
 
 
+def _torch_dynamic_scaled_fp8_quant(
+    input: torch.Tensor,
+    output: torch.Tensor,
+    scale: torch.Tensor,
+    *,
+    per_token: bool,
+) -> None:
+    valid_rows = input.shape[0]
+    input_fp32 = input.contiguous().float()
+    if output.shape[0] > valid_rows:
+        output[valid_rows:].zero_()
+
+    if input.numel() == 0:
+        scale.fill_(1.0)
+        return
+
+    if per_token:
+        row_scale = torch.clamp(
+            input_fp32.abs().amax(dim=1, keepdim=True) / fp8_max,
+            min=1e-12,
+        )
+        quantized = torch.clamp(
+            input_fp32 / row_scale,
+            min=fp8_min,
+            max=fp8_max,
+        ).to(fp8_dtype)
+        output[:valid_rows].copy_(quantized)
+        scale[:valid_rows].copy_(row_scale)
+        if scale.shape[0] > valid_rows:
+            scale[valid_rows:].fill_(1.0)
+        return
+
+    scale_value = torch.clamp(input_fp32.abs().max() / fp8_max, min=1e-12)
+    quantized = torch.clamp(
+        input_fp32 / scale_value,
+        min=fp8_min,
+        max=fp8_max,
+    ).to(fp8_dtype)
+    output[:valid_rows].copy_(quantized)
+    scale.copy_(scale_value.reshape_as(scale))
+
+
 def scaled_fp8_quant(
     input: torch.Tensor,
     scale: Optional[torch.Tensor] = None,
@@ -570,12 +612,28 @@ def scaled_fp8_quant(
                 scale = torch.empty(
                     (shape[0], 1), device=input.device, dtype=torch.float32
                 )
-                torch.ops._C.dynamic_per_token_scaled_fp8_quant(
-                    output, input.contiguous(), scale, None
-                )
+                if hasattr(torch.ops._C, "dynamic_per_token_scaled_fp8_quant"):
+                    torch.ops._C.dynamic_per_token_scaled_fp8_quant(
+                        output, input.contiguous(), scale, None
+                    )
+                else:
+                    _torch_dynamic_scaled_fp8_quant(
+                        input,
+                        output,
+                        scale,
+                        per_token=True,
+                    )
             else:
                 scale = torch.zeros(1, device=input.device, dtype=torch.float32)
-                torch.ops._C.dynamic_scaled_fp8_quant(output, input, scale)
+                if hasattr(torch.ops._C, "dynamic_scaled_fp8_quant"):
+                    torch.ops._C.dynamic_scaled_fp8_quant(output, input, scale)
+                else:
+                    _torch_dynamic_scaled_fp8_quant(
+                        input,
+                        output,
+                        scale,
+                        per_token=False,
+                    )
         else:
             # Static scaling
             assert (
