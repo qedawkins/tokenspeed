@@ -33,6 +33,7 @@ from tokenspeed_kernel.ops.moe.triton_kernels import (
     PrecisionConfig,
     convert_layout,
     layout,
+    make_ragged_tensor_metadata,
     opt_flags,
     swiglu_fn,
     wrap_torch_tensor,
@@ -45,6 +46,10 @@ from tokenspeed.runtime.layers.moe.backends.base import MoEBackend
 from tokenspeed.runtime.layers.moe.backends.mxfp4.activation import (
     MXFP4_ACTIVATION_SCALE_LAYOUT,
     quantize_mxfp4_activation,
+)
+from tokenspeed.runtime.layers.moe.backends.mxfp4.routing import (
+    is_kimi_sigmoid_noaux_topk_config,
+    mxfp4_kimi_sigmoid_ragged_route_from_bypassed,
 )
 from tokenspeed.runtime.layers.moe.backends.mxfp4.weights import (
     MXFP4_BLOCK,
@@ -265,16 +270,26 @@ class Mxfp4TritonKernelBackend(MoEBackend):
         top_k = topk_output.topk_config.top_k
         n_tokens = router_logits.shape[0]
 
-        ragged_metadata, gather_indx, scatter_indx, gate_scal = (
-            tokenspeed_kernel.moe_route(
-                router_logits,
-                top_k,
-                sm_first=False,
-                dtype=router_logits.dtype,
-                traits={"output_type": "ragged_metadata"},
-                expected_kernel_name="triton_kernels_routing",
+        if is_kimi_sigmoid_noaux_topk_config(topk_output.topk_config):
+            ragged_metadata, gather_indx, scatter_indx, gate_scal = (
+                mxfp4_kimi_sigmoid_ragged_route_from_bypassed(
+                    topk_output,
+                    num_experts=router_logits.shape[1],
+                    metadata_factory=make_ragged_tensor_metadata,
+                    gate_dtype=router_logits.dtype,
+                )
             )
-        )
+        else:
+            ragged_metadata, gather_indx, scatter_indx, gate_scal = (
+                tokenspeed_kernel.moe_route(
+                    router_logits,
+                    top_k,
+                    sm_first=False,
+                    dtype=router_logits.dtype,
+                    traits={"output_type": "ragged_metadata"},
+                    expected_kernel_name="triton_kernels_routing",
+                )
+            )
 
         w13_weight = layer.w13_weight_triton_tensor
         w2_weight = layer.w2_weight_triton_tensor
