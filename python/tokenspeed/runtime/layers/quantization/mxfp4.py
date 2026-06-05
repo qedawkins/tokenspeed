@@ -24,21 +24,23 @@ from __future__ import annotations
 import re
 
 import torch
-from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
+from tokenspeed.runtime.kimi_quantization_preflight import (
+    is_quark_mxfp4_dynamic_fp4_config,
+)
 
 
-def _is_amd_quark_w_mxfp4_a_fp8(config: dict) -> bool:
+def _is_quark_w_mxfp4_a_fp8(config: dict) -> bool:
     if not isinstance(config, dict):
-        return False
-    if not current_platform().is_amd:
         return False
     if str(config.get("quant_method", "")).lower() != "quark":
         return False
     g = config.get("global_quant_config") or {}
     weight = g.get("weight") or {}
     inputs = g.get("input_tensors") or {}
+    if not isinstance(weight, dict) or not isinstance(inputs, dict):
+        return False
     if str(weight.get("dtype", "")).lower() not in {"fp4", "mxfp4"}:
         return False
     if int(weight.get("group_size", 0)) != 32:
@@ -47,6 +49,12 @@ def _is_amd_quark_w_mxfp4_a_fp8(config: dict) -> bool:
     if "fp8" not in in_dtype:
         return False
     return True
+
+
+def _is_quark_mxfp4_checkpoint(config: dict) -> bool:
+    return _is_quark_w_mxfp4_a_fp8(config) or is_quark_mxfp4_dynamic_fp4_config(
+        config
+    )
 
 
 def _normalize_ignored_layer_patterns(patterns: list[str] | None) -> list[str]:
@@ -88,8 +96,12 @@ class Mxfp4Config(QuantizationConfig):
     @classmethod
     def from_config(cls, config):
         quant_method = str(config.get("quant_method", "")).lower()
-        is_w4a8_fp8 = _is_amd_quark_w_mxfp4_a_fp8(config)
-        is_checkpoint_mxfp4_serialized = "mxfp4" in quant_method or is_w4a8_fp8
+        is_w4a8_fp8 = _is_quark_w_mxfp4_a_fp8(config)
+        is_checkpoint_mxfp4_serialized = (
+            "mxfp4" in quant_method
+            or is_w4a8_fp8
+            or is_quark_mxfp4_dynamic_fp4_config(config)
+        )
 
         raw_ignored = cls.get_from_keys_or(config, ["ignored_layers", "exclude"], None)
         ignored_layers = _normalize_ignored_layer_patterns(raw_ignored)
@@ -102,8 +114,8 @@ class Mxfp4Config(QuantizationConfig):
 
     @classmethod
     def override_quantization_method(cls, hf_quant_cfg, user_quant) -> str | None:
-        """Promote AMD Quark w_mxfp4_a_fp8 checkpoints to mxfp4."""
-        if user_quant in {"mxfp4", None} and _is_amd_quark_w_mxfp4_a_fp8(hf_quant_cfg):
+        """Promote Quark MXFP4 checkpoint metadata to mxfp4."""
+        if user_quant in {"mxfp4", None} and _is_quark_mxfp4_checkpoint(hf_quant_cfg):
             return "mxfp4"
         return None
 

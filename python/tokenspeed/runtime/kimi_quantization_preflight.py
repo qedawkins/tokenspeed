@@ -204,6 +204,8 @@ def detect_quark_quantization(
         return "w8a8_fp8"
     if _is_quark_w4a8(quantization_config):
         return "w4a8_quark"
+    if is_quark_mxfp4_dynamic_fp4_config(quantization_config):
+        return "mxfp4"
     return None
 
 
@@ -427,7 +429,7 @@ def preflight_kimi_quantization(
             source=source if quantization else "missing-local-json",
             config_path=None,
             requires_local_artifact=not os.path.isdir(os.path.expanduser(model)),
-            is_quark=quantization in {"w8a8_fp8", "w4a8_quark"},
+            is_quark=quantization in {"w8a8_fp8", "w4a8_quark", "mxfp4"},
         )
 
     quantization = resolve_kimi_quantization_from_config(
@@ -440,5 +442,5 @@ def preflight_kimi_quantization(
         source=source,
         config_path=config_path,
         requires_local_artifact=False,
-        is_quark=quantization in {"w8a8_fp8", "w4a8_quark"},
+        is_quark=quantization in {"w8a8_fp8", "w4a8_quark", "mxfp4"},
     )

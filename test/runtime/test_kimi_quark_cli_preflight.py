@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import argparse
 import ast
+import importlib.util
 import json
+import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -76,6 +79,7 @@ def test_cli_quantization_choices_include_quark_routes() -> None:
     choices = _server_args_quantization_choices()
 
     assert "nvfp4" in choices
+    assert "mxfp4" in choices
     assert "w8a8_fp8" in choices
     assert "w4a8_quark" in choices
 
@@ -148,6 +152,22 @@ def test_local_w4a8_config_resolves_from_json(tmp_path: Path) -> None:
     result = preflight_kimi_quantization(str(model_dir))
 
     assert result.quantization == "w4a8_quark"
+    assert result.source == "local-json"
+    assert result.config_path == str(model_dir / "config.json")
+    assert result.requires_local_artifact is False
+    assert result.is_quark is True
+
+
+def test_local_mxfp4_config_resolves_from_json(tmp_path: Path) -> None:
+    model_dir = _write_config(
+        tmp_path,
+        quark_kimi_mxfp4_model_config(),
+        "kimi-mxfp4",
+    )
+
+    result = preflight_kimi_quantization(str(model_dir))
+
+    assert result.quantization == "mxfp4"
     assert result.source == "local-json"
     assert result.config_path == str(model_dir / "config.json")
     assert result.requires_local_artifact is False
@@ -251,6 +271,31 @@ def test_local_w4a8_config_accepts_matching_explicit_cli(tmp_path: Path) -> None
     assert result.is_quark is True
 
 
+def test_local_mxfp4_config_accepts_matching_explicit_cli(tmp_path: Path) -> None:
+    model_dir = _write_config(
+        tmp_path,
+        quark_kimi_mxfp4_model_config(),
+        "kimi-mxfp4",
+    )
+    args = _parse_preflight_args(
+        [
+            "--model",
+            str(model_dir),
+            "--quantization",
+            "mxfp4",
+        ]
+    )
+
+    result = preflight_kimi_quantization(
+        args.model,
+        args.quantization,
+    )
+
+    assert result.quantization == "mxfp4"
+    assert result.source == "local-json"
+    assert result.is_quark is True
+
+
 def test_local_quark_config_rejects_mismatched_explicit_cli(tmp_path: Path) -> None:
     model_dir = _write_config(
         tmp_path,
@@ -260,6 +305,17 @@ def test_local_quark_config_rejects_mismatched_explicit_cli(tmp_path: Path) -> N
 
     with pytest.raises(ValueError, match="does not match"):
         preflight_kimi_quantization(str(model_dir), "w8a8_fp8")
+
+
+def test_local_mxfp4_config_rejects_mismatched_explicit_cli(tmp_path: Path) -> None:
+    model_dir = _write_config(
+        tmp_path,
+        quark_kimi_mxfp4_model_config(),
+        "kimi-mxfp4",
+    )
+
+    with pytest.raises(ValueError, match="does not match"):
+        preflight_kimi_quantization(str(model_dir), "w4a8_quark")
 
 
 def test_nested_text_config_quantization_is_detected(tmp_path: Path) -> None:
@@ -295,3 +351,104 @@ def test_nvfp4_cli_path_remains_explicit() -> None:
     assert result.source == "explicit-cli"
     assert result.requires_local_artifact is True
     assert result.is_quark is False
+
+
+def _load_mxfp4_config_module_without_quantization_package_import():
+    module_path = (
+        Path(__file__).parents[2]
+        / "python"
+        / "tokenspeed"
+        / "runtime"
+        / "layers"
+        / "quantization"
+        / "mxfp4.py"
+    )
+
+    class QuantizationConfig:
+        @staticmethod
+        def get_from_keys(config: dict, keys: list[str]):
+            for key in keys:
+                if key in config:
+                    return config[key]
+            raise ValueError(keys)
+
+        @staticmethod
+        def get_from_keys_or(config: dict, keys: list[str], default):
+            try:
+                return QuantizationConfig.get_from_keys(config, keys)
+            except ValueError:
+                return default
+
+    stubs = {
+        "tokenspeed.runtime.layers": types.ModuleType("tokenspeed.runtime.layers"),
+        "tokenspeed.runtime.layers.quantization": types.ModuleType(
+            "tokenspeed.runtime.layers.quantization"
+        ),
+        "tokenspeed.runtime.layers.quantization.base_config": types.ModuleType(
+            "tokenspeed.runtime.layers.quantization.base_config"
+        ),
+    }
+    stubs[
+        "tokenspeed.runtime.layers.quantization.base_config"
+    ].QuantizationConfig = QuantizationConfig
+    for module in stubs.values():
+        module.__path__ = []
+
+    original_modules = {name: sys.modules.get(name) for name in stubs}
+    sys.modules.update(stubs)
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "_test_tokenspeed_mxfp4_config",
+            module_path,
+        )
+        assert spec is not None
+        assert spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    finally:
+        for name, original in original_modules.items():
+            if original is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = original
+
+
+def test_runtime_mxfp4_override_detects_dynamic_fp4_quark_without_gpu_imports() -> None:
+    module = _load_mxfp4_config_module_without_quantization_package_import()
+    mxfp4_config = quark_kimi_mxfp4_model_config()["quantization_config"]
+    w8a8_config = quark_kimi_w8a8_model_config()["quantization_config"]
+    w4a8_config = quark_kimi_w4a8_model_config()["quantization_config"]
+    mxfp4_a_fp8_config = {
+        "quant_method": "quark",
+        "global_quant_config": {
+            "input_tensors": {"dtype": "fp8_e4m3"},
+            "weight": {"dtype": "fp4", "group_size": 32},
+        },
+    }
+
+    assert module.Mxfp4Config.override_quantization_method(mxfp4_config, None) == (
+        "mxfp4"
+    )
+    assert module.Mxfp4Config.override_quantization_method(
+        mxfp4_config,
+        "mxfp4",
+    ) == "mxfp4"
+    assert (
+        module.Mxfp4Config.override_quantization_method(
+            mxfp4_config,
+            "w4a8_quark",
+        )
+        is None
+    )
+    assert module.Mxfp4Config.override_quantization_method(
+        mxfp4_a_fp8_config,
+        None,
+    ) == "mxfp4"
+    assert module.Mxfp4Config.override_quantization_method(w8a8_config, None) is None
+    assert module.Mxfp4Config.override_quantization_method(w4a8_config, None) is None
+
+    parsed = module.Mxfp4Config.from_config(mxfp4_config)
+
+    assert parsed.is_checkpoint_mxfp4_serialized is True
+    assert parsed.is_w4a8_fp8 is False
