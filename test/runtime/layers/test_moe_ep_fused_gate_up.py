@@ -40,12 +40,14 @@ from tokenspeed.runtime.layers.moe.backends.ep_experts import (
 )
 from tokenspeed.runtime.layers.moe.backends.ep_fused_gate_up import (
     pre_routed_fused_dispatch_gate_up,
+    self_routing_fused_dispatch_gate_up,
 )
 from tokenspeed.runtime.layers.moe.backends.ep_fused_metadata import (
     build_pre_routed_fused_ep_metadata,
 )
 from tokenspeed.runtime.layers.moe.backends.ep_workspace import (
     EPCommunicationWorkspace,
+    EPWorkspaceError,
 )
 
 
@@ -469,6 +471,163 @@ def test_pre_routed_fused_dispatch_gate_up_matches_s4_unfused_hot_empty_experts(
     assert ref_plan.local_expert_counts.tolist() == [6, 2, 0]
     torch.testing.assert_close(result.owner_tokens, ref_step.dispatch_buffer)
     torch.testing.assert_close(result.gate_up, ref_gate_up)
+
+
+def test_self_routing_fused_dispatch_gate_up_matches_pre_routed_same_logits() -> None:
+    _require_cdna4_gpu()
+    import tokenspeed_kernel
+    from tokenspeed.runtime.layers.moe.topk import TopK, TopKOutputFormat
+
+    torch.manual_seed(8602)
+    device = torch.device("cuda")
+    world_size = 2
+    rank = 0
+    num_local_experts = 3
+    num_experts = world_size * num_local_experts
+    hidden_size = 32
+    output_size = 32
+    top_k = 2
+    num_expert_group = 2
+    topk_group = 1
+    block_shape = (16, 16)
+    block_size = 16
+    hidden_states = (torch.randn(4, hidden_size, device=device) * 0.11).to(
+        torch.bfloat16
+    )
+    router_logits = torch.tensor(
+        [
+            [5.0, 4.0, 3.0, -4.0, -5.0, -6.0],
+            [4.0, 5.0, 3.0, -4.0, -5.0, -6.0],
+            [3.0, 4.0, 5.0, -4.0, -5.0, -6.0],
+            [5.0, 3.0, 4.0, -4.0, -5.0, -6.0],
+        ],
+        dtype=torch.float32,
+        device=device,
+    )
+    routing_bias = torch.zeros(num_experts, device=device)
+    topk_kwargs = dict(
+        use_grouped_topk=True,
+        num_expert_group=num_expert_group,
+        topk_group=topk_group,
+        correction_bias=routing_bias,
+        routed_scaling_factor=1.0,
+    )
+    pre_routed_topk = TopK(top_k, **topk_kwargs)(hidden_states, router_logits)
+    bypassed_topk = TopK(
+        top_k,
+        **topk_kwargs,
+        output_format=TopKOutputFormat.BYPASSED,
+    )(hidden_states, router_logits)
+    torch.cuda.synchronize()
+
+    topk_ids = pre_routed_topk.topk_ids.to(torch.int32)
+    topk_weights = pre_routed_topk.topk_weights
+    expert_owner, local_expert_id = _uniform_owner_maps(
+        world_size,
+        num_local_experts,
+        device=device,
+    )
+    ep_metadata = tokenspeed_kernel.moe_dispatch(
+        topk_ids,
+        expert_owner,
+        local_expert_id,
+        rank,
+        world_size,
+        num_local_experts,
+        dtype=torch.int32,
+        traits={"comm_strategy": "ep_metadata"},
+        expected_kernel_name="gluon_ep_metadata_gfx950",
+    )
+    torch.cuda.synchronize()
+    ref_workspace = _workspace(
+        world_size=world_size,
+        rank=rank,
+        hidden_size=hidden_size,
+        max_tokens_per_rank=hidden_states.shape[0],
+        top_k=top_k,
+        device=device,
+        dtype=hidden_states.dtype,
+    )
+    self_workspace = _workspace(
+        world_size=world_size,
+        rank=rank,
+        hidden_size=hidden_size,
+        max_tokens_per_rank=hidden_states.shape[0],
+        top_k=top_k,
+        device=device,
+        dtype=hidden_states.dtype,
+    )
+    ref_plan = prepare_owner_directed_dispatch(ep_metadata, ref_workspace)
+    ref_fused_metadata = build_pre_routed_fused_ep_metadata(
+        hidden_states,
+        topk_ids,
+        topk_weights,
+        ep_metadata,
+        ref_workspace,
+        dispatch_plan=ref_plan,
+    )
+    dense_weight = (
+        torch.randn(num_local_experts, output_size, hidden_size, device=device) * 0.13
+    )
+    local_gate_up_weight, local_gate_up_scale = _make_fp8_weight(
+        dense_weight,
+        block_shape,
+    )
+
+    ref_result = pre_routed_fused_dispatch_gate_up(
+        hidden_states,
+        topk_ids,
+        ep_metadata,
+        ref_workspace,
+        ref_fused_metadata,
+        local_gate_up_weight,
+        local_gate_up_scale,
+        block_shape=block_shape,
+        block_size=block_size,
+        expected_gemm_kernel_name="gluon_fp8_local_experts_gfx950",
+    )
+    self_result = self_routing_fused_dispatch_gate_up(
+        hidden_states,
+        bypassed_topk,
+        expert_owner,
+        local_expert_id,
+        self_workspace,
+        local_gate_up_weight,
+        local_gate_up_scale,
+        block_shape=block_shape,
+        block_size=block_size,
+        expected_metadata_kernel_name="gluon_ep_metadata_gfx950",
+        expected_gemm_kernel_name="gluon_fp8_local_experts_gfx950",
+    )
+    torch.cuda.synchronize()
+
+    assert ref_plan.local_expert_counts.sum().item() > 0
+    torch.testing.assert_close(self_result.topk_output.topk_ids, topk_ids)
+    torch.testing.assert_close(self_result.topk_output.topk_weights, topk_weights)
+    torch.testing.assert_close(
+        self_result.fused_metadata.owner_rows,
+        ref_fused_metadata.owner_rows,
+    )
+    torch.testing.assert_close(
+        self_result.dispatch_plan.local_expert_counts,
+        ref_plan.local_expert_counts,
+    )
+    torch.testing.assert_close(self_result.owner_tokens, ref_result.owner_tokens)
+    torch.testing.assert_close(self_result.gate_up, ref_result.gate_up)
+
+
+def test_self_routing_fused_dispatch_gate_up_rejects_standard_topk_output() -> None:
+    with pytest.raises(EPWorkspaceError, match="BypassedTopKOutput"):
+        self_routing_fused_dispatch_gate_up(
+            torch.empty(0, 0),
+            SimpleNamespace(format=None),
+            None,
+            None,
+            None,
+            None,
+            None,
+            block_shape=(16, 16),
+        )
 
 
 def test_iris_pre_routed_fused_dispatch_gate_up_matches_s4_unfused_one_rank() -> None:

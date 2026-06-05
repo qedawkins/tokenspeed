@@ -35,6 +35,7 @@ import torch
 from tokenspeed.runtime.layers.moe.backends.ep_dispatch import (
     EPOwnerDispatchPlan,
     owner_directed_dispatch,
+    prepare_owner_directed_dispatch,
 )
 from tokenspeed.runtime.layers.moe.backends.ep_experts import (
     build_owner_expert_metadata,
@@ -43,6 +44,7 @@ from tokenspeed.runtime.layers.moe.backends.ep_experts import (
 )
 from tokenspeed.runtime.layers.moe.backends.ep_fused_metadata import (
     PreRoutedFusedEPMetadata,
+    build_pre_routed_fused_ep_metadata,
 )
 from tokenspeed.runtime.layers.moe.backends.ep_workspace import (
     EPCommunicationWorkspace,
@@ -69,6 +71,17 @@ if gluon is None:
 
 @dataclass(frozen=True)
 class PreRoutedFusedGateUpResult:
+    gate_up: torch.Tensor
+    owner_tokens: torch.Tensor
+    dispatch_step: EPWorkspaceStep
+    dispatch_plan: EPOwnerDispatchPlan
+
+
+@dataclass(frozen=True)
+class SelfRoutingFusedGateUpResult:
+    topk_output: Any
+    ep_metadata: Any
+    fused_metadata: PreRoutedFusedEPMetadata
     gate_up: torch.Tensor
     owner_tokens: torch.Tensor
     dispatch_step: EPWorkspaceStep
@@ -147,6 +160,84 @@ def pre_routed_fused_dispatch_gate_up(
         owner_tokens=dispatch_step.dispatch_buffer,
         dispatch_step=dispatch_step,
         dispatch_plan=dispatch_plan,
+    )
+
+
+def self_routing_fused_dispatch_gate_up(
+    hidden_states: torch.Tensor,
+    topk_output: Any,
+    expert_owner: torch.Tensor,
+    local_expert_id: torch.Tensor,
+    workspace: EPCommunicationWorkspace,
+    local_gate_up_weight: torch.Tensor,
+    local_gate_up_weight_scale: torch.Tensor,
+    *,
+    block_shape: tuple[int, int],
+    block_size: int = 16,
+    out: torch.Tensor | None = None,
+    config: dict[str, Any] | None = None,
+    expected_metadata_kernel_name: str | None = None,
+    expected_gemm_kernel_name: str | None = None,
+) -> SelfRoutingFusedGateUpResult:
+    """Resolve self-routing top-k, then reuse the pre-routed fused gate/up path."""
+
+    output_format = getattr(topk_output, "format", None)
+    is_bypassed = getattr(output_format, "is_bypassed", lambda: False)
+    if output_format is None or not is_bypassed():
+        raise EPWorkspaceError(
+            "self_routing_fused_dispatch_gate_up expects BypassedTopKOutput"
+        )
+
+    from tokenspeed.runtime.layers.moe.backends.ep_self_routing import (
+        self_routing_topk_from_bypassed,
+    )
+    import tokenspeed_kernel
+
+    routed_topk = self_routing_topk_from_bypassed(topk_output)
+    topk_ids = routed_topk.topk_ids.to(torch.int32).contiguous()
+    topk_weights = routed_topk.topk_weights
+    ep_metadata = tokenspeed_kernel.moe_dispatch(
+        topk_ids,
+        expert_owner,
+        local_expert_id,
+        workspace.rank,
+        workspace.world_size,
+        local_gate_up_weight.shape[0],
+        dtype=torch.int32,
+        traits={"comm_strategy": "ep_metadata"},
+        expected_kernel_name=expected_metadata_kernel_name,
+    )
+    dispatch_plan = prepare_owner_directed_dispatch(ep_metadata, workspace)
+    fused_metadata = build_pre_routed_fused_ep_metadata(
+        hidden_states,
+        topk_ids,
+        topk_weights,
+        ep_metadata,
+        workspace,
+        dispatch_plan=dispatch_plan,
+    )
+    gate_up_result = pre_routed_fused_dispatch_gate_up(
+        hidden_states,
+        topk_ids,
+        ep_metadata,
+        workspace,
+        fused_metadata,
+        local_gate_up_weight,
+        local_gate_up_weight_scale,
+        block_shape=block_shape,
+        block_size=block_size,
+        out=out,
+        config=config,
+        expected_gemm_kernel_name=expected_gemm_kernel_name,
+    )
+    return SelfRoutingFusedGateUpResult(
+        topk_output=routed_topk,
+        ep_metadata=ep_metadata,
+        fused_metadata=fused_metadata,
+        gate_up=gate_up_result.gate_up,
+        owner_tokens=gate_up_result.owner_tokens,
+        dispatch_step=gate_up_result.dispatch_step,
+        dispatch_plan=gate_up_result.dispatch_plan,
     )
 
 
@@ -712,5 +803,7 @@ def _fp8_e4m3_dtypes() -> tuple[torch.dtype, ...]:
 
 __all__ = [
     "PreRoutedFusedGateUpResult",
+    "SelfRoutingFusedGateUpResult",
     "pre_routed_fused_dispatch_gate_up",
+    "self_routing_fused_dispatch_gate_up",
 ]
