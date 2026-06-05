@@ -78,6 +78,42 @@ def _int4_per_channel_static() -> dict[str, Any]:
     }
 
 
+def _fp4_mx_per_group_dynamic() -> dict[str, Any]:
+    return {
+        "dtype": "fp4",
+        "is_dynamic": True,
+        "qscheme": "per_group",
+        "ch_axis": -1,
+        "group_size": 32,
+        "symmetric": None,
+        "round_method": "half_even",
+        "scale_type": "float",
+        "scale_format": "e8m0",
+        "scale_calculation_mode": "even",
+        "mx_element_dtype": None,
+        "observer_cls": "PerBlockMXObserver",
+        "is_scale_quant": False,
+    }
+
+
+def _fp4_mx_per_group_static() -> dict[str, Any]:
+    return {
+        "dtype": "fp4",
+        "is_dynamic": False,
+        "qscheme": "per_group",
+        "ch_axis": -1,
+        "group_size": 32,
+        "symmetric": None,
+        "round_method": "half_even",
+        "scale_type": "float",
+        "scale_format": "e8m0",
+        "scale_calculation_mode": "even",
+        "mx_element_dtype": None,
+        "observer_cls": "PerBlockMXObserver",
+        "is_scale_quant": False,
+    }
+
+
 _KIMI_QUARK_EXCLUDE = [
     "re:lm_head",
     "re:.*self_attn.*",
@@ -85,6 +121,15 @@ _KIMI_QUARK_EXCLUDE = [
     "re:.*mlp\\.(gate|up|gate_up|down)_proj.*",
     "re:.*mm_projector.*",
     "re:.*vision_tower.*",
+]
+
+
+_KIMI_QUARK_MXFP4_EXCLUDE = [
+    "re:lm_head",
+    "re:.*self_attn.*",
+    "re:.*mlp.gate",
+    "re:mm_projector.*",
+    "re:vision_tower.*",
 ]
 
 
@@ -147,12 +192,44 @@ _KIMI_QUARK_W4A8_QUANTIZATION_CONFIG: dict[str, Any] = {
 }
 
 
+_KIMI_QUARK_MXFP4_QUANTIZATION_CONFIG: dict[str, Any] = {
+    "global_quant_config": {
+        "input_tensors": _fp4_mx_per_group_dynamic(),
+        "output_tensors": None,
+        "weight": _fp4_mx_per_group_static(),
+        "bias": None,
+        "target_device": None,
+    },
+    "algo_config": None,
+    "softmax_quant_spec": None,
+    "quant_method": "quark",
+    "layer_type_quant_config": {},
+    "layer_quant_config": {},
+    "kv_cache_quant_config": {},
+    "kv_cache_post_rope": False,
+    "quant_mode": "eager_mode",
+    "version": "0.11.2",
+    "export": {
+        "kv_cache_group": [],
+        "min_kv_scale": 0.0,
+        "pack_method": "reorder",
+        "weight_format": "real_quantized",
+        "weight_merge_groups": None,
+    },
+    "exclude": list(_KIMI_QUARK_MXFP4_EXCLUDE),
+}
+
+
 def quark_kimi_w8a8_quantization_config() -> dict[str, Any]:
     return deepcopy(_KIMI_QUARK_W8A8_QUANTIZATION_CONFIG)
 
 
 def quark_kimi_w4a8_quantization_config() -> dict[str, Any]:
     return deepcopy(_KIMI_QUARK_W4A8_QUANTIZATION_CONFIG)
+
+
+def quark_kimi_mxfp4_quantization_config() -> dict[str, Any]:
+    return deepcopy(_KIMI_QUARK_MXFP4_QUANTIZATION_CONFIG)
 
 
 def quark_kimi_w8a8_model_config() -> dict[str, Any]:
@@ -163,6 +240,72 @@ def quark_kimi_w4a8_model_config() -> dict[str, Any]:
     return _kimi_model_config(quark_kimi_w4a8_quantization_config())
 
 
+def quark_kimi_mxfp4_model_config() -> dict[str, Any]:
+    return _kimi_model_config(quark_kimi_mxfp4_quantization_config())
+
+
+def quark_kimi_mxfp4_safetensors_index() -> dict[str, Any]:
+    return {
+        "metadata": {"total_size": 558995180568},
+        "weight_map": {
+            "language_model.model.layers.0.mlp.up_proj.weight": (
+                "model-00001-of-000064.safetensors"
+            ),
+            "language_model.model.layers.0.mlp.up_proj.weight_scale": (
+                "model-00001-of-000064.safetensors"
+            ),
+            "language_model.model.layers.0.mlp.gate_proj.weight": (
+                "model-00001-of-000064.safetensors"
+            ),
+            "language_model.model.layers.0.mlp.gate_proj.weight_scale": (
+                "model-00001-of-000064.safetensors"
+            ),
+            "language_model.model.layers.0.mlp.down_proj.weight": (
+                "model-00001-of-000064.safetensors"
+            ),
+            "language_model.model.layers.0.mlp.down_proj.weight_scale": (
+                "model-00001-of-000064.safetensors"
+            ),
+            "language_model.model.layers.1.mlp.experts.0.gate_proj.weight": (
+                "model-00002-of-000064.safetensors"
+            ),
+            "language_model.model.layers.1.mlp.experts.0.gate_proj.weight_scale": (
+                "model-00002-of-000064.safetensors"
+            ),
+            "language_model.model.layers.1.mlp.experts.0.up_proj.weight": (
+                "model-00002-of-000064.safetensors"
+            ),
+            "language_model.model.layers.1.mlp.experts.0.up_proj.weight_scale": (
+                "model-00002-of-000064.safetensors"
+            ),
+            "language_model.model.layers.1.mlp.experts.0.down_proj.weight": (
+                "model-00002-of-000064.safetensors"
+            ),
+            "language_model.model.layers.1.mlp.experts.0.down_proj.weight_scale": (
+                "model-00002-of-000064.safetensors"
+            ),
+            "language_model.model.layers.1.mlp.shared_experts.gate_proj.weight": (
+                "model-00002-of-000064.safetensors"
+            ),
+            "language_model.model.layers.1.mlp.shared_experts.gate_proj.weight_scale": (
+                "model-00002-of-000064.safetensors"
+            ),
+            "language_model.model.layers.1.mlp.shared_experts.down_proj.weight": (
+                "model-00002-of-000064.safetensors"
+            ),
+            "language_model.model.layers.1.mlp.shared_experts.down_proj.weight_scale": (
+                "model-00002-of-000064.safetensors"
+            ),
+            "language_model.model.layers.60.mlp.experts.383.down_proj.weight": (
+                "model-00061-of-000064.safetensors"
+            ),
+            "language_model.model.layers.60.mlp.experts.383.down_proj.weight_scale": (
+                "model-00061-of-000064.safetensors"
+            ),
+        },
+    }
+
+
 def _kimi_model_config(quantization_config: dict[str, Any]) -> dict[str, Any]:
     return {
         "architectures": ["KimiK25ForConditionalGeneration"],
@@ -170,12 +313,21 @@ def _kimi_model_config(quantization_config: dict[str, Any]) -> dict[str, Any]:
         "dtype": "bfloat16",
         "text_config": {
             "architectures": ["DeepseekV3ForCausalLM"],
+            "first_k_dense_replace": 1,
             "hidden_size": 7168,
+            "intermediate_size": 18432,
             "model_type": "kimi_k2",
             "moe_intermediate_size": 2048,
+            "n_group": 1,
             "n_routed_experts": 384,
+            "n_shared_experts": 1,
+            "norm_topk_prob": True,
             "num_experts_per_tok": 8,
             "num_hidden_layers": 61,
+            "routed_scaling_factor": 2.827,
+            "scoring_func": "sigmoid",
+            "topk_group": 1,
+            "topk_method": "noaux_tc",
         },
         "quantization_config": quantization_config,
     }
