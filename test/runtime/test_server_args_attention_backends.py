@@ -5,6 +5,8 @@ backends (e.g. trtllm_mla) because its argparse `choices` was a narrower subset
 of --attention-backend's.
 """
 
+# ruff: noqa: E402
+
 import os
 import sys
 
@@ -103,11 +105,35 @@ class TestAttentionBackendChoices(unittest.TestCase):
             )
 
     def test_sm90_defaults_to_flashmla_for_mla(self):
-        platform = SimpleNamespace(is_blackwell=False, is_hopper=True)
+        platform = SimpleNamespace(is_amd=False, is_blackwell=False, is_hopper=True)
         with mock.patch.object(registry, "current_platform", return_value=platform):
             self.assertEqual(
                 registry._get_default_backend_name(AttentionArch.MLA), "flashmla"
             )
+
+    def test_amd_defaults_to_tokenspeed_mla_for_mla(self):
+        platform = SimpleNamespace(is_amd=True, is_blackwell=False, is_hopper=False)
+        with mock.patch.object(registry, "current_platform", return_value=platform):
+            self.assertEqual(
+                registry._get_default_backend_name(AttentionArch.MLA),
+                "tokenspeed_mla",
+            )
+
+    def test_amd_registers_gluon_mla_as_tokenspeed_mla(self):
+        from tokenspeed_kernel.platform import current_platform
+
+        if not current_platform().is_amd:
+            self.skipTest("AMD-only backend registration")
+
+        import tokenspeed.runtime.layers.attention.backends  # noqa: F401
+        from tokenspeed.runtime.layers.attention.backends.gluon_mla import (
+            GluonMLABackend,
+        )
+
+        self.assertIs(
+            registry._get_backend_cls("tokenspeed_mla", AttentionArch.MLA),
+            GluonMLABackend,
+        )
 
     def test_mha_config_propagates_speculative_settings(self):
         server_args = SimpleNamespace(
