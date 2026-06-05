@@ -272,6 +272,8 @@ class MoECheckpointLoader:
             mapped_name = plan_entry.resolve_param_name(name)
             param = self._params_dict.get(mapped_name)
             if param is None:
+                if mapped_name.endswith((".w13_input_scale", ".w2_input_scale")):
+                    return mapped_name
                 continue
 
             param.weight_loader(

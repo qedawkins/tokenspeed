@@ -34,6 +34,7 @@ MXFP4_LOGICAL_DTYPE = "float4_e2m1"
 
 class PackedScaleGranularity(str, Enum):
     BLOCK = "block"
+    CHANNEL = "channel"
 
 
 class ExpertLocalLayout(str, Enum):
@@ -73,45 +74,63 @@ class PackedExpertWeightFormat:
         logical_shape: tuple[int, int, int],
     ) -> tuple[int, int, int]:
         self._validate_supported()
-        block_out, block_in = self.block_shape
         num_experts, out_features, in_features = _normalize_logical_shape(
             logical_shape
         )
-        if out_features % block_out != 0:
-            raise ValueError(
-                f"logical output dim {out_features} must be divisible by "
-                f"scale block output {block_out}"
-            )
-        if in_features % block_in != 0:
-            raise ValueError(
-                f"logical input dim {in_features} must be divisible by "
-                f"scale block input {block_in}"
-            )
-        return (num_experts, out_features // block_out, in_features // block_in)
+        if self.scale_granularity == PackedScaleGranularity.CHANNEL:
+            return (num_experts, out_features, 1)
+
+        assert self.block_shape is not None
+        block_out, block_in = self.block_shape
+        if self.scale_granularity == PackedScaleGranularity.BLOCK:
+            if out_features % block_out != 0:
+                raise ValueError(
+                    f"logical output dim {out_features} must be divisible by "
+                    f"scale block output {block_out}"
+                )
+            if in_features % block_in != 0:
+                raise ValueError(
+                    f"logical input dim {in_features} must be divisible by "
+                    f"scale block input {block_in}"
+                )
+            return (num_experts, out_features // block_out, in_features // block_in)
+
+        raise ValueError(f"unsupported scale granularity {self.scale_granularity!r}")
 
     def _validate_supported(self) -> None:
         if self.storage_dtype != torch.uint8:
             raise ValueError(
                 f"unsupported packed weight storage dtype {self.storage_dtype}"
             )
-        if self.logical_dtype != MXFP4_LOGICAL_DTYPE:
-            raise ValueError(f"unsupported logical dtype {self.logical_dtype!r}")
         if self.pack_factor != 2:
             raise ValueError(f"unsupported pack_factor {self.pack_factor}")
-        if self.scale_dtype != torch.uint8:
-            raise ValueError(f"unsupported scale dtype {self.scale_dtype}")
-        if self.scale_granularity != PackedScaleGranularity.BLOCK:
-            raise ValueError(
-                f"unsupported scale granularity {self.scale_granularity!r}"
-            )
-        if self.block_shape != (1, MXFP4_BLOCK):
-            raise ValueError(f"unsupported scale block shape {self.block_shape!r}")
         if self.expert_local_layout != ExpertLocalLayout.EXPERT_OUT_IN:
             raise ValueError(
                 f"unsupported expert-local layout {self.expert_local_layout!r}"
             )
         if self.transposed_from_logical:
             raise ValueError("transposed packed expert weights are not supported")
+        if self.logical_dtype == MXFP4_LOGICAL_DTYPE:
+            if self.scale_dtype != torch.uint8:
+                raise ValueError(f"unsupported scale dtype {self.scale_dtype}")
+            if self.scale_granularity != PackedScaleGranularity.BLOCK:
+                raise ValueError(
+                    f"unsupported scale granularity {self.scale_granularity!r}"
+                )
+            if self.block_shape != (1, MXFP4_BLOCK):
+                raise ValueError(f"unsupported scale block shape {self.block_shape!r}")
+            return
+        if self.logical_dtype == "int4":
+            if self.scale_dtype != torch.float32:
+                raise ValueError(f"unsupported scale dtype {self.scale_dtype}")
+            if self.scale_granularity != PackedScaleGranularity.CHANNEL:
+                raise ValueError(
+                    f"unsupported scale granularity {self.scale_granularity!r}"
+                )
+            if self.block_shape is not None:
+                raise ValueError(f"unsupported scale block shape {self.block_shape!r}")
+            return
+        raise ValueError(f"unsupported logical dtype {self.logical_dtype!r}")
 
 
 MXFP4_E2M1_BLOCK32_FORMAT = PackedExpertWeightFormat(

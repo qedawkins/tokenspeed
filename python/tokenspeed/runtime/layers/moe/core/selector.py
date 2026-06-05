@@ -30,6 +30,7 @@ from tokenspeed.runtime.layers.quantization import (
     Fp8Config,
     Mxfp4Config,
     Nvfp4Config,
+    W4A8QuarkConfig,
     W8A8Fp8Config,
 )
 from tokenspeed.runtime.layers.quantization.utils import should_ignore_quant_layer
@@ -55,9 +56,10 @@ _AUTO_IMPL_PREFERENCE = {
         "triton",
     ),
     "w8a8_fp8": ("triton",),
+    "w4a8_quark": ("triton",),
     "wna16": ("marlin",),
 }
-_PACKED_FUSED_QUANT_KINDS = frozenset({"mxfp4", "nvfp4"})
+_PACKED_FUSED_QUANT_KINDS = frozenset({"mxfp4", "nvfp4", "w4a8_quark"})
 _FUSED_FEATURE_KEYS = ("moe_fused_features", "features")
 
 
@@ -83,6 +85,8 @@ def _normalize_quant_kind(quant_config: object, prefix: str = "") -> str:
     # W8A8 quantization configs
     if isinstance(quant_config, W8A8Fp8Config):
         return "w8a8_fp8"
+    if isinstance(quant_config, W4A8QuarkConfig):
+        return "w4a8_quark"
     if isinstance(quant_config, CompressedTensorsConfig):
         weight_quant = quant_config.target_scheme_map["Linear"].get("weights")
         input_quant = quant_config.target_scheme_map["Linear"].get("input_activations")
@@ -126,7 +130,7 @@ def _resolve_impl_candidates(quant_kind: str) -> tuple[str, ...]:
     auto_candidates = _AUTO_IMPL_PREFERENCE.get(quant_kind, ())
     platform = current_platform()
     if backend.is_auto() and platform.is_amd:
-        if quant_kind in {"unquantized", "fp8", "w8a8_fp8"}:
+        if quant_kind in {"unquantized", "fp8", "w8a8_fp8", "w4a8_quark"}:
             auto_candidates = tuple(
                 impl for impl in auto_candidates if impl == "triton"
             )
