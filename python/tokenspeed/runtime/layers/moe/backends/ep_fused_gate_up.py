@@ -52,13 +52,15 @@ from tokenspeed.runtime.layers.moe.backends.ep_workspace import (
     EPWorkspaceStep,
     EPWorkspaceUnavailable,
 )
+from tokenspeed_kernel._triton import redirect_triton_to_tokenspeed_triton
 
 
 try:
-    import triton
-    from iris.gluon import IrisDeviceCtx
-    from triton.experimental import gluon
-    from triton.experimental.gluon import language as gl
+    with redirect_triton_to_tokenspeed_triton():
+        import triton
+        from iris.gluon import IrisDeviceCtx
+        from triton.experimental import gluon
+        from triton.experimental.gluon import language as gl
 except ImportError:
     triton = None
     IrisDeviceCtx = None
