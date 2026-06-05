@@ -29,7 +29,7 @@ For a compact compatibility table, see
 | `--dtype` | Model weight and activation dtype. `auto` follows model metadata. |
 | `--kv-cache-dtype` | KV cache dtype. Lower precision reduces KV memory and may require scaling factors. |
 | `--kv-cache-quant-method` | KV cache quantization method. |
-| `--quantization` | Weight quantization mode such as `fp8`, `nvfp4`, `w8a8_fp8`, or `compressed-tensors`. |
+| `--quantization` | Weight quantization mode such as `fp8`, `nvfp4`, `w8a8_fp8`, `w4a8_quark`, or `compressed-tensors`. |
 | `--quantization-param-path` | JSON file for KV cache scaling factors, commonly needed with FP8 KV cache. |
 
 ## API Surface

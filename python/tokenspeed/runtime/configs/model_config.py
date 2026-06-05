@@ -373,6 +373,7 @@ class ModelConfig:
             "compressed_tensors",
             "compressed-tensors",
             "w8a8_fp8",
+            "w4a8_quark",
         ]
         compatible_quantization_methods = {
             "w8a8_fp8": ["compressed-tensors", "compressed_tensors"],

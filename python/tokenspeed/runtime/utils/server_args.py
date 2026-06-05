@@ -772,6 +772,7 @@ class ServerArgs:
                 "fp8",
                 "nvfp4",
                 "w8a8_fp8",
+                "w4a8_quark",
                 "compressed-tensors",
             ],
             help="The quantization method.",
