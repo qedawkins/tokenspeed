@@ -25,6 +25,29 @@ import torch
 from tokenspeed.runtime.layers.quantization import QuantizationConfig
 
 
+def _is_quark_w8a8_fp8(config: dict[str, Any]) -> bool:
+    if not isinstance(config, dict):
+        return False
+    if str(config.get("quant_method", "")).lower() != "quark":
+        return False
+
+    global_quant_config = config.get("global_quant_config") or {}
+    weight = global_quant_config.get("weight") or {}
+    input_tensors = global_quant_config.get("input_tensors") or {}
+
+    if not isinstance(weight, dict) or not isinstance(input_tensors, dict):
+        return False
+
+    return (
+        str(weight.get("dtype", "")).lower() == "fp8_e4m3"
+        and weight.get("is_dynamic") is False
+        and str(weight.get("qscheme", "")).lower() == "per_channel"
+        and str(input_tensors.get("dtype", "")).lower() == "fp8_e4m3"
+        and input_tensors.get("is_dynamic") is True
+        and str(input_tensors.get("qscheme", "")).lower() == "per_tensor"
+    )
+
+
 class W8A8Fp8Config(QuantizationConfig):
     """Config class for W8A8 FP8 Quantization.
 
@@ -68,8 +91,15 @@ class W8A8Fp8Config(QuantizationConfig):
         quant_method = cls.get_from_keys(config, ["quant_method"])
         is_checkpoint_fp8_serialized = (
             "compressed-tensors" in quant_method or "w8a8_fp8" in quant_method
+            or _is_quark_w8a8_fp8(config)
         )
         return cls(is_checkpoint_fp8_serialized=is_checkpoint_fp8_serialized)
+
+    @classmethod
+    def override_quantization_method(cls, hf_quant_cfg, user_quant) -> str | None:
+        if user_quant in {"w8a8_fp8", None} and _is_quark_w8a8_fp8(hf_quant_cfg):
+            return "w8a8_fp8"
+        return None
 
     def get_scaled_act_names(self) -> list[str]:
         return []
