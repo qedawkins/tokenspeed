@@ -41,6 +41,7 @@ def select_kimi_sigmoid_noaux_topk(
     routed_scaling_factor: float | None,
     apply_routed_scaling_factor_on_output: bool,
     topk_indices_dtype: torch.dtype | None = torch.int32,
+    hidden_states: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Kimi-K2.5 ``noaux_tc`` routing for ``n_group == topk_group == 1``.
 
@@ -81,6 +82,109 @@ def select_kimi_sigmoid_noaux_topk(
         )
         return topk_weights, topk_ids
 
+    kernel_output = _try_select_kimi_sigmoid_noaux_topk_kernel(
+        router_logits,
+        top_k=top_k,
+        correction_bias=correction_bias,
+        renormalize=renormalize,
+        routed_scaling_factor=routed_scaling_factor,
+        apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
+        hidden_states=hidden_states,
+    )
+    if kernel_output is not None:
+        topk_weights, topk_ids = kernel_output
+        return topk_weights.to(torch.float32), topk_ids.to(id_dtype)
+
+    return _select_kimi_sigmoid_noaux_topk_torch(
+        router_logits,
+        top_k=top_k,
+        correction_bias=correction_bias,
+        renormalize=renormalize,
+        routed_scaling_factor=routed_scaling_factor,
+        apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
+        id_dtype=id_dtype,
+    )
+
+
+def _try_select_kimi_sigmoid_noaux_topk_kernel(
+    router_logits: torch.Tensor,
+    *,
+    top_k: int,
+    correction_bias: torch.Tensor,
+    renormalize: bool,
+    routed_scaling_factor: float | None,
+    apply_routed_scaling_factor_on_output: bool,
+    hidden_states: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    if not router_logits.is_cuda:
+        return None
+    if router_logits.dtype not in {torch.float16, torch.bfloat16, torch.float32}:
+        return None
+    if correction_bias.device != router_logits.device:
+        return None
+    if routed_scaling_factor is None:
+        return None
+    if top_k > 16 or router_logits.shape[1] > 512:
+        return None
+
+    try:
+        import tokenspeed_kernel
+        from tokenspeed_kernel.platform import current_platform
+    except ImportError:
+        return None
+
+    if not getattr(current_platform(), "is_cdna4", False):
+        return None
+
+    route_hidden_states = hidden_states
+    if route_hidden_states is None:
+        route_hidden_states = router_logits
+    if route_hidden_states.shape[0] != router_logits.shape[0]:
+        return None
+    if route_hidden_states.device != router_logits.device:
+        return None
+
+    traits = {
+        "output_type": "topk",
+        "biased": True,
+        "grouped": True,
+        "ep": True,
+        "num_expert_group": 1,
+        "topk_group": 1,
+        "topk": top_k,
+        "num_fused_shared_experts": 0,
+    }
+    return tokenspeed_kernel.moe_route(
+        route_hidden_states,
+        router_logits,
+        correction_bias,
+        topk=top_k,
+        renormalize=renormalize,
+        num_expert_group=1,
+        topk_group=1,
+        num_fused_shared_experts=0,
+        routed_scaling_factor=routed_scaling_factor,
+        num_token_non_padded=None,
+        expert_location_dispatch_info=None,
+        apply_routed_scaling_factor_on_output=(
+            apply_routed_scaling_factor_on_output
+        ),
+        dtype=router_logits.dtype,
+        traits=traits,
+        expected_kernel_name="gluon_grouped_biased_topk_gfx950",
+    )
+
+
+def _select_kimi_sigmoid_noaux_topk_torch(
+    router_logits: torch.Tensor,
+    *,
+    top_k: int,
+    correction_bias: torch.Tensor,
+    renormalize: bool,
+    routed_scaling_factor: float | None,
+    apply_routed_scaling_factor_on_output: bool,
+    id_dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
     scores = router_logits.float().sigmoid()
     bias = correction_bias.to(device=scores.device, dtype=scores.dtype)
     choice_scores = scores + bias.unsqueeze(0)
@@ -129,6 +233,7 @@ def mxfp4_kimi_sigmoid_ragged_route_from_bypassed(
             topk_config.apply_routed_scaling_factor_on_output
         ),
         topk_indices_dtype=topk_config.topk_indices_dtype,
+        hidden_states=hidden_states,
     )
     return topk_to_ragged_metadata(
         topk_ids,

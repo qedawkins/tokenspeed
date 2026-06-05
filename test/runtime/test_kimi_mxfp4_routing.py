@@ -5,12 +5,20 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+import tokenspeed.runtime.layers.moe.backends.mxfp4.routing as routing_module
 from tokenspeed.runtime.layers.moe.backends.mxfp4.routing import (
     is_kimi_sigmoid_noaux_topk_config,
     mxfp4_kimi_sigmoid_ragged_route_from_bypassed,
     select_kimi_sigmoid_noaux_topk,
     topk_to_ragged_metadata,
 )
+
+
+def _require_cdna4_gpu() -> None:
+    from tokenspeed_kernel.platform import current_platform
+
+    if not torch.cuda.is_available() or not current_platform().is_cdna4_plus:
+        pytest.skip("AMD CDNA4 GPU is required for the MXFP4 routing capture test")
 
 
 def _metadata_factory(col_sum: torch.Tensor, n_total_rows: int) -> SimpleNamespace:
@@ -95,6 +103,123 @@ def test_kimi_sigmoid_noaux_topk_does_not_scale_without_normalization() -> None:
 
     assert ids.tolist() == [[2, 1]]
     torch.testing.assert_close(weights, router_logits.sigmoid().gather(1, ids.long()))
+
+
+def test_kimi_sigmoid_noaux_topk_uses_available_kernel_output(monkeypatch) -> None:
+    router_logits = torch.randn(2, 5, dtype=torch.float32)
+    correction_bias = torch.zeros(5, dtype=torch.float32)
+    hidden_states = torch.randn(2, 7, dtype=torch.float32)
+    kernel_weights = torch.tensor(
+        [[0.6, 0.4], [0.75, 0.25]],
+        dtype=torch.float32,
+    )
+    kernel_ids = torch.tensor([[2, 1], [4, 3]], dtype=torch.int32)
+    calls = []
+
+    def fake_kernel(*args, **kwargs):
+        calls.append((args, kwargs))
+        return kernel_weights, kernel_ids
+
+    monkeypatch.setattr(
+        routing_module,
+        "_try_select_kimi_sigmoid_noaux_topk_kernel",
+        fake_kernel,
+    )
+
+    weights, ids = select_kimi_sigmoid_noaux_topk(
+        router_logits,
+        top_k=2,
+        correction_bias=correction_bias,
+        renormalize=True,
+        routed_scaling_factor=1.0,
+        apply_routed_scaling_factor_on_output=False,
+        topk_indices_dtype=torch.int64,
+        hidden_states=hidden_states,
+    )
+
+    torch.testing.assert_close(weights, kernel_weights)
+    assert torch.equal(ids, kernel_ids.to(torch.int64))
+    assert calls[0][0][0] is router_logits
+    assert calls[0][1]["hidden_states"] is hidden_states
+    assert calls[0][1]["top_k"] == 2
+
+
+def test_kimi_sigmoid_noaux_topk_gpu_kernel_captures_kimi_like_shape() -> None:
+    _require_cdna4_gpu()
+    torch.manual_seed(7000)
+    hidden_states = torch.randn(8, 64, device="cuda", dtype=torch.bfloat16)
+    router_logits = torch.randn(8, 384, device="cuda", dtype=torch.bfloat16)
+    correction_bias = (
+        torch.randn(384, device="cuda", dtype=torch.float32) * 0.05
+    )
+
+    expected_weights, expected_ids = select_kimi_sigmoid_noaux_topk(
+        router_logits.float().cpu(),
+        top_k=8,
+        correction_bias=correction_bias.cpu(),
+        renormalize=True,
+        routed_scaling_factor=1.0,
+        apply_routed_scaling_factor_on_output=False,
+    )
+    kernel_output = routing_module._try_select_kimi_sigmoid_noaux_topk_kernel(
+        router_logits,
+        top_k=8,
+        correction_bias=correction_bias,
+        renormalize=True,
+        routed_scaling_factor=1.0,
+        apply_routed_scaling_factor_on_output=False,
+        hidden_states=hidden_states,
+    )
+    assert kernel_output is not None
+    kernel_weights, kernel_ids = kernel_output
+    assert torch.equal(kernel_ids.cpu(), expected_ids)
+    torch.testing.assert_close(
+        kernel_weights.cpu(),
+        expected_weights,
+        atol=5e-4,
+        rtol=5e-4,
+    )
+
+    weights, ids = select_kimi_sigmoid_noaux_topk(
+        router_logits,
+        top_k=8,
+        correction_bias=correction_bias,
+        renormalize=True,
+        routed_scaling_factor=1.0,
+        apply_routed_scaling_factor_on_output=False,
+        hidden_states=hidden_states,
+    )
+    torch.cuda.synchronize()
+
+    assert torch.equal(ids.cpu(), expected_ids)
+    torch.testing.assert_close(
+        weights.cpu(),
+        expected_weights,
+        atol=5e-4,
+        rtol=5e-4,
+    )
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured_weights, captured_ids = select_kimi_sigmoid_noaux_topk(
+            router_logits,
+            top_k=8,
+            correction_bias=correction_bias,
+            renormalize=True,
+            routed_scaling_factor=1.0,
+            apply_routed_scaling_factor_on_output=False,
+            hidden_states=hidden_states,
+        )
+    graph.replay()
+    torch.cuda.synchronize()
+
+    assert torch.equal(captured_ids.cpu(), expected_ids)
+    torch.testing.assert_close(
+        captured_weights.cpu(),
+        expected_weights,
+        atol=5e-4,
+        rtol=5e-4,
+    )
 
 
 def test_kimi_sigmoid_config_detection_is_narrow() -> None:

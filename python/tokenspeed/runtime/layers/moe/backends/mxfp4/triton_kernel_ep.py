@@ -111,6 +111,7 @@ class Mxfp4TritonKernelEPBackend(Mxfp4TritonKernelBackend):
                 topk_config.apply_routed_scaling_factor_on_output
             ),
             topk_indices_dtype=torch.int32,
+            hidden_states=hidden_states,
         )
         topk_ids = topk_ids.to(device=hidden_states.device, dtype=torch.int32).contiguous()
         topk_weights = topk_weights.to(
