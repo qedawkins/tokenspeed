@@ -53,6 +53,37 @@ def test_reference_quantizes_pack_order_and_e8m0_scales() -> None:
     torch.testing.assert_close(actual[8:], torch.zeros(24))
 
 
+def test_dequantize_activation_cuda_graph_safe() -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("GPU is required for CUDA graph activation dequant smoke test")
+    row = torch.zeros(32, dtype=torch.float32)
+    row[:8] = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
+    packed, scale = quantize_mxfp4_activation_reference(row.to(torch.bfloat16))
+    packed = packed.to("cuda")
+    scale = scale.to("cuda")
+
+    expected = dequantize_mxfp4_activation(
+        packed,
+        scale,
+        logical_shape=(32,),
+        output_dtype=torch.float32,
+    )
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = dequantize_mxfp4_activation(
+            packed,
+            scale,
+            logical_shape=(32,),
+            output_dtype=torch.float32,
+        )
+    graph.replay()
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(actual, expected)
+
+
 def test_reference_rounds_scale_up_to_power_of_two() -> None:
     activations = torch.full((1, 32), 12.0, dtype=torch.float16)
 

@@ -28,6 +28,7 @@ import pytest
 import torch
 import torch.distributed as dist
 
+import tokenspeed.runtime.layers.moe.backends.ep_combine as ep_combine_module
 from tokenspeed.runtime.layers.moe.backends.ep_combine import owner_directed_combine
 from tokenspeed.runtime.layers.moe.backends.ep_dispatch import EPOwnerDispatchPlan
 from tokenspeed.runtime.layers.moe.backends.ep_workspace import (
@@ -134,6 +135,15 @@ def _row_values(num_rows: int, hidden_size: int, *, device: torch.device | str =
         dtype=torch.float32,
         device=device,
     ).reshape(num_rows, hidden_size)
+
+
+def test_combine_workspace_sync_disabled_during_capture(monkeypatch) -> None:
+    assert ep_combine_module._should_synchronize_workspace(True)
+    assert not ep_combine_module._should_synchronize_workspace(False)
+
+    monkeypatch.setattr(ep_combine_module, "get_is_capture_mode", lambda: True)
+
+    assert not ep_combine_module._should_synchronize_workspace(True)
 
 
 def test_owner_directed_combine_preserves_topk_slot_order() -> None:

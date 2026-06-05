@@ -31,6 +31,7 @@ from typing import Any
 
 import torch
 
+from tokenspeed.runtime.execution.cuda_graph_wrapper import get_is_capture_mode
 from tokenspeed.runtime.layers.moe.backends.ep_dispatch import EPOwnerDispatchPlan
 from tokenspeed.runtime.layers.moe.backends.ep_workspace import (
     EPCommunicationWorkspace,
@@ -208,13 +209,13 @@ def owner_directed_combine(
     out.zero_()
 
     if topk_ids.numel() == 0:
-        if workspace.backend == "iris" and synchronize:
+        if workspace.backend == "iris" and _should_synchronize_workspace(synchronize):
             workspace.barrier()
             workspace.barrier()
         return out
 
     if workspace.backend == "iris":
-        if synchronize:
+        if _should_synchronize_workspace(synchronize):
             workspace.barrier()
         _combine_with_iris_gluon(
             out,
@@ -225,7 +226,7 @@ def owner_directed_combine(
             expert_owner,
             local_expert_id,
         )
-        if synchronize:
+        if _should_synchronize_workspace(synchronize):
             workspace.barrier()
     else:
         _combine_local_torch(
@@ -357,6 +358,10 @@ def _owner_output_row(
     )
     source_base = int(dispatch_plan.owner_expert_base_offsets[owner, local_id].item())
     return aggregate_start + source_base + source_owner_row - local_start
+
+
+def _should_synchronize_workspace(synchronize: bool) -> bool:
+    return synchronize and not get_is_capture_mode()
 
 
 def _validate_combine_inputs(

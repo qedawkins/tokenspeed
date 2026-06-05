@@ -433,6 +433,99 @@ def test_pre_routed_fused_metadata_matches_actual_s4_metadata_kernel() -> None:
     torch.testing.assert_close(fused.topk_weights, topk_weights.reshape(-1))
 
 
+def test_pre_routed_fused_metadata_cuda_graph_capture_path(monkeypatch) -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("GPU is required for CUDA graph fused metadata smoke test")
+    device = "cuda"
+    rank = 2
+    world_size = 4
+    num_local_experts = 2
+    topk_ids = torch.tensor(
+        [
+            [0, 1, 2],
+            [0, 3, 5],
+            [6, 0, -1],
+            [2, 3, 99],
+            [0, 1, 6],
+        ],
+        dtype=torch.int32,
+        device=device,
+    )
+    expert_owner, local_expert_id = _uniform_owner_maps(
+        world_size,
+        num_local_experts,
+        device=device,
+    )
+    ep_metadata = _reference_ep_metadata(
+        topk_ids,
+        expert_owner,
+        local_expert_id,
+        rank=rank,
+        world_size=world_size,
+        num_local_experts=num_local_experts,
+    )
+    workspace = _workspace(
+        world_size=world_size,
+        rank=rank,
+        hidden_size=4,
+        max_tokens_per_rank=topk_ids.shape[0],
+        top_k=topk_ids.shape[1],
+        device=device,
+    )
+    hidden_states = torch.arange(
+        topk_ids.shape[0] * 4,
+        dtype=torch.float32,
+        device=device,
+    ).reshape(topk_ids.shape[0], 4)
+    topk_weights = torch.linspace(
+        0.1,
+        0.9,
+        steps=topk_ids.numel(),
+        dtype=torch.float32,
+        device=device,
+    ).reshape(topk_ids.shape)
+
+    expected = build_pre_routed_fused_ep_metadata(
+        hidden_states,
+        topk_ids,
+        topk_weights,
+        ep_metadata,
+        workspace,
+    )
+    monkeypatch.setattr(ep_fused_metadata, "get_is_capture_mode", lambda: True)
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = build_pre_routed_fused_ep_metadata(
+            hidden_states,
+            topk_ids,
+            topk_weights,
+            ep_metadata,
+            workspace,
+        )
+    graph.replay()
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(captured.owner_ranks, expected.owner_ranks)
+    torch.testing.assert_close(captured.local_expert_ids, expected.local_expert_ids)
+    torch.testing.assert_close(captured.owner_rows, expected.owner_rows)
+    compact_rows = expected.owner_row_to_source_flat_slot.shape[1]
+    assert captured.owner_row_to_source_flat_slot.shape == (
+        world_size,
+        workspace.max_dispatch_rows,
+    )
+    torch.testing.assert_close(
+        captured.owner_row_to_source_flat_slot[:, :compact_rows],
+        expected.owner_row_to_source_flat_slot,
+    )
+    torch.testing.assert_close(
+        captured.owner_row_to_source[:, :compact_rows],
+        expected.owner_row_to_source,
+    )
+    assert captured.owner_row_to_source_flat_slot[:, compact_rows:].eq(-1).all()
+
+
 def test_ep_metadata_kernel_handles_kimi_96_local_expert_layout() -> None:
     _require_cdna4_gpu()
     import tokenspeed_kernel

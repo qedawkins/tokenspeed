@@ -28,6 +28,7 @@ import pytest
 import torch
 import torch.distributed as dist
 
+import tokenspeed.runtime.layers.moe.backends.ep_dispatch as ep_dispatch_module
 from tokenspeed.runtime.layers.moe.backends.ep_dispatch import (
     EPOwnerDispatchPlan,
     owner_directed_dispatch,
@@ -117,6 +118,142 @@ def test_owner_directed_dispatch_one_rank_duplicates_rows() -> None:
     assert step.num_rows == 5
     assert torch.equal(step.rank_counts, torch.tensor([5], dtype=torch.int32))
     assert torch.equal(step.rank_offsets, torch.tensor([0, 5], dtype=torch.int32))
+
+
+def test_owner_expert_metadata_value_checks_skip_during_capture(monkeypatch) -> None:
+    workspace = _workspace(world_size=2, rank=0, hidden_size=4)
+    metadata = _metadata(
+        [2, 2],
+        [[0, 1], [2, 3]],
+        owner_expert_counts=[[1, 1], [1, 1]],
+    )
+    metadata.owner_expert_offsets[0, 0] = 1
+
+    with pytest.raises(EPWorkspaceError, match="must start at zero"):
+        ep_dispatch_module._validate_owner_expert_metadata(metadata, workspace)
+
+    monkeypatch.setattr(ep_dispatch_module, "get_is_capture_mode", lambda: True)
+    ep_dispatch_module._validate_owner_expert_metadata(metadata, workspace)
+
+
+def test_dispatch_plan_value_checks_skip_during_capture(monkeypatch) -> None:
+    workspace = _workspace(world_size=2, rank=0, hidden_size=4)
+    metadata = _metadata(
+        [2, 2],
+        [[0, 1], [2, 3]],
+        owner_expert_counts=[[1, 1], [1, 1]],
+    )
+    dispatch_plan = EPOwnerDispatchPlan(
+        owner_base_offsets=torch.zeros(2, dtype=torch.int32),
+        owner_expert_base_offsets=torch.zeros((2, 2), dtype=torch.int32),
+        aggregate_owner_expert_counts=torch.ones((2, 2), dtype=torch.int32),
+        aggregate_owner_expert_offsets=torch.tensor(
+            [[0, 1, 2], [0, 1, 2]],
+            dtype=torch.int32,
+        ),
+        local_expert_counts=torch.tensor([1, 1], dtype=torch.int32),
+        local_expert_offsets=torch.tensor([0, 2, 2], dtype=torch.int32),
+    )
+
+    with pytest.raises(EPWorkspaceError, match="local_expert_offsets"):
+        ep_dispatch_module._validate_dispatch_plan(dispatch_plan, metadata, workspace)
+
+    monkeypatch.setattr(ep_dispatch_module, "get_is_capture_mode", lambda: True)
+    ep_dispatch_module._validate_dispatch_plan(dispatch_plan, metadata, workspace)
+
+
+def test_dispatch_offsets_from_counts() -> None:
+    counts = torch.tensor([2, 0, 3], dtype=torch.int32)
+    offsets = ep_dispatch_module._offsets_from_counts(counts)
+    owner_counts = torch.tensor([[1, 0], [2, 3]], dtype=torch.int32)
+    owner_offsets = ep_dispatch_module._owner_offsets_from_counts(owner_counts)
+
+    assert offsets.tolist() == [0, 2, 2, 5]
+    assert owner_offsets.tolist() == [[0, 1, 1], [0, 2, 5]]
+
+
+def test_dispatch_offsets_from_counts_cuda_graph_safe() -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("GPU is required for CUDA graph offset smoke test")
+    device = torch.device("cuda")
+    counts = torch.tensor([2, 0, 3], dtype=torch.int32, device=device)
+    owner_counts = torch.tensor([[1, 0], [2, 3]], dtype=torch.int32, device=device)
+
+    ep_dispatch_module._offsets_from_counts(counts)
+    ep_dispatch_module._owner_offsets_from_counts(owner_counts)
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        offsets = ep_dispatch_module._offsets_from_counts(counts)
+        owner_offsets = ep_dispatch_module._owner_offsets_from_counts(owner_counts)
+    graph.replay()
+    torch.cuda.synchronize()
+
+    assert offsets.cpu().tolist() == [0, 2, 2, 5]
+    assert owner_offsets.cpu().tolist() == [[0, 1, 1], [0, 2, 5]]
+
+
+def test_prepare_dispatch_uses_static_rows_during_capture(monkeypatch) -> None:
+    metadata = _metadata([5], [[0, 1, 2, 4, 5]])
+    workspace = _workspace(world_size=1, rank=0, hidden_size=4)
+    observed: dict[str, int | None] = {}
+    prepare_step = workspace.prepare_step
+
+    def spy_prepare_step(
+        rank_counts: torch.Tensor,
+        rank_offsets: torch.Tensor,
+        *,
+        num_rows: int | None = None,
+    ):
+        observed["num_rows"] = num_rows
+        return prepare_step(rank_counts, rank_offsets, num_rows=num_rows)
+
+    monkeypatch.setattr(ep_dispatch_module, "get_is_capture_mode", lambda: True)
+    monkeypatch.setattr(workspace, "prepare_step", spy_prepare_step)
+
+    prepare_owner_directed_dispatch(metadata, workspace)
+
+    assert observed["num_rows"] == workspace.max_dispatch_rows
+
+
+def test_owner_directed_dispatch_returns_static_view_during_capture(monkeypatch) -> None:
+    hidden_states = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+    topk_ids = torch.tensor([[0, 0], [0, -1], [0, 0]], dtype=torch.int32)
+    metadata = _metadata([5], [[0, 1, 2, 4, 5]])
+    workspace = _workspace(world_size=1, rank=0, hidden_size=4)
+
+    monkeypatch.setattr(ep_dispatch_module, "get_is_capture_mode", lambda: True)
+
+    step = owner_directed_dispatch(hidden_states, topk_ids, metadata, workspace)
+
+    assert step.num_rows == workspace.max_dispatch_rows
+    assert step.dispatch_buffer.shape == (workspace.max_dispatch_rows, 4)
+
+
+def test_dispatch_grid_owner_rows_uses_static_capacity_during_capture(
+    monkeypatch,
+) -> None:
+    metadata = _metadata([5], [[0, 1, 2, 4, 5]])
+    workspace = _workspace(world_size=1, rank=0, hidden_size=4)
+
+    assert ep_dispatch_module._dispatch_grid_owner_rows(metadata, workspace) == 5
+
+    monkeypatch.setattr(ep_dispatch_module, "get_is_capture_mode", lambda: True)
+
+    assert (
+        ep_dispatch_module._dispatch_grid_owner_rows(metadata, workspace)
+        == workspace.max_dispatch_rows
+    )
+
+
+def test_dispatch_workspace_sync_disabled_during_capture(monkeypatch) -> None:
+    assert ep_dispatch_module._should_synchronize_workspace(True)
+    assert not ep_dispatch_module._should_synchronize_workspace(False)
+
+    monkeypatch.setattr(ep_dispatch_module, "get_is_capture_mode", lambda: True)
+
+    assert not ep_dispatch_module._should_synchronize_workspace(True)
 
 
 def test_owner_directed_dispatch_one_rank_gpu_smoke() -> None:

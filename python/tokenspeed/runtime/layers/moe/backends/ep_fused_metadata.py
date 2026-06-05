@@ -33,6 +33,7 @@ from typing import Any
 import torch
 import torch.distributed as dist
 
+from tokenspeed.runtime.execution.cuda_graph_wrapper import get_is_capture_mode
 from tokenspeed.runtime.layers.moe.backends.ep_dispatch import (
     EPOwnerDispatchPlan,
     prepare_owner_directed_dispatch,
@@ -302,6 +303,8 @@ def _validate_metadata_tensor(
 
 
 def _validate_s4_metadata_consistency(ep_metadata: Any, *, expected_slots: int) -> None:
+    if get_is_capture_mode():
+        return
     if bool(ep_metadata.owner_offsets[0].ne(0).item()):
         raise EPWorkspaceError("owner_offsets must start at zero")
     if bool(
@@ -402,6 +405,8 @@ def _validate_dispatch_plan(
         ),
     ):
         _validate_metadata_tensor(tensor, name, shape, workspace)
+    if get_is_capture_mode():
+        return
     if bool(
         (
             dispatch_plan.aggregate_owner_expert_offsets[:, 1:]
@@ -435,8 +440,8 @@ def _owner_offsets_from_counts(counts: torch.Tensor) -> torch.Tensor:
         dtype=torch.int32,
         device=counts.device,
     )
-    offsets[:, 0] = 0
-    offsets[:, 1:] = torch.cumsum(counts, dim=1, dtype=torch.int32)
+    offsets[:, :1].zero_()
+    offsets[:, 1:].copy_(torch.cumsum(counts, dim=1, dtype=torch.int32))
     return offsets
 
 
@@ -446,36 +451,53 @@ def _derive_slot_owner_metadata(
     num_slots: int,
     workspace: EPCommunicationWorkspace,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    owner_ranks = torch.full(
-        (num_slots,),
+    combine_offsets = ep_metadata.combine_offsets
+    owner_ranks_ext = torch.full(
+        (num_slots + 1,),
         -1,
         dtype=torch.int32,
         device=workspace.device,
     )
-    local_expert_ids = torch.full_like(owner_ranks, -1)
-    for owner in range(workspace.world_size):
-        owner_count = int(ep_metadata.owner_counts[owner].item())
-        if owner_count == 0:
-            continue
-        owner_slots = ep_metadata.combine_offsets[owner, :owner_count]
-        valid_owner_slots = owner_slots >= 0
-        if bool(valid_owner_slots.any().item()):
-            slot_indices = owner_slots[valid_owner_slots].to(torch.long)
-            owner_ranks[slot_indices] = owner
+    local_expert_ids_ext = torch.full_like(owner_ranks_ext, -1)
+    owner_ids = torch.arange(
+        workspace.world_size,
+        dtype=torch.int32,
+        device=workspace.device,
+    ).view(-1, 1)
+    owner_ids = owner_ids.expand_as(combine_offsets)
+    valid_slots = (combine_offsets >= 0) & (combine_offsets < num_slots)
+    safe_slots = torch.where(
+        valid_slots,
+        combine_offsets,
+        torch.full_like(combine_offsets, num_slots),
+    ).reshape(-1).to(torch.long)
+    owner_values = torch.where(
+        valid_slots,
+        owner_ids,
+        torch.full_like(owner_ids, -1),
+    ).reshape(-1)
+    owner_ranks_ext.scatter_(0, safe_slots, owner_values)
 
-        offsets = ep_metadata.owner_expert_offsets[owner]
-        for local_id in range(offsets.numel() - 1):
-            start = int(offsets[local_id].item())
-            end = int(offsets[local_id + 1].item())
-            if start == end:
-                continue
-            expert_slots = ep_metadata.combine_offsets[owner, start:end]
-            valid_expert_slots = expert_slots >= 0
-            if bool(valid_expert_slots.any().item()):
-                local_expert_ids[expert_slots[valid_expert_slots].to(torch.long)] = (
-                    local_id
-                )
-    return owner_ranks, local_expert_ids
+    owner_row_ids = torch.arange(
+        combine_offsets.shape[1],
+        dtype=torch.int32,
+        device=workspace.device,
+    ).view(1, -1, 1)
+    expert_offsets = ep_metadata.owner_expert_offsets
+    expert_starts = expert_offsets[:, :-1].unsqueeze(1)
+    expert_ends = expert_offsets[:, 1:].unsqueeze(1)
+    expert_matches = (owner_row_ids >= expert_starts) & (owner_row_ids < expert_ends)
+    local_ids_by_owner_row = expert_matches.to(torch.int32).argmax(dim=2).to(
+        torch.int32
+    )
+    local_values = torch.where(
+        valid_slots,
+        local_ids_by_owner_row,
+        torch.full_like(local_ids_by_owner_row, -1),
+    ).reshape(-1)
+    local_expert_ids_ext.scatter_(0, safe_slots, local_values)
+
+    return owner_ranks_ext[:num_slots], local_expert_ids_ext[:num_slots]
 
 
 def _aggregate_owner_rows(
@@ -487,22 +509,18 @@ def _aggregate_owner_rows(
     dispatch_plan: EPOwnerDispatchPlan,
 ) -> torch.Tensor:
     owner_rows = torch.full_like(source_owner_rows, -1)
-    if not bool(valid_slot_mask.any().item()):
-        return owner_rows
-
-    owner_idx = owner_ranks[valid_slot_mask].to(torch.long)
-    local_idx = local_expert_ids[valid_slot_mask].to(torch.long)
-    source_rows = source_owner_rows[valid_slot_mask]
+    owner_idx = owner_ranks.clamp(min=0).to(torch.long)
+    local_idx = local_expert_ids.clamp(min=0).to(torch.long)
     local_starts = ep_metadata.owner_expert_offsets[owner_idx, local_idx]
     aggregate_starts = dispatch_plan.aggregate_owner_expert_offsets[
         owner_idx,
         local_idx,
     ]
     source_bases = dispatch_plan.owner_expert_base_offsets[owner_idx, local_idx]
-    owner_rows[valid_slot_mask] = (
-        aggregate_starts + source_bases + source_rows - local_starts
+    computed_owner_rows = (
+        aggregate_starts + source_bases + source_owner_rows - local_starts
     ).to(torch.int32)
-    return owner_rows
+    return torch.where(valid_slot_mask, computed_owner_rows, owner_rows)
 
 
 def _build_owner_row_identity(
@@ -516,7 +534,7 @@ def _build_owner_row_identity(
     dispatch_plan: EPOwnerDispatchPlan,
     workspace: EPCommunicationWorkspace,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    max_owner_rows = int(dispatch_plan.aggregate_owner_expert_offsets[:, -1].max().item())
+    max_owner_rows = _owner_row_capacity(dispatch_plan, workspace)
     owner_row_to_source_flat_slot = torch.full(
         (workspace.world_size, max_owner_rows),
         -1,
@@ -529,6 +547,19 @@ def _build_owner_row_identity(
         dtype=torch.int32,
         device=workspace.device,
     )
+    if get_is_capture_mode():
+        return _build_owner_row_identity_capture(
+            flat_slots,
+            source_ranks,
+            source_token_ids,
+            source_topk_slots,
+            owner_ranks,
+            owner_rows,
+            valid_slot_mask,
+            workspace,
+            owner_row_to_source_flat_slot,
+            owner_row_to_source,
+        )
     if max_owner_rows == 0 or not bool(valid_slot_mask.any().item()):
         if bool(valid_slot_mask.any().item()):
             raise EPWorkspaceError(
@@ -562,6 +593,83 @@ def _build_owner_row_identity(
     owner_row_to_source[owner_idx, owner_row_idx, 2] = source_topk_slots[
         valid_slot_mask
     ][valid_rows]
+    return owner_row_to_source_flat_slot, owner_row_to_source
+
+
+def _owner_row_capacity(
+    dispatch_plan: EPOwnerDispatchPlan,
+    workspace: EPCommunicationWorkspace,
+) -> int:
+    if get_is_capture_mode():
+        return workspace.max_dispatch_rows
+    return int(dispatch_plan.aggregate_owner_expert_offsets[:, -1].max().item())
+
+
+def _build_owner_row_identity_capture(
+    flat_slots: torch.Tensor,
+    source_ranks: torch.Tensor,
+    source_token_ids: torch.Tensor,
+    source_topk_slots: torch.Tensor,
+    owner_ranks: torch.Tensor,
+    owner_rows: torch.Tensor,
+    valid_slot_mask: torch.Tensor,
+    workspace: EPCommunicationWorkspace,
+    owner_row_to_source_flat_slot: torch.Tensor,
+    owner_row_to_source: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    max_owner_rows = owner_row_to_source_flat_slot.shape[1]
+    sentinel = workspace.world_size * max_owner_rows
+    valid_rows = (
+        valid_slot_mask
+        & (owner_ranks >= 0)
+        & (owner_rows >= 0)
+        & (owner_rows < max_owner_rows)
+    )
+    linear_rows = (
+        owner_ranks.clamp(min=0).to(torch.long) * max_owner_rows
+        + owner_rows.clamp(min=0).to(torch.long)
+    )
+    safe_rows = torch.where(
+        valid_rows,
+        linear_rows,
+        torch.full_like(linear_rows, sentinel),
+    )
+
+    flat_slot_ext = torch.full(
+        (sentinel + 1,),
+        -1,
+        dtype=torch.int32,
+        device=workspace.device,
+    )
+    flat_slot_values = torch.where(
+        valid_rows,
+        flat_slots,
+        torch.full_like(flat_slots, -1),
+    )
+    flat_slot_ext.scatter_(0, safe_rows, flat_slot_values)
+    owner_row_to_source_flat_slot.copy_(
+        flat_slot_ext[:sentinel].view(workspace.world_size, max_owner_rows)
+    )
+
+    source_values = torch.stack(
+        (source_ranks, source_token_ids, source_topk_slots),
+        dim=1,
+    )
+    source_ext = torch.full(
+        (sentinel + 1, 3),
+        -1,
+        dtype=torch.int32,
+        device=workspace.device,
+    )
+    source_values = torch.where(
+        valid_rows.view(-1, 1),
+        source_values,
+        torch.full_like(source_values, -1),
+    )
+    source_ext.scatter_(0, safe_rows.view(-1, 1).expand(-1, 3), source_values)
+    owner_row_to_source.copy_(
+        source_ext[:sentinel].view(workspace.world_size, max_owner_rows, 3)
+    )
     return owner_row_to_source_flat_slot, owner_row_to_source
 
 

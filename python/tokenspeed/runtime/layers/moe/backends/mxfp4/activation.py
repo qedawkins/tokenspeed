@@ -301,12 +301,13 @@ def _e8m0_to_float32(scale: torch.Tensor) -> torch.Tensor:
 
 
 def _e2m1_values(nibbles: torch.Tensor) -> torch.Tensor:
-    table = nibbles.new_tensor(
-        [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0],
-        dtype=torch.float32,
-    )
-    magnitude = table[(nibbles & 0x7).long()]
-    sign = torch.where((nibbles & 0x8) != 0, -1.0, 1.0)
+    magnitude_bits = nibbles & 0x7
+    exponent = (magnitude_bits >> 1).to(torch.float32)
+    mantissa = (magnitude_bits & 0x1).to(torch.float32)
+    normal = (1.0 + 0.5 * mantissa) * torch.exp2(exponent - 1.0)
+    subnormal = 0.5 * mantissa
+    magnitude = torch.where(exponent == 0, subnormal, normal)
+    sign = 1.0 - 2.0 * ((nibbles >> 3) & 0x1).to(torch.float32)
     return magnitude * sign
 
 

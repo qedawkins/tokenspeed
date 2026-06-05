@@ -33,6 +33,7 @@ from typing import Any
 import torch
 import torch.distributed as dist
 
+from tokenspeed.runtime.execution.cuda_graph_wrapper import get_is_capture_mode
 from tokenspeed.runtime.layers.moe.backends.ep_workspace import (
     EPCommunicationWorkspace,
     EPWorkspaceError,
@@ -188,7 +189,7 @@ def owner_directed_dispatch(
             workspace,
             dispatch_plan,
         )
-        if synchronize:
+        if _should_synchronize_workspace(synchronize):
             workspace.barrier()
     else:
         _dispatch_local_torch(
@@ -199,7 +200,7 @@ def owner_directed_dispatch(
             dispatch_plan,
         )
 
-    return workspace.view(int(dispatch_plan.local_expert_offsets[-1].item()))
+    return workspace.view(_dispatch_view_rows(dispatch_plan, workspace))
 
 
 def prepare_owner_directed_dispatch(
@@ -241,14 +242,12 @@ def prepare_owner_directed_dispatch(
         ]
         local_expert_counts = metadata.owner_expert_counts[workspace.rank].contiguous()
 
-    recv_offsets = torch.empty(
-        (workspace.world_size + 1,),
-        dtype=torch.int32,
-        device=owner_counts.device,
+    recv_offsets = _offsets_from_counts(recv_counts)
+    workspace.prepare_step(
+        recv_counts,
+        recv_offsets,
+        num_rows=_capture_view_rows(workspace),
     )
-    recv_offsets[0] = 0
-    recv_offsets[1:] = torch.cumsum(recv_counts, dim=0, dtype=torch.int32)
-    workspace.prepare_step(recv_counts, recv_offsets)
     return EPOwnerDispatchPlan(
         owner_base_offsets=owner_base_offsets,
         owner_expert_base_offsets=owner_expert_base_offsets,
@@ -273,7 +272,7 @@ def _dispatch_with_iris_gluon(
     if workspace.handle.device_context is None:
         raise EPWorkspaceUnavailable("Iris-backed workspace has no device context")
 
-    max_owner_rows = int(metadata.owner_counts.max().item())
+    max_owner_rows = _dispatch_grid_owner_rows(metadata, workspace)
     if max_owner_rows == 0:
         return
 
@@ -462,6 +461,8 @@ def _validate_owner_expert_metadata(
             f"owner_expert_offsets device {owner_expert_offsets.device} != "
             f"workspace device {workspace.device}"
         )
+    if get_is_capture_mode():
+        return
     if bool(owner_expert_offsets[:, 0].ne(0).any().item()):
         raise EPWorkspaceError("owner_expert_offsets must start at zero for each owner")
     if bool(
@@ -525,6 +526,8 @@ def _validate_dispatch_plan(
             raise EPWorkspaceError(
                 f"{name} device {tensor.device} != workspace device {workspace.device}"
             )
+    if get_is_capture_mode():
+        return
     if bool(
         (dispatch_plan.local_expert_offsets[1:] - dispatch_plan.local_expert_offsets[:-1])
         .ne(dispatch_plan.local_expert_counts)
@@ -576,9 +579,37 @@ def _offsets_from_counts(counts: torch.Tensor) -> torch.Tensor:
         dtype=torch.int32,
         device=counts.device,
     )
-    offsets[0] = 0
-    offsets[1:] = torch.cumsum(counts, dim=0, dtype=torch.int32)
+    offsets[:1].zero_()
+    offsets[1:].copy_(torch.cumsum(counts, dim=0, dtype=torch.int32))
     return offsets
+
+
+def _dispatch_view_rows(
+    dispatch_plan: EPOwnerDispatchPlan,
+    workspace: EPCommunicationWorkspace,
+) -> int:
+    if get_is_capture_mode():
+        return workspace.max_dispatch_rows
+    return int(dispatch_plan.local_expert_offsets[-1].item())
+
+
+def _dispatch_grid_owner_rows(
+    metadata: Any,
+    workspace: EPCommunicationWorkspace,
+) -> int:
+    if get_is_capture_mode():
+        return workspace.max_dispatch_rows
+    return int(metadata.owner_counts.max().item())
+
+
+def _should_synchronize_workspace(synchronize: bool) -> bool:
+    return synchronize and not get_is_capture_mode()
+
+
+def _capture_view_rows(workspace: EPCommunicationWorkspace) -> int | None:
+    if get_is_capture_mode():
+        return workspace.max_dispatch_rows
+    return None
 
 
 def _owner_offsets_from_counts(counts: torch.Tensor) -> torch.Tensor:
@@ -587,8 +618,8 @@ def _owner_offsets_from_counts(counts: torch.Tensor) -> torch.Tensor:
         dtype=torch.int32,
         device=counts.device,
     )
-    offsets[:, 0] = 0
-    offsets[:, 1:] = torch.cumsum(counts, dim=1, dtype=torch.int32)
+    offsets[:, :1].zero_()
+    offsets[:, 1:].copy_(torch.cumsum(counts, dim=1, dtype=torch.int32))
     return offsets
 
 

@@ -43,6 +43,37 @@ def test_dequantize_mxfp4_expert_weight_applies_pack_order_and_scales() -> None:
     torch.testing.assert_close(actual, expected)
 
 
+def test_dequantize_mxfp4_expert_weight_cuda_graph_safe() -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("GPU is required for CUDA graph expert dequant smoke test")
+    row = torch.tensor(
+        [0x21, 0x43, 0x65, 0x17] + [0] * 12,
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    packed = torch.cat((row, row)).reshape(1, 1, 32)
+    scales = torch.tensor([[[127, 128]]], dtype=torch.uint8, device="cuda")
+
+    expected = dequantize_mxfp4_expert_weight(
+        packed,
+        scales,
+        logical_shape=(1, 1, 64),
+    )
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = dequantize_mxfp4_expert_weight(
+            packed,
+            scales,
+            logical_shape=(1, 1, 64),
+        )
+    graph.replay()
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(actual, expected)
+
+
 def test_owner_rank_mxfp4_gate_up_matches_dequantized_dense_reference() -> None:
     torch.manual_seed(1729)
     num_experts = 2
