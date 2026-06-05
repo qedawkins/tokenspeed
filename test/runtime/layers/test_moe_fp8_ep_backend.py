@@ -194,6 +194,155 @@ def test_fp8_ep_pre_routed_fused_support_gate(
     )
 
 
+def test_fp8_ep_self_routing_fused_support_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _require_cdna4_gpu()
+    from tokenspeed.runtime.layers.moe.backends.fp8 import triton as fp8_triton
+    from tokenspeed.runtime.layers.moe.core.types import BackendKey, MoELayerSpec
+    from tokenspeed.runtime.layers.quantization import Fp8Config
+
+    def make_spec(
+        *,
+        activation: str = "silu",
+        ep_size: int = 4,
+        tp_size: int = 1,
+    ) -> MoELayerSpec:
+        return MoELayerSpec(
+            top_k=2,
+            num_experts=8,
+            num_local_experts=2,
+            hidden_size=32,
+            intermediate_size=16,
+            activation=activation,
+            tp_rank=0,
+            tp_size=tp_size,
+            ep_rank=0,
+            ep_size=ep_size,
+        )
+
+    def make_backend(spec: MoELayerSpec, routing_config=None):
+        return fp8_triton.Fp8TritonBackend(
+            key=BackendKey(arch="gfx950", quant="fp8", impl="triton"),
+            spec=spec,
+            quant_config=quant_config,
+            routing_config=routing_config,
+        )
+
+    quant_config = Fp8Config(
+        is_checkpoint_fp8_serialized=True,
+        weight_block_size=[16, 16],
+    )
+    monkeypatch.setattr(
+        fp8_triton,
+        "_current_platform",
+        lambda: SimpleNamespace(is_amd=True, is_cdna4_plus=True),
+    )
+
+    assert make_backend(make_spec()).topk_output_format.is_standard()
+    assert make_backend(
+        make_spec(),
+        routing_config={"moe_fused_features": {"self_routing"}},
+    ).topk_output_format.is_bypassed()
+    assert make_backend(
+        make_spec(),
+        routing_config={"features": "self_routing"},
+    ).topk_output_format.is_bypassed()
+    assert fp8_triton.Fp8TritonBackend._supports_self_routing_fused_ep(
+        make_spec(),
+        quant_config,
+    )
+    assert not fp8_triton.Fp8TritonBackend._supports_self_routing_fused_ep(
+        make_spec(ep_size=1),
+        quant_config,
+    )
+    assert make_backend(
+        make_spec(ep_size=1),
+        routing_config={"moe_fused_features": {"self_routing"}},
+    ).topk_output_format.is_standard()
+    assert not fp8_triton.Fp8TritonBackend._supports_self_routing_fused_ep(
+        make_spec(activation="gelu"),
+        quant_config,
+    )
+    assert not fp8_triton.Fp8TritonBackend._supports_self_routing_fused_ep(
+        make_spec(tp_size=2),
+        quant_config,
+    )
+
+    monkeypatch.setattr(
+        fp8_triton,
+        "_current_platform",
+        lambda: SimpleNamespace(is_amd=False, is_cdna4_plus=False),
+    )
+    assert not fp8_triton.Fp8TritonBackend._supports_self_routing_fused_ep(
+        make_spec(),
+        quant_config,
+    )
+
+
+def test_fp8_triton_backend_self_routing_rejects_runtime_dtype_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _require_cdna4_gpu()
+    fp8_dtype = getattr(torch, "float8_e4m3fn", None)
+    if fp8_dtype is None:
+        pytest.skip("torch FP8 dtype is required for fused wiring validation")
+
+    from tokenspeed.runtime.layers.moe.backends.fp8 import triton as fp8_triton
+    from tokenspeed.runtime.layers.moe.core.types import BackendKey, MoELayerSpec
+    from tokenspeed.runtime.layers.moe.topk import BypassedTopKOutput, TopKConfig
+    from tokenspeed.runtime.layers.quantization import Fp8Config
+
+    monkeypatch.setattr(
+        fp8_triton,
+        "_current_platform",
+        lambda: SimpleNamespace(is_amd=True, is_cdna4_plus=True),
+    )
+    spec = MoELayerSpec(
+        top_k=2,
+        num_experts=4,
+        num_local_experts=2,
+        hidden_size=32,
+        intermediate_size=16,
+        activation="silu",
+        tp_rank=0,
+        tp_size=1,
+        ep_rank=0,
+        ep_size=2,
+    )
+    backend = fp8_triton.Fp8TritonBackend(
+        key=BackendKey(arch="gfx950", quant="fp8", impl="triton"),
+        spec=spec,
+        quant_config=Fp8Config(
+            is_checkpoint_fp8_serialized=True,
+            weight_block_size=[16, 16],
+        ),
+        routing_config={"moe_fused_features": {"self_routing"}},
+    )
+    layer = SimpleNamespace(
+        activation="silu",
+        w13_weight=torch.empty((2, 32, 32), dtype=fp8_dtype),
+        w13_weight_scale_inv=torch.empty((2, 2, 2), dtype=torch.float32),
+        w2_weight=torch.empty((2, 32, 16), dtype=fp8_dtype),
+        w2_weight_scale_inv=torch.empty((2, 2, 1), dtype=torch.float32),
+    )
+    hidden_states = torch.empty((2, 32), dtype=torch.float32)
+    topk_output = BypassedTopKOutput(
+        hidden_states=hidden_states,
+        router_logits=torch.empty((2, 4), dtype=torch.float32),
+        topk_config=TopKConfig(top_k=2),
+    )
+
+    with pytest.raises(ValueError, match="self-routing fused EP requires"):
+        backend.forward(
+            layer,
+            hidden_states,
+            topk_output,
+            num_global_tokens=4,
+            max_num_tokens_per_gpu=2,
+        )
+
+
 @pytest.mark.parametrize("forced_backend", [False, True])
 def test_fp8_ep_selection_uses_existing_triton_backend_for_pre_routed_fused(
     monkeypatch: pytest.MonkeyPatch,
@@ -245,6 +394,64 @@ def test_fp8_ep_selection_uses_existing_triton_backend_for_pre_routed_fused(
     assert isinstance(backend, fp8_triton.Fp8TritonBackend)
     assert backend.key.impl == "triton"
     assert backend._supports_pre_routed_fused_ep(spec, quant_config)
+
+
+@pytest.mark.parametrize("forced_backend", [False, True])
+def test_fp8_ep_selection_uses_existing_triton_backend_for_self_routing_fused(
+    monkeypatch: pytest.MonkeyPatch,
+    forced_backend: bool,
+) -> None:
+    _require_cdna4_gpu()
+    from tokenspeed.runtime.layers.moe import utils as moe_utils
+    from tokenspeed.runtime.layers.moe.backends.fp8 import triton as fp8_triton
+    from tokenspeed.runtime.layers.moe.core import selector as selector_module
+    from tokenspeed.runtime.layers.moe.core.types import MoELayerSpec
+    from tokenspeed.runtime.layers.moe.utils import MoeBackend
+    from tokenspeed.runtime.layers.quantization import Fp8Config
+
+    monkeypatch.setattr(
+        selector_module,
+        "current_platform",
+        lambda: SimpleNamespace(is_amd=True),
+    )
+    monkeypatch.setattr(selector_module, "_detect_arch", lambda: "gfx950")
+    monkeypatch.setattr(
+        fp8_triton,
+        "_current_platform",
+        lambda: SimpleNamespace(is_amd=True, is_cdna4_plus=True),
+    )
+    monkeypatch.setattr(
+        moe_utils,
+        "MOE_BACKEND",
+        MoeBackend.TRITON if forced_backend else MoeBackend.AUTO,
+    )
+    spec = MoELayerSpec(
+        top_k=2,
+        num_experts=8,
+        num_local_experts=2,
+        hidden_size=32,
+        intermediate_size=16,
+        activation="silu",
+        tp_rank=0,
+        tp_size=1,
+        ep_rank=0,
+        ep_size=4,
+    )
+    quant_config = Fp8Config(
+        is_checkpoint_fp8_serialized=True,
+        weight_block_size=[16, 16],
+    )
+
+    backend = selector_module.select_backend(
+        spec,
+        quant_config,
+        routing_config={"moe_fused_features": {"self_routing"}},
+    )
+
+    assert isinstance(backend, fp8_triton.Fp8TritonBackend)
+    assert backend.key.impl == "triton"
+    assert backend._supports_self_routing_fused_ep(spec, quant_config)
+    assert backend.topk_output_format.is_bypassed()
 
 
 def test_fp8_ep_selection_rejects_unsupported_pre_routed_fused_shape(
@@ -382,6 +589,108 @@ def test_fp8_triton_backend_ep_forward_matches_dense_reference(ep_rank: int) -> 
         _dequantize_fp8_weight(fp8_w2, fp8_w2_scale, block_shape),
         topk_ids,
         topk_weights,
+    ).to(torch.bfloat16)
+    torch.testing.assert_close(out, expected, atol=7e-2, rtol=7e-2)
+
+
+def test_fp8_triton_backend_self_routing_ep_forward_matches_dense_reference() -> None:
+    _require_cdna4_gpu()
+    torch.manual_seed(9404)
+    from tokenspeed.runtime.layers.moe.backends.ep_self_routing import (
+        self_routing_topk_from_bypassed,
+    )
+    from tokenspeed.runtime.layers.moe.backends.fp8.triton import Fp8TritonBackend
+    from tokenspeed.runtime.layers.moe.core.types import BackendKey, MoELayerSpec
+    from tokenspeed.runtime.layers.moe.topk import BypassedTopKOutput, TopKConfig
+    from tokenspeed.runtime.layers.quantization import Fp8Config
+
+    device = "cuda"
+    num_tokens = 6
+    top_k = 2
+    ep_rank = 0
+    ep_size = 2
+    num_local_experts = 2
+    num_experts = ep_size * num_local_experts
+    hidden_size = 32
+    intermediate_size = 16
+    block_shape = (16, 16)
+    local_start = ep_rank * num_local_experts
+    hidden_states = (
+        torch.randn(num_tokens, hidden_size, device=device, dtype=torch.float32) * 0.12
+    ).to(torch.bfloat16)
+    router_logits = torch.full(
+        (num_tokens, num_experts),
+        -8.0,
+        dtype=torch.float32,
+        device=device,
+    )
+    router_logits[:, 0] = torch.linspace(2.0, 3.0, steps=num_tokens, device=device)
+    router_logits[:, 1] = torch.linspace(1.0, 1.5, steps=num_tokens, device=device)
+    dense_w13 = (
+        torch.randn(num_experts, 2 * intermediate_size, hidden_size, device=device)
+        * 0.12
+    )
+    dense_w2 = (
+        torch.randn(num_experts, hidden_size, intermediate_size, device=device) * 0.12
+    )
+    fp8_w13, fp8_w13_scale = _make_fp8_weight(dense_w13, block_shape)
+    fp8_w2, fp8_w2_scale = _make_fp8_weight(dense_w2, block_shape)
+    spec = MoELayerSpec(
+        top_k=top_k,
+        num_experts=num_experts,
+        num_local_experts=num_local_experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        activation="silu",
+        tp_rank=0,
+        tp_size=1,
+        ep_rank=ep_rank,
+        ep_size=ep_size,
+    )
+    backend = Fp8TritonBackend(
+        key=BackendKey(arch="gfx950", quant="fp8", impl="triton"),
+        spec=spec,
+        quant_config=Fp8Config(
+            is_checkpoint_fp8_serialized=True,
+            weight_block_size=list(block_shape),
+        ),
+        routing_config={"moe_fused_features": {"self_routing"}},
+    )
+    layer = SimpleNamespace(
+        activation="silu",
+        w13_weight=fp8_w13[local_start : local_start + num_local_experts],
+        w13_weight_scale_inv=fp8_w13_scale[local_start : local_start + num_local_experts],
+        w2_weight=fp8_w2[local_start : local_start + num_local_experts],
+        w2_weight_scale_inv=fp8_w2_scale[local_start : local_start + num_local_experts],
+    )
+    topk_output = BypassedTopKOutput(
+        hidden_states=hidden_states,
+        router_logits=router_logits,
+        topk_config=TopKConfig(
+            top_k=top_k,
+            routed_scaling_factor=1.0,
+            apply_routed_scaling_factor_on_output=(
+                backend.apply_routed_scaling_factor_on_output
+            ),
+        ),
+    )
+    routed_topk = self_routing_topk_from_bypassed(topk_output)
+
+    out = backend.forward(
+        layer,
+        hidden_states,
+        topk_output,
+        num_global_tokens=num_tokens * ep_size,
+        max_num_tokens_per_gpu=num_tokens,
+    )
+    torch.cuda.synchronize()
+
+    expected = _dense_moe_reference(
+        hidden_states,
+        _dequantize_fp8_weight(fp8_w13, fp8_w13_scale, block_shape),
+        _dequantize_fp8_weight(fp8_w2, fp8_w2_scale, block_shape),
+        routed_topk.topk_ids,
+        routed_topk.topk_weights,
     ).to(torch.bfloat16)
     torch.testing.assert_close(out, expected, atol=7e-2, rtol=7e-2)
 
@@ -823,6 +1132,226 @@ def test_fp8_triton_backend_ep_forward_uses_pre_routed_fused_helpers(
         "activation",
         "fused_down",
     ]
+
+
+def test_fp8_triton_backend_ep_forward_uses_self_routing_fused_helpers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _require_cdna4_gpu()
+    fp8_dtype = getattr(torch, "float8_e4m3fn", None)
+    if fp8_dtype is None:
+        pytest.skip("torch FP8 dtype is required for fused wiring validation")
+
+    import tokenspeed_kernel
+
+    from tokenspeed.runtime.layers import activation
+    from tokenspeed.runtime.layers.moe.backends import (
+        ep_dispatch,
+        ep_experts,
+        ep_fused_down_combine,
+        ep_fused_gate_up,
+        ep_fused_metadata,
+    )
+    from tokenspeed.runtime.layers.moe.backends.fp8 import triton as fp8_triton
+    from tokenspeed.runtime.layers.moe.core.types import BackendKey, MoELayerSpec
+    from tokenspeed.runtime.layers.moe.topk import BypassedTopKOutput, TopKConfig
+    from tokenspeed.runtime.layers.quantization import Fp8Config
+
+    device = "cpu"
+    hidden_size = 32
+    intermediate_size = 16
+    top_k = 2
+    ep_size = 2
+    num_local_experts = 2
+    calls: list[str] = []
+    expected = torch.full((2, hidden_size), 5.0, dtype=torch.bfloat16, device=device)
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        fp8_triton,
+        "_current_platform",
+        lambda: SimpleNamespace(is_amd=True, is_cdna4_plus=True),
+    )
+
+    def fail_pre_routed(*args, **kwargs):
+        del args, kwargs
+        pytest.fail("pre-routed fused helper was called")
+
+    def fail_unfused(*args, **kwargs):
+        del args, kwargs
+        pytest.fail("unfused EP helper was called")
+
+    def fake_self_gate_up(
+        hidden_states_arg,
+        topk_output_arg,
+        expert_owner,
+        local_expert_id,
+        workspace,
+        local_gate_up_weight,
+        local_gate_up_weight_scale,
+        **kwargs,
+    ):
+        del local_gate_up_weight, local_gate_up_weight_scale
+        calls.append("self_fused_gate_up")
+        assert hidden_states_arg is hidden_states
+        assert topk_output_arg.format.is_bypassed()
+        assert topk_output_arg.router_logits is router_logits
+        assert topk_output_arg.topk_config.top_k == top_k
+        assert workspace.backend == "torch"
+        assert expert_owner.tolist() == [0, 0, 1, 1]
+        assert local_expert_id.tolist() == [0, 1, 0, 1]
+        assert kwargs["expected_metadata_kernel_name"] == "gluon_ep_metadata_gfx950"
+        assert kwargs["expected_gemm_kernel_name"] == "gluon_fp8_local_experts_gfx950"
+        result = SimpleNamespace(
+            topk_output=SimpleNamespace(
+                topk_ids=torch.tensor(
+                    [[0, 1], [2, 3]],
+                    dtype=torch.int32,
+                    device=device,
+                ),
+                topk_weights=torch.ones((2, top_k), dtype=torch.float32, device=device),
+            ),
+            ep_metadata=SimpleNamespace(tag="metadata"),
+            fused_metadata=SimpleNamespace(tag="fused"),
+            gate_up=torch.ones(
+                (4, 2 * intermediate_size),
+                dtype=torch.bfloat16,
+                device=device,
+            ),
+            dispatch_plan=SimpleNamespace(tag="dispatch_plan"),
+        )
+        captured["gate_up_result"] = result
+        return result
+
+    def fake_silu_and_mul(gate_up, out):
+        del gate_up
+        calls.append("activation")
+        out.fill_(2)
+
+    def fake_self_down(
+        owner_intermediate,
+        gate_up_result,
+        workspace,
+        local_down_weight,
+        local_down_weight_scale,
+        expert_owner,
+        local_expert_id,
+        **kwargs,
+    ):
+        del local_down_weight, local_down_weight_scale, expert_owner, local_expert_id
+        calls.append("self_fused_down")
+        assert gate_up_result is captured["gate_up_result"]
+        assert owner_intermediate.shape == (4, intermediate_size)
+        assert workspace.backend == "torch"
+        assert kwargs["expected_gemm_kernel_name"] == "gluon_fp8_local_experts_gfx950"
+        assert kwargs["expected_reduce_kernel_name"] == "gluon_local_sum_reduce_gfx950"
+        return SimpleNamespace(output=expected)
+
+    monkeypatch.setattr(tokenspeed_kernel, "moe_dispatch", fail_pre_routed)
+    monkeypatch.setattr(ep_dispatch, "prepare_owner_directed_dispatch", fail_pre_routed)
+    monkeypatch.setattr(ep_dispatch, "owner_directed_dispatch", fail_unfused)
+    monkeypatch.setattr(ep_experts, "owner_rank_fp8_expert_gemm", fail_unfused)
+    monkeypatch.setattr(
+        ep_fused_metadata,
+        "build_pre_routed_fused_ep_metadata",
+        fail_pre_routed,
+    )
+    monkeypatch.setattr(
+        ep_fused_gate_up,
+        "pre_routed_fused_dispatch_gate_up",
+        fail_pre_routed,
+    )
+    monkeypatch.setattr(
+        ep_fused_gate_up,
+        "self_routing_fused_dispatch_gate_up",
+        fake_self_gate_up,
+    )
+    monkeypatch.setattr(activation, "silu_and_mul", fake_silu_and_mul)
+    monkeypatch.setattr(
+        ep_fused_down_combine,
+        "pre_routed_fused_down_combine",
+        fail_pre_routed,
+    )
+    monkeypatch.setattr(
+        ep_fused_down_combine,
+        "self_routing_fused_down_combine",
+        fake_self_down,
+    )
+
+    spec = MoELayerSpec(
+        top_k=top_k,
+        num_experts=ep_size * num_local_experts,
+        num_local_experts=num_local_experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        activation="silu",
+        tp_rank=0,
+        tp_size=1,
+        ep_rank=0,
+        ep_size=ep_size,
+    )
+    backend = fp8_triton.Fp8TritonBackend(
+        key=BackendKey(arch="gfx950", quant="fp8", impl="triton"),
+        spec=spec,
+        quant_config=Fp8Config(
+            is_checkpoint_fp8_serialized=True,
+            weight_block_size=[16, 16],
+        ),
+        routing_config={"moe_fused_features": {"self_routing"}},
+    )
+    layer = SimpleNamespace(
+        activation="silu",
+        w13_weight=torch.empty(
+            (num_local_experts, 2 * intermediate_size, hidden_size),
+            dtype=fp8_dtype,
+            device=device,
+        ),
+        w13_weight_scale_inv=torch.empty(
+            (num_local_experts, 2, 2),
+            dtype=torch.float32,
+            device=device,
+        ),
+        w2_weight=torch.empty(
+            (num_local_experts, hidden_size, intermediate_size),
+            dtype=fp8_dtype,
+            device=device,
+        ),
+        w2_weight_scale_inv=torch.empty(
+            (num_local_experts, 2, 1),
+            dtype=torch.float32,
+            device=device,
+        ),
+    )
+    hidden_states = torch.empty((2, hidden_size), dtype=torch.bfloat16, device=device)
+    router_logits = torch.empty(
+        (2, ep_size * num_local_experts),
+        dtype=torch.float32,
+        device=device,
+    )
+    topk_output = BypassedTopKOutput(
+        hidden_states=hidden_states,
+        router_logits=router_logits,
+        topk_config=TopKConfig(
+            top_k=top_k,
+            use_grouped_topk=True,
+            topk_group=1,
+            num_expert_group=2,
+            routed_scaling_factor=0.5,
+            apply_routed_scaling_factor_on_output=True,
+        ),
+    )
+
+    out = backend.forward(
+        layer,
+        hidden_states,
+        topk_output,
+        num_global_tokens=4,
+        max_num_tokens_per_gpu=2,
+    )
+
+    assert out is expected
+    assert backend.topk_output_format.is_bypassed()
+    assert calls == ["self_fused_gate_up", "activation", "self_fused_down"]
 
 
 def _dense_moe_reference(

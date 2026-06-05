@@ -63,6 +63,25 @@ class Fp8TritonBackend(MoEBackend):
             and spec.tp_size == 1
         )
 
+    @classmethod
+    def _supports_self_routing_fused_ep(
+        cls,
+        spec: MoELayerSpec,
+        quant_config: object,
+    ) -> bool:
+        return cls._supports_pre_routed_fused_ep(spec, quant_config)
+
+    @property
+    def topk_output_format(self):
+        from tokenspeed.runtime.layers.moe.topk import TopKOutputFormat
+
+        if (
+            self._wants_self_routing_fused_ep()
+            and self._supports_self_routing_fused_ep(self.spec, self.quant_config)
+        ):
+            return TopKOutputFormat.BYPASSED
+        return TopKOutputFormat.STANDARD
+
     def create_layer_weights(self, layer, *, with_bias: bool = False) -> None:
         ispp = attach_dense_weight_pair(
             self,
@@ -147,9 +166,11 @@ class Fp8TritonBackend(MoEBackend):
         )
         from tokenspeed.runtime.layers.moe.backends.ep_fused_down_combine import (
             pre_routed_fused_down_combine,
+            self_routing_fused_down_combine,
         )
         from tokenspeed.runtime.layers.moe.backends.ep_fused_gate_up import (
             pre_routed_fused_dispatch_gate_up,
+            self_routing_fused_dispatch_gate_up,
         )
         from tokenspeed.runtime.layers.moe.backends.ep_fused_metadata import (
             build_pre_routed_fused_ep_metadata,
@@ -157,28 +178,27 @@ class Fp8TritonBackend(MoEBackend):
         from tokenspeed.runtime.layers.moe.backends.ep_reduce import ep_weighted_reduce
         import tokenspeed_kernel
 
-        topk_ids = topk_output.topk_ids.to(torch.int32)
-        topk_weights = topk_output.topk_weights
         num_tokens = hidden_states.shape[0]
         num_global_tokens = int(num_global_tokens or 0)
         if num_tokens == 0 and num_global_tokens == 0:
             return hidden_states.new_zeros((0, self.spec.hidden_size))
+        use_self_routing = _is_bypassed_topk_output(topk_output)
+        if use_self_routing:
+            if not self._can_use_self_routing_fused_ep(layer, hidden_states):
+                raise ValueError(
+                    "FP8 Triton self-routing fused EP requires AMD CDNA4+, "
+                    "silu activation, EP>1, TP=1, BF16 activations, FP8 E4M3 "
+                    "weights, and FP32 block scales"
+                )
+            topk_output = _replace_bypassed_hidden_states(topk_output, hidden_states)
+        else:
+            topk_ids = topk_output.topk_ids.to(torch.int32)
+            topk_weights = topk_output.topk_weights
 
         expert_owner, local_expert_id = _expert_ownership_tensors(
             num_experts=self.spec.num_experts,
             num_local_experts=self.spec.num_local_experts,
             device=hidden_states.device,
-        )
-        metadata = tokenspeed_kernel.moe_dispatch(
-            topk_ids,
-            expert_owner,
-            local_expert_id,
-            self.spec.ep_rank,
-            self.spec.ep_size,
-            self.spec.num_local_experts,
-            dtype=torch.int32,
-            traits={"comm_strategy": "ep_metadata"},
-            expected_kernel_name="gluon_ep_metadata_gfx950",
         )
         fallback_max_tokens_per_rank = (
             num_global_tokens + self.spec.ep_size - 1
@@ -193,11 +213,46 @@ class Fp8TritonBackend(MoEBackend):
             device=hidden_states.device,
             iris_mode="auto",
         )
-        dispatch_plan = prepare_owner_directed_dispatch(metadata, workspace)
 
         block_shape = tuple(self.quant_config.weight_block_size)
         fused_metadata = None
-        if self._can_use_pre_routed_fused_ep(layer, hidden_states):
+        gate_up_result = None
+        if use_self_routing:
+            gate_up_result = self_routing_fused_dispatch_gate_up(
+                hidden_states,
+                topk_output,
+                expert_owner,
+                local_expert_id,
+                workspace,
+                layer.w13_weight,
+                layer.w13_weight_scale_inv,
+                block_shape=block_shape,
+                block_size=16,
+                out=None,
+                config=None,
+                expected_metadata_kernel_name="gluon_ep_metadata_gfx950",
+                expected_gemm_kernel_name="gluon_fp8_local_experts_gfx950",
+            )
+            gate_up = gate_up_result.gate_up
+            dispatch_plan = gate_up_result.dispatch_plan
+        else:
+            metadata = tokenspeed_kernel.moe_dispatch(
+                topk_ids,
+                expert_owner,
+                local_expert_id,
+                self.spec.ep_rank,
+                self.spec.ep_size,
+                self.spec.num_local_experts,
+                dtype=torch.int32,
+                traits={"comm_strategy": "ep_metadata"},
+                expected_kernel_name="gluon_ep_metadata_gfx950",
+            )
+            dispatch_plan = prepare_owner_directed_dispatch(metadata, workspace)
+
+        if (not use_self_routing) and self._can_use_pre_routed_fused_ep(
+            layer,
+            hidden_states,
+        ):
             fused_metadata = build_pre_routed_fused_ep_metadata(
                 hidden_states,
                 topk_ids,
@@ -222,7 +277,7 @@ class Fp8TritonBackend(MoEBackend):
             )
             gate_up = gate_up_result.gate_up
             dispatch_plan = gate_up_result.dispatch_plan
-        else:
+        elif not use_self_routing:
             dispatch_step = owner_directed_dispatch(
                 hidden_states,
                 topk_ids,
@@ -246,6 +301,21 @@ class Fp8TritonBackend(MoEBackend):
             device=gate_up.device,
         )
         silu_and_mul(gate_up.view(-1, gate_up.shape[-1]), intermediate)
+
+        if use_self_routing:
+            return self_routing_fused_down_combine(
+                intermediate,
+                gate_up_result,
+                workspace,
+                layer.w2_weight,
+                layer.w2_weight_scale_inv,
+                expert_owner,
+                local_expert_id,
+                block_shape=block_shape,
+                block_size=16,
+                expected_gemm_kernel_name="gluon_fp8_local_experts_gfx950",
+                expected_reduce_kernel_name="gluon_local_sum_reduce_gfx950",
+            ).output
 
         if fused_metadata is not None:
             return pre_routed_fused_down_combine(
@@ -287,6 +357,17 @@ class Fp8TritonBackend(MoEBackend):
         )
         return ep_weighted_reduce(returned_slots, topk_weights)
 
+    def _wants_self_routing_fused_ep(self) -> bool:
+        return _FUSED_SELF_ROUTING_FEATURE in _fused_features_from_routing_config(
+            self.routing_config
+        )
+
+    def _can_use_self_routing_fused_ep(self, layer, hidden_states) -> bool:
+        return self._wants_self_routing_fused_ep() and self._can_use_pre_routed_fused_ep(
+            layer,
+            hidden_states,
+        )
+
     def _can_use_pre_routed_fused_ep(self, layer, hidden_states) -> bool:
         if not self._supports_pre_routed_fused_ep(self.spec, self.quant_config):
             return False
@@ -304,6 +385,38 @@ class Fp8TritonBackend(MoEBackend):
 
 
 __all__ = ["Fp8TritonBackend"]
+
+
+_FUSED_SELF_ROUTING_FEATURE = "self_routing"
+_FUSED_FEATURE_KEYS = ("moe_fused_features", "features")
+
+
+def _fused_features_from_routing_config(routing_config: dict | None) -> frozenset[str]:
+    if not routing_config:
+        return frozenset()
+    for key in _FUSED_FEATURE_KEYS:
+        features = routing_config.get(key)
+        if features is None:
+            continue
+        if isinstance(features, str):
+            return frozenset({features})
+        return frozenset(features)
+    return frozenset()
+
+
+def _is_bypassed_topk_output(topk_output: object) -> bool:
+    output_format = getattr(topk_output, "format", None)
+    is_bypassed = getattr(output_format, "is_bypassed", None)
+    return is_bypassed is not None and is_bypassed()
+
+
+def _replace_bypassed_hidden_states(topk_output: object, hidden_states: torch.Tensor):
+    replace = getattr(topk_output, "_replace", None)
+    if replace is not None:
+        return replace(hidden_states=hidden_states)
+    if hasattr(topk_output, "hidden_states"):
+        topk_output.hidden_states = hidden_states
+    return topk_output
 
 
 def _expert_ownership_tensors(
