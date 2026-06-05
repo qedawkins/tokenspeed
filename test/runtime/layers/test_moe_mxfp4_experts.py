@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 import torch
 
+from tokenspeed.runtime.layers.moe.backends.mxfp4 import experts as mxfp4_experts_module
 from tokenspeed.runtime.layers.moe.backends.mxfp4.activation import (
     dequantize_mxfp4_activation,
     quantize_mxfp4_activation_reference,
@@ -62,6 +63,61 @@ def test_owner_rank_mxfp4_gate_up_matches_dequantized_dense_reference() -> None:
 
     dense_weight = dequantize_mxfp4_expert_weight(packed_weight, scales)
     expected = _dense_owner_reference(owner_tokens, dense_weight, local_counts)
+    torch.testing.assert_close(actual, expected, atol=1e-4, rtol=1e-4)
+
+
+def test_owner_rank_mxfp4_expert_gemm_dequantizes_only_active_experts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    torch.manual_seed(1848)
+    num_experts = 4
+    out_features = 10
+    in_features = 64
+    local_counts = torch.tensor([0, 2, 0, 1], dtype=torch.int32)
+    owner_tokens = torch.randn(3, in_features, dtype=torch.float32).to(torch.bfloat16)
+    packed_weight = _random_packed_weight(num_experts, out_features, in_features)
+    scales = _random_e8m0_scales(num_experts, out_features, in_features)
+
+    dense_weight = dequantize_mxfp4_expert_weight(packed_weight, scales)
+    expected = _dense_owner_reference(owner_tokens, dense_weight, local_counts)
+    dequant_shapes: list[tuple[int, int, int]] = []
+    original_dequant = (
+        mxfp4_experts_module._dequantize_mxfp4_expert_weight_unchecked
+    )
+
+    def tracked_dequant(
+        packed: torch.Tensor,
+        scale: torch.Tensor,
+        *,
+        logical_shape: tuple[int, int, int],
+        signature: object,
+    ) -> torch.Tensor:
+        dequant_shapes.append(logical_shape)
+        return original_dequant(
+            packed,
+            scale,
+            logical_shape=logical_shape,
+            signature=signature,
+        )
+
+    monkeypatch.setattr(
+        mxfp4_experts_module,
+        "_dequantize_mxfp4_expert_weight_unchecked",
+        tracked_dequant,
+    )
+
+    actual = owner_rank_mxfp4_expert_gemm(
+        owner_tokens,
+        packed_weight,
+        scales,
+        local_counts,
+        output_dtype=torch.float32,
+    )
+
+    assert dequant_shapes == [
+        (1, out_features, in_features),
+        (1, out_features, in_features),
+    ]
     torch.testing.assert_close(actual, expected, atol=1e-4, rtol=1e-4)
 
 

@@ -35,6 +35,7 @@ from tokenspeed.runtime.layers.moe.backends.mxfp4.activation import (
 )
 from tokenspeed.runtime.layers.moe.backends.mxfp4.weights import (
     MXFP4_E2M1_BLOCK32_FORMAT,
+    PackedExpertWeightFormat,
     validate_mxfp4_expert_weight_format,
 )
 
@@ -58,6 +59,21 @@ def dequantize_mxfp4_expert_weight(
         weight_scale,
         logical_shape=logical_shape,
     )
+    return _dequantize_mxfp4_expert_weight_unchecked(
+        packed_weight,
+        weight_scale,
+        logical_shape=logical_shape,
+        signature=signature,
+    )
+
+
+def _dequantize_mxfp4_expert_weight_unchecked(
+    packed_weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    *,
+    logical_shape: tuple[int, int, int],
+    signature: PackedExpertWeightFormat,
+) -> torch.Tensor:
     _, _, in_features = logical_shape
     values = packed_weight.new_empty(logical_shape, dtype=torch.float32)
     packed = packed_weight.reshape(
@@ -70,6 +86,24 @@ def dequantize_mxfp4_expert_weight(
     _, block_in = signature.block_shape
     scales = torch.pow(2.0, weight_scale.to(torch.int32) - 127).to(torch.float32)
     return values * scales.repeat_interleave(block_in, dim=2)
+
+
+def _dequantize_single_mxfp4_expert_weight(
+    packed_weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    expert_idx: int,
+    *,
+    in_features: int,
+    signature: PackedExpertWeightFormat,
+) -> torch.Tensor:
+    logical_shape = (1, int(packed_weight.shape[1]), in_features)
+    dense = _dequantize_mxfp4_expert_weight_unchecked(
+        packed_weight[expert_idx : expert_idx + 1],
+        weight_scale[expert_idx : expert_idx + 1],
+        logical_shape=logical_shape,
+        signature=signature,
+    )
+    return dense.squeeze(0)
 
 
 def owner_rank_mxfp4_expert_gemm(
@@ -103,28 +137,42 @@ def owner_rank_mxfp4_expert_gemm(
         int(local_packed_weight.shape[1]),
         int(owner_tokens.shape[1]),
     )
-    dense_weight = dequantize_mxfp4_expert_weight(
+    signature = validate_mxfp4_expert_weight_format(
         local_packed_weight,
         local_weight_scale,
         logical_shape=logical_shape,
     )
-    _validate_component_shapes(owner_tokens, dense_weight, offsets, bias, out)
+    _validate_owner_gemm_component_shapes(
+        owner_tokens,
+        local_packed_weight,
+        local_weight_scale,
+        offsets,
+        bias,
+        out,
+    )
 
     if out is None:
         out = torch.empty(
-            (owner_tokens.shape[0], dense_weight.shape[1]),
+            (owner_tokens.shape[0], local_packed_weight.shape[1]),
             dtype=output_dtype,
             device=owner_tokens.device,
         )
     if owner_tokens.shape[0] == 0:
         return out
 
-    for expert_idx in range(dense_weight.shape[0]):
+    for expert_idx in range(local_packed_weight.shape[0]):
         start = int(offsets[expert_idx].item())
         end = int(offsets[expert_idx + 1].item())
         if start == end:
             continue
-        result = owner_tokens[start:end].float() @ dense_weight[expert_idx].T
+        expert_weight = _dequantize_single_mxfp4_expert_weight(
+            local_packed_weight,
+            local_weight_scale,
+            expert_idx,
+            in_features=owner_tokens.shape[1],
+            signature=signature,
+        )
+        result = owner_tokens[start:end].float() @ expert_weight.T
         if bias is not None:
             result = result + bias[expert_idx].float()
         out[start:end].copy_(result.to(out.dtype))
@@ -397,35 +445,37 @@ def _validate_counts_and_offsets(
     return offsets
 
 
-def _validate_component_shapes(
+def _validate_owner_gemm_component_shapes(
     owner_tokens: torch.Tensor,
-    dense_weight: torch.Tensor,
+    local_packed_weight: torch.Tensor,
+    local_weight_scale: torch.Tensor,
     offsets: torch.Tensor,
     bias: torch.Tensor | None,
     out: torch.Tensor | None,
 ) -> None:
-    if dense_weight.device != owner_tokens.device:
+    num_local_experts = int(local_packed_weight.shape[0])
+    out_features = int(local_packed_weight.shape[1])
+    if local_packed_weight.device != owner_tokens.device:
         raise ValueError(
-            f"dense weight device {dense_weight.device} != owner token device "
-            f"{owner_tokens.device}"
+            f"local packed weight device {local_packed_weight.device} != "
+            f"owner token device {owner_tokens.device}"
+        )
+    if local_weight_scale.device != local_packed_weight.device:
+        raise ValueError(
+            f"local weight scale device {local_weight_scale.device} != "
+            f"local packed weight device {local_packed_weight.device}"
         )
     if offsets.device != owner_tokens.device:
         raise ValueError(
             f"local_expert_offsets device {offsets.device} != owner token device "
             f"{owner_tokens.device}"
         )
-    if dense_weight.shape[0] != offsets.numel() - 1:
+    if num_local_experts != offsets.numel() - 1:
         raise ValueError(
-            f"local weight experts {dense_weight.shape[0]} != "
-            f"{offsets.numel() - 1}"
-        )
-    if dense_weight.shape[2] != owner_tokens.shape[1]:
-        raise ValueError(
-            f"local weight input {dense_weight.shape[2]} != owner token hidden "
-            f"{owner_tokens.shape[1]}"
+            f"local weight experts {num_local_experts} != {offsets.numel() - 1}"
         )
     if bias is not None:
-        expected_bias_shape = (dense_weight.shape[0], dense_weight.shape[1])
+        expected_bias_shape = (num_local_experts, out_features)
         if bias.shape != expected_bias_shape:
             raise ValueError(f"bias shape {tuple(bias.shape)} != {expected_bias_shape}")
         if bias.device != owner_tokens.device:
@@ -433,7 +483,7 @@ def _validate_component_shapes(
                 f"bias device {bias.device} != owner token device {owner_tokens.device}"
             )
     if out is not None:
-        expected_out_shape = (owner_tokens.shape[0], dense_weight.shape[1])
+        expected_out_shape = (owner_tokens.shape[0], out_features)
         if out.shape != expected_out_shape:
             raise ValueError(f"out shape {tuple(out.shape)} != {expected_out_shape}")
         if out.device != owner_tokens.device:
