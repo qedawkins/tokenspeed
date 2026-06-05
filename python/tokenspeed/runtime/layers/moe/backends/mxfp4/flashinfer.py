@@ -29,6 +29,7 @@ from torch.nn.parameter import Parameter
 from tokenspeed.runtime.layers.moe.backends.base import MoEBackend
 from tokenspeed.runtime.layers.moe.backends.mxfp4.weights import (
     MXFP4_BLOCK,
+    MXFP4_E2M1_BLOCK32_FORMAT,
     create_mxfp4_weights,
 )
 from tokenspeed.runtime.layers.moe.core.types import MoELayerSpec
@@ -183,6 +184,10 @@ class Mxfp4FlashinferMxfp4Backend(MoEBackend):
     @property
     def topk_output_format(self) -> TopKOutputFormat:
         return TopKOutputFormat.BYPASSED
+
+    @property
+    def expert_weight_format_signature(self):
+        return MXFP4_E2M1_BLOCK32_FORMAT
 
     def create_layer_weights(
         self, layer: nn.Module, *, with_bias: bool = False

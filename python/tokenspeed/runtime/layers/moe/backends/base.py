@@ -101,6 +101,10 @@ class MoEBackend(ABC):
 
         return TopKOutputFormat.STANDARD
 
+    @property
+    def expert_weight_format_signature(self):
+        return None
+
     def ensure_ep_workspace(
         self,
         *,
