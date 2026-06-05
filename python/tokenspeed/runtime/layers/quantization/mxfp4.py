@@ -57,6 +57,27 @@ def _is_quark_mxfp4_checkpoint(config: dict) -> bool:
     )
 
 
+def _iter_ignored_layer_pattern_aliases(raw: str):
+    yield raw
+    if raw.startswith("language_model."):
+        yield raw.removeprefix("language_model.")
+        return
+
+    if raw.startswith("re:"):
+        regex = raw[3:]
+        for prefix in ("language_model.", re.escape("language_model.")):
+            if regex.startswith(prefix):
+                yield f"re:{regex.removeprefix(prefix)}"
+                return
+
+
+def _to_ignore_pattern(raw: str) -> str:
+    if raw.startswith("re:") or "*" not in raw:
+        return raw
+    regex = re.escape(raw).replace(r"\*", ".*")
+    return f"re:{regex}"
+
+
 def _normalize_ignored_layer_patterns(patterns: list[str] | None) -> list[str]:
     """Normalize ignored-layer patterns into the form understood by
     ``should_ignore_quant_layer``.
@@ -69,14 +90,16 @@ def _normalize_ignored_layer_patterns(patterns: list[str] | None) -> list[str]:
     if not patterns:
         return []
     normalized: list[str] = []
+    seen: set[str] = set()
     for raw in patterns:
         if not isinstance(raw, str) or not raw:
             continue
-        if raw.startswith("re:") or "*" not in raw:
-            normalized.append(raw)
-            continue
-        regex = re.escape(raw).replace(r"\*", ".*")
-        normalized.append(f"re:{regex}")
+        for alias in _iter_ignored_layer_pattern_aliases(raw):
+            pattern = _to_ignore_pattern(alias)
+            if pattern in seen:
+                continue
+            seen.add(pattern)
+            normalized.append(pattern)
     return normalized
 
 

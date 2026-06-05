@@ -87,10 +87,7 @@ from tokenspeed.runtime.layers.moe.utils import RoutingMethodType
 from tokenspeed.runtime.layers.paged_attention import PagedAttention
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.layers.quantization.nvfp4 import Nvfp4Config
-from tokenspeed.runtime.layers.quantization.utils import (
-    block_dequant,
-    should_ignore_quant_layer,
-)
+from tokenspeed.runtime.layers.quantization.utils import block_dequant
 from tokenspeed.runtime.layers.rotary_embedding import get_rope
 from tokenspeed.runtime.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -1320,6 +1317,13 @@ class DeepseekV3Model(nn.Module):
         return hidden_states, aux_hidden_states
 
 
+def _qkv_a_quant_block_size(quant_config: QuantizationConfig | None) -> int:
+    weight_block_size = getattr(quant_config, "weight_block_size", None)
+    if weight_block_size is None:
+        return 1
+    return int(weight_block_size[0])
+
+
 class DeepseekV3ForCausalLM(BaseCausalLM):
     model_cls = DeepseekV3Model
 
@@ -1484,12 +1488,7 @@ class DeepseekV3ForCausalLM(BaseCausalLM):
                 if fuse_qkv_a_proj and (
                     "q_a_proj" in name or "kv_a_proj_with_mqa" in name
                 ):
-                    quant_block_size = 1
-                    if (
-                        self.quant_config is not None
-                        and self.quant_config.weight_block_size is not None
-                    ):
-                        quant_block_size = self.quant_config.weight_block_size[0]
+                    quant_block_size = _qkv_a_quant_block_size(self.quant_config)
                     begin_size_mp = {
                         "q_a_proj": 0,
                         "kv_a_proj_with_mqa": self.config.q_lora_rank,

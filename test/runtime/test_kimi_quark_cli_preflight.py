@@ -452,3 +452,28 @@ def test_runtime_mxfp4_override_detects_dynamic_fp4_quark_without_gpu_imports() 
 
     assert parsed.is_checkpoint_mxfp4_serialized is True
     assert parsed.is_w4a8_fp8 is False
+
+
+def test_mxfp4_exact_language_model_excludes_match_stripped_fused_attention() -> None:
+    from tokenspeed.runtime.layers.quantization.utils import should_ignore_quant_layer
+
+    module = _load_mxfp4_config_module_without_quantization_package_import()
+    mxfp4_config = quark_kimi_mxfp4_model_config()["quantization_config"]
+    mxfp4_config["exclude"] = [
+        "language_model.model.layers.0.self_attn.q_a_proj",
+        "language_model.model.layers.0.self_attn.kv_a_proj_with_mqa",
+        "language_model.model.layers.0.mlp.experts.0.gate_proj",
+    ]
+
+    parsed = module.Mxfp4Config.from_config(mxfp4_config)
+
+    assert "language_model.model.layers.0.self_attn.q_a_proj" in parsed.ignored_layers
+    assert "model.layers.0.self_attn.q_a_proj" in parsed.ignored_layers
+    assert should_ignore_quant_layer(
+        "model.layers.0.self_attn.fused_qkv_a_proj_with_mqa",
+        parsed.ignored_layers,
+    )
+    assert not should_ignore_quant_layer(
+        "model.layers.0.mlp.experts.1.gate_proj",
+        parsed.ignored_layers,
+    )
