@@ -19,6 +19,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from test.runtime.fixtures.kimi_quark_metadata import (
+    quark_kimi_w8a8_quantization_config,
+)
+
 
 def _require_cdna4_gpu() -> None:
     if not torch.cuda.is_available():
@@ -36,7 +40,7 @@ def _per_channel_quantize_fp8(
 
     fp8 = current_platform().fp8e4m3fn
     scale = torch.clamp(
-        dense.float().abs().amax(dim=2, keepdim=True) / fp8.max,
+        dense.float().abs().amax(dim=-1, keepdim=True) / fp8.max,
         min=1e-6,
     )
     quantized = torch.clamp(
@@ -109,48 +113,188 @@ def _forbid_triton_experts_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(experts_mod, "_triton_experts_fallback", _fail_fallback)
 
 
-def _init_w8a8_tp_layer(layer, device: torch.device) -> None:
-    torch.manual_seed(2718)
-    intermediate_per_partition = layer.w2_weight.shape[-1]
-    gate_up_channels = layer.w13_weight.shape[1]
-    gate_up_channel_scale = torch.linspace(
-        0.04,
-        1.55,
-        steps=gate_up_channels,
+def _quark_w8a8_quant_config():
+    from tokenspeed.runtime.layers.quantization import W8A8Fp8Config
+
+    quant_config = W8A8Fp8Config.from_config(quark_kimi_w8a8_quantization_config())
+    assert quant_config.is_checkpoint_fp8_serialized is True
+    return quant_config
+
+
+def _dense_checkpoint_pattern(
+    rows: int,
+    cols: int,
+    *,
+    expert_id: int,
+    offset: float,
+    device: torch.device,
+) -> torch.Tensor:
+    values = torch.arange(rows * cols, device=device, dtype=torch.float32).reshape(
+        rows,
+        cols,
+    )
+    row_scale = torch.linspace(
+        0.05,
+        1.35,
+        steps=rows,
         device=device,
-    ).view(1, gate_up_channels, 1)
-    down_channel_scale = torch.linspace(
-        0.03,
-        1.25,
-        steps=layer.hidden_size,
-        device=device,
-    ).view(1, layer.hidden_size, 1)
-    w13_dense = (
-        torch.randn(
-            layer.num_experts,
-            gate_up_channels,
-            layer.hidden_size,
+        dtype=torch.float32,
+    ).view(rows, 1)
+    phase = offset + expert_id * 0.37
+    return (
+        torch.sin(values * 0.17 + phase) * 0.13
+        + torch.cos(values * 0.11 + phase) * 0.07
+    ) * row_scale
+
+
+def _expert_checkpoint_tensors(experts, *, expert_id: int, device: torch.device):
+    local_gate_rows = experts.w13_weight.shape[1] // 2
+    gate_rows = local_gate_rows * experts.tp_size
+    hidden_size = experts.w13_weight.shape[2]
+    down_rows = experts.w2_weight.shape[1]
+    down_cols = experts.w2_weight.shape[2] * experts.tp_size
+
+    gate_weight, gate_scale = _per_channel_quantize_fp8(
+        _dense_checkpoint_pattern(
+            gate_rows,
+            hidden_size,
+            expert_id=expert_id,
+            offset=0.15,
             device=device,
         )
-        * gate_up_channel_scale
-        * 0.15
     )
-    w2_dense = (
-        torch.randn(
-            layer.num_experts,
-            layer.hidden_size,
-            intermediate_per_partition,
+    up_weight, up_scale = _per_channel_quantize_fp8(
+        _dense_checkpoint_pattern(
+            gate_rows,
+            hidden_size,
+            expert_id=expert_id,
+            offset=0.45,
             device=device,
         )
-        * down_channel_scale
-        * 0.13
     )
-    w13_weight, w13_weight_scale = _per_channel_quantize_fp8(w13_dense)
-    w2_weight, w2_weight_scale = _per_channel_quantize_fp8(w2_dense)
-    layer.w13_weight.data.copy_(w13_weight)
-    layer.w13_weight_scale.data.copy_(w13_weight_scale)
-    layer.w2_weight.data.copy_(w2_weight)
-    layer.w2_weight_scale.data.copy_(w2_weight_scale)
+    down_weight, down_scale = _per_channel_quantize_fp8(
+        _dense_checkpoint_pattern(
+            down_rows,
+            down_cols,
+            expert_id=expert_id,
+            offset=0.30,
+            device=device,
+        )
+    )
+
+    return {
+        "gate_proj.weight": gate_weight,
+        "up_proj.weight": up_weight,
+        "down_proj.weight": down_weight,
+        "gate_proj.weight_scale": gate_scale,
+        "up_proj.weight_scale": up_scale,
+        "down_proj.weight_scale": down_scale,
+        "gate_proj.input_scale": torch.tensor(
+            1.0 + expert_id,
+            device=device,
+            dtype=torch.float32,
+        ),
+        "down_proj.input_scale": torch.tensor(
+            2.0 + expert_id,
+            device=device,
+            dtype=torch.float32,
+        ),
+    }
+
+
+def _synthetic_quark_w8a8_checkpoint(experts, *, prefix: str, device: torch.device):
+    weights = []
+    originals = {}
+    for expert_id in range(experts.num_experts):
+        tensors = _expert_checkpoint_tensors(
+            experts,
+            expert_id=expert_id,
+            device=device,
+        )
+        originals[expert_id] = tensors
+        for suffix, tensor in tensors.items():
+            weights.append((f"{prefix}.experts.{expert_id}.{suffix}", tensor))
+    return weights, originals
+
+
+def _params_dict_for_layer(layer, *, prefix: str):
+    return {f"{prefix}.experts.{name}": param for name, param in layer.named_parameters()}
+
+
+def _load_checkpoint_into_moe_layer(layer, *, prefix: str, device: torch.device):
+    from tokenspeed.runtime.layers.moe.checkpoint import (
+        ExpertCheckpointSchema,
+        build_moe_checkpoint_loader,
+    )
+
+    weights, originals = _synthetic_quark_w8a8_checkpoint(
+        layer,
+        prefix=prefix,
+        device=device,
+    )
+    loader = build_moe_checkpoint_loader(
+        params_dict=_params_dict_for_layer(layer, prefix=prefix),
+        expert_schema=ExpertCheckpointSchema(
+            gate_proj_name="gate_proj",
+            down_proj_name="down_proj",
+            up_proj_name="up_proj",
+        ),
+        num_experts=layer.num_experts,
+        ep_rank=layer.ep_rank,
+        ep_size=layer.ep_size,
+    )
+    for name, tensor in weights:
+        loader.load(name, tensor)
+    return originals
+
+
+def _assert_checkpoint_loaded_tp_slice(experts, originals, *, expert_id: int = 0) -> None:
+    local_gate_rows = experts.w13_weight.shape[1] // 2
+    down_cols = experts.w2_weight.shape[2]
+    tp_rank = experts.tp_rank
+    expert = originals[expert_id]
+
+    torch.testing.assert_close(
+        experts.w13_weight[expert_id, :local_gate_rows].float(),
+        expert["gate_proj.weight"][
+            local_gate_rows * tp_rank : local_gate_rows * (tp_rank + 1)
+        ].float(),
+        atol=0.0,
+        rtol=0.0,
+    )
+    torch.testing.assert_close(
+        experts.w13_weight[expert_id, local_gate_rows:].float(),
+        expert["up_proj.weight"][
+            local_gate_rows * tp_rank : local_gate_rows * (tp_rank + 1)
+        ].float(),
+        atol=0.0,
+        rtol=0.0,
+    )
+    torch.testing.assert_close(
+        experts.w2_weight[expert_id].float(),
+        expert["down_proj.weight"][:, down_cols * tp_rank : down_cols * (tp_rank + 1)]
+        .float(),
+        atol=0.0,
+        rtol=0.0,
+    )
+    torch.testing.assert_close(
+        experts.w13_weight_scale[expert_id, :local_gate_rows],
+        expert["gate_proj.weight_scale"][
+            local_gate_rows * tp_rank : local_gate_rows * (tp_rank + 1)
+        ],
+    )
+    torch.testing.assert_close(
+        experts.w13_weight_scale[expert_id, local_gate_rows:],
+        expert["up_proj.weight_scale"][
+            local_gate_rows * tp_rank : local_gate_rows * (tp_rank + 1)
+        ],
+    )
+    torch.testing.assert_close(
+        experts.w2_weight_scale[expert_id],
+        expert["down_proj.weight_scale"],
+    )
+    assert experts.w13_input_scale is None
+    assert experts.w2_input_scale is None
 
 
 def _topk_output(
@@ -173,13 +317,21 @@ def _topk_output(
         dtype=torch.int32,
     )
     topk_ids = base_ids[:num_tokens].contiguous()
-    topk_weights = torch.linspace(
-        0.25,
-        0.85,
-        steps=num_tokens * topk_ids.shape[1],
-        device=device,
-        dtype=torch.float32,
-    ).view(num_tokens, topk_ids.shape[1])
+    if num_tokens == 0:
+        topk_weights = torch.empty(
+            0,
+            topk_ids.shape[1],
+            device=device,
+            dtype=torch.float32,
+        )
+    else:
+        topk_weights = torch.linspace(
+            0.25,
+            0.85,
+            steps=num_tokens * topk_ids.shape[1],
+            device=device,
+            dtype=torch.float32,
+        ).view(num_tokens, topk_ids.shape[1])
     router_logits = torch.empty(num_tokens, num_experts, device=device)
     return StandardTopKOutput(topk_weights, topk_ids, router_logits)
 
@@ -240,7 +392,6 @@ def _make_tiny_kimi_language_model(device: torch.device):
         KimiK25VisionConfig,
     )
     from tokenspeed.runtime.distributed.mapping import Mapping
-    from tokenspeed.runtime.layers.quantization import W8A8Fp8Config
     from tokenspeed.runtime.models.kimi_k25 import KimiK25ForConditionalGeneration
     from tokenspeed.runtime.utils.env import global_server_args_dict
 
@@ -300,13 +451,16 @@ def _make_tiny_kimi_language_model(device: torch.device):
             moe_ep_size=1,
             moe_dp_size=1,
         ),
-        quant_config=W8A8Fp8Config(is_checkpoint_fp8_serialized=True),
+        quant_config=_quark_w8a8_quant_config(),
         is_multimodal_active=False,
     ).to(device)
-    layer = model.language_model.model.layers[0]
-    layer.self_attn = _IdentityAttention().to(device)
-    layer.comm_manager = _NoCollectiveComm(layer)
     return model
+
+
+def _install_no_collective_runtime(model) -> None:
+    layer = model.language_model.model.layers[0]
+    layer.self_attn = _IdentityAttention().to(next(model.parameters()).device)
+    layer.comm_manager = _NoCollectiveComm(layer)
 
 
 def _reference_kimi_language_logits(
@@ -358,16 +512,24 @@ def _reference_kimi_language_logits(
     )
 
 
-def _init_kimi_language_weights(model) -> None:
+def _init_kimi_language_weights(model) -> dict[int, dict[str, torch.Tensor]]:
     layer = model.language_model.model.layers[0]
     experts = layer.mlp.experts
-    _init_w8a8_tp_layer(experts, experts.w13_weight.device)
+    weights, originals = _synthetic_quark_w8a8_checkpoint(
+        experts,
+        prefix="model.layers.0.mlp",
+        device=experts.w13_weight.device,
+    )
+    model.load_weights(weights)
+    _assert_checkpoint_loaded_tp_slice(experts, originals)
+    _install_no_collective_runtime(model)
     layer.mlp.gate.weight.data = (
         torch.randn_like(layer.mlp.gate.weight) * 0.05
     ).bfloat16()
     model.language_model.lm_head.weight.data = (
         torch.randn_like(model.language_model.lm_head.weight) * 0.04
     ).bfloat16()
+    return originals
 
 
 def _run_kimi_language_logits_case(
@@ -690,6 +852,8 @@ def test_kimi_w8a8_tp_prefill_decode_reach_logits_without_kernel_fallback(
     assert decode_kernel == "gluon_mla_decode_gfx950"
     assert prefill_kernel == "gluon_mla_prefill_gfx950"
     assert _select_existing_w8a8_experts_kernel() == "gluon_fp8_local_experts_gfx950"
+    quant_config = _quark_w8a8_quant_config()
+    assert isinstance(quant_config, W8A8Fp8Config)
 
     torch.manual_seed(31415)
     device = torch.device("cuda", torch.cuda.current_device())
@@ -726,7 +890,7 @@ def test_kimi_w8a8_tp_prefill_decode_reach_logits_without_kernel_fallback(
         num_experts=4,
         hidden_size=32,
         intermediate_size=24,
-        quant_config=W8A8Fp8Config(is_checkpoint_fp8_serialized=True),
+        quant_config=quant_config,
         layer_index=0,
         prefix="layers.0.mlp",
         tp_rank=1,
@@ -735,13 +899,38 @@ def test_kimi_w8a8_tp_prefill_decode_reach_logits_without_kernel_fallback(
         ep_size=1,
         activation="silu",
     ).to(device)
-    _init_w8a8_tp_layer(layer, device)
+    layer_originals = _load_checkpoint_into_moe_layer(
+        layer,
+        prefix="layers.0.mlp",
+        device=device,
+    )
 
     assert type(layer.backend).__name__ == "W8A8PerTokenPerChannelFp8TritonBackend"
     assert layer.backend.key.quant == "w8a8_fp8"
     assert layer.backend.key.impl == "triton"
     assert layer.w13_weight.shape == (4, 24, 32)
     assert layer.w2_weight.shape == (4, 32, 12)
+    _assert_checkpoint_loaded_tp_slice(layer, layer_originals)
+
+    empty_hidden = torch.empty(
+        0,
+        layer.hidden_size,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    empty_topk_output = _topk_output(
+        device=device,
+        num_tokens=0,
+        num_experts=layer.num_experts,
+    )
+    empty_actual = layer(
+        empty_hidden,
+        empty_topk_output,
+        num_global_tokens=0,
+        max_num_tokens_per_gpu=1,
+    )
+    assert empty_actual.shape == empty_hidden.shape
+    assert empty_actual.dtype == torch.bfloat16
 
     lm_head = torch.nn.Linear(layer.hidden_size, 19, bias=False).to(
         device=device,
