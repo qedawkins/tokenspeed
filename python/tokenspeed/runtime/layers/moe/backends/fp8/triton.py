@@ -23,6 +23,9 @@ from __future__ import annotations
 import torch
 
 from tokenspeed.runtime.layers.moe.backends.base import MoEBackend
+from tokenspeed.runtime.layers.moe.backends.ep_ownership import (
+    build_uniform_expert_owner_maps,
+)
 from tokenspeed.runtime.layers.moe.backends.triton_common import (
     build_triton_gemms,
     triton_forward,
@@ -425,19 +428,11 @@ def _expert_ownership_tensors(
     num_local_experts: int,
     device: torch.device | str,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    if num_experts <= 0:
-        raise ValueError(f"num_experts must be positive, got {num_experts}")
-    if num_local_experts <= 0:
-        raise ValueError(
-            f"num_local_experts must be positive, got {num_local_experts}"
-        )
-    if num_experts % num_local_experts != 0:
-        raise ValueError(
-            f"num_experts {num_experts} must be divisible by num_local_experts "
-            f"{num_local_experts}"
-        )
-    experts = torch.arange(num_experts, dtype=torch.int32, device=device)
-    return experts // num_local_experts, experts % num_local_experts
+    return build_uniform_expert_owner_maps(
+        num_experts=num_experts,
+        num_local_experts=num_local_experts,
+        device=device,
+    )
 
 
 def _is_block_fp8_config(quant_config: object) -> bool:

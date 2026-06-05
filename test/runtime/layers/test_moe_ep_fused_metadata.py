@@ -31,6 +31,9 @@ from tokenspeed.runtime.layers.moe.backends.ep_fused_metadata import (
     build_pre_routed_fused_ep_metadata,
     prepare_pre_routed_fused_ep_metadata,
 )
+from tokenspeed.runtime.layers.moe.backends.ep_ownership import (
+    build_uniform_expert_owner_maps,
+)
 from tokenspeed.runtime.layers.moe.backends.ep_workspace import (
     EPCommunicationWorkspace,
     EPWorkspaceError,
@@ -52,9 +55,11 @@ def _uniform_owner_maps(
     *,
     device: torch.device | str = "cpu",
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    num_experts = world_size * num_local_experts
-    experts = torch.arange(num_experts, dtype=torch.int32, device=device)
-    return experts // num_local_experts, experts % num_local_experts
+    return build_uniform_expert_owner_maps(
+        num_experts=world_size * num_local_experts,
+        world_size=world_size,
+        device=device,
+    )
 
 
 def _workspace(
@@ -198,6 +203,106 @@ def _build(
         dispatch_plan=dispatch_plan,
     )
     return fused, ep_metadata, topk_weights
+
+
+def test_uniform_expert_owner_maps_match_kimi_384_expert_layout() -> None:
+    expert_owner, local_expert_id = build_uniform_expert_owner_maps(
+        num_experts=384,
+        world_size=4,
+        device="cpu",
+    )
+
+    assert expert_owner.dtype == torch.int32
+    assert local_expert_id.dtype == torch.int32
+    assert expert_owner.shape == (384,)
+    assert local_expert_id.shape == (384,)
+    for rank, start in enumerate((0, 96, 192, 288)):
+        end = start + 96
+        assert expert_owner[start:end].eq(rank).all()
+        assert local_expert_id[start].item() == 0
+        assert local_expert_id[end - 1].item() == 95
+
+
+@pytest.mark.parametrize("rank", [0, 1, 2, 3])
+def test_pre_routed_fused_metadata_matches_kimi_384_expert_topk8_oracle(
+    rank: int,
+) -> None:
+    topk_ids = torch.tensor(
+        [
+            [0, 0, 0, 0, 0, 0, 0, 0],
+            [95, 96, 191, 192, 287, 288, 383, 1],
+            [10, 106, 202, 298, 20, 116, 212, 308],
+            [300, 301, 302, 303, 304, 305, 306, 307],
+            [94, 95, 96, 97, 190, 191, 192, 193],
+            [286, 287, 288, 289, 382, 383, 2, 3],
+        ],
+        dtype=torch.int32,
+    )
+    fused, ep_metadata, topk_weights = _build(
+        topk_ids,
+        rank=rank,
+        world_size=4,
+        num_local_experts=96,
+        hidden_size=16,
+    )
+    flat_ids = topk_ids.reshape(-1)
+    expected_owner = flat_ids // 96
+    expected_owner_counts = torch.bincount(expected_owner.long(), minlength=4).to(
+        torch.int32
+    )
+
+    torch.testing.assert_close(fused.owner_counts, expected_owner_counts)
+    torch.testing.assert_close(fused.owner_counts, ep_metadata.owner_counts)
+    torch.testing.assert_close(
+        fused.owner_expert_counts,
+        ep_metadata.owner_expert_counts,
+    )
+    torch.testing.assert_close(fused.topk_weights, topk_weights.reshape(-1))
+    assert fused.num_valid_slots == topk_ids.numel()
+    assert fused.local_expert_counts.sum().item() == expected_owner_counts[rank].item()
+    assert fused.owner_expert_counts[0, 0].item() == 8
+    assert fused.owner_expert_counts.eq(0).any()
+
+    for flat_slot, expert in enumerate(flat_ids.tolist()):
+        owner = expert // 96
+        local_id = expert % 96
+        owner_row = int(fused.owner_rows[flat_slot].item())
+        token = flat_slot // topk_ids.shape[1]
+        slot = flat_slot - token * topk_ids.shape[1]
+        assert fused.owner_ranks[flat_slot].item() == owner
+        assert fused.local_expert_ids[flat_slot].item() == local_id
+        assert owner_row >= 0
+        assert ep_metadata.combine_offsets[owner, owner_row].item() == flat_slot
+        assert fused.owner_row_to_source_flat_slot[owner, owner_row].item() == flat_slot
+        assert fused.owner_row_to_source[owner, owner_row].tolist() == [
+            rank,
+            token,
+            slot,
+        ]
+
+
+def test_pre_routed_fused_metadata_handles_kimi_empty_owner_ranks() -> None:
+    topk_ids = torch.tensor(
+        [
+            [0, 1, 2, 3, 4, 5, 6, 7],
+            [8, 9, 10, 11, 12, 13, 14, 15],
+            [16, 17, 18, 19, 20, 21, 22, 23],
+        ],
+        dtype=torch.int32,
+    )
+    fused, ep_metadata, _ = _build(
+        topk_ids,
+        rank=3,
+        world_size=4,
+        num_local_experts=96,
+        hidden_size=8,
+    )
+
+    assert fused.num_valid_slots == topk_ids.numel()
+    assert fused.owner_counts.tolist() == [topk_ids.numel(), 0, 0, 0]
+    assert fused.local_expert_counts.sum().item() == 0
+    assert fused.owner_row_to_source_flat_slot[1:].eq(-1).all()
+    torch.testing.assert_close(fused.owner_rows, ep_metadata.dispatch_offsets.reshape(-1))
 
 
 def test_pre_routed_fused_metadata_matches_s4_unfused_metadata() -> None:
