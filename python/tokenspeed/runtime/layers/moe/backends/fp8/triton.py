@@ -40,16 +40,28 @@ class Fp8TritonBackend(MoEBackend):
 
     @classmethod
     def supports(cls, spec: MoELayerSpec, quant_config: object) -> bool:
-        if not (
-            isinstance(quant_config, Fp8Config)
-            and quant_config.weight_block_size is not None
-        ):
+        if not _is_block_fp8_config(quant_config):
             return False
         if spec.ep_size <= 1:
             return True
+        return cls._supports_pre_routed_fused_ep(spec, quant_config)
 
+    @classmethod
+    def _supports_pre_routed_fused_ep(
+        cls,
+        spec: MoELayerSpec,
+        quant_config: object,
+    ) -> bool:
+        if not _is_block_fp8_config(quant_config):
+            return False
         platform = _current_platform()
-        return platform.is_amd and platform.is_cdna4_plus and spec.activation == "silu"
+        return (
+            platform.is_amd
+            and platform.is_cdna4_plus
+            and spec.activation == "silu"
+            and spec.ep_size > 1
+            and spec.tp_size == 1
+        )
 
     def create_layer_weights(self, layer, *, with_bias: bool = False) -> None:
         ispp = attach_dense_weight_pair(
@@ -133,6 +145,15 @@ class Fp8TritonBackend(MoEBackend):
         from tokenspeed.runtime.layers.moe.backends.ep_experts import (
             owner_rank_fp8_expert_gemm,
         )
+        from tokenspeed.runtime.layers.moe.backends.ep_fused_down_combine import (
+            pre_routed_fused_down_combine,
+        )
+        from tokenspeed.runtime.layers.moe.backends.ep_fused_gate_up import (
+            pre_routed_fused_dispatch_gate_up,
+        )
+        from tokenspeed.runtime.layers.moe.backends.ep_fused_metadata import (
+            build_pre_routed_fused_ep_metadata,
+        )
         from tokenspeed.runtime.layers.moe.backends.ep_reduce import ep_weighted_reduce
         import tokenspeed_kernel
 
@@ -173,31 +194,76 @@ class Fp8TritonBackend(MoEBackend):
             iris_mode="auto",
         )
         dispatch_plan = prepare_owner_directed_dispatch(metadata, workspace)
-        dispatch_step = owner_directed_dispatch(
-            hidden_states,
-            topk_ids,
-            metadata,
-            workspace,
-            dispatch_plan=dispatch_plan,
-        )
 
         block_shape = tuple(self.quant_config.weight_block_size)
-        gate_up = owner_rank_fp8_expert_gemm(
-            dispatch_step.dispatch_buffer,
-            layer.w13_weight,
-            layer.w13_weight_scale_inv,
-            dispatch_plan.local_expert_counts,
-            block_shape=block_shape,
-            block_size=16,
-            local_expert_offsets=dispatch_plan.local_expert_offsets,
-            expected_kernel_name="gluon_fp8_local_experts_gfx950",
-        )
+        fused_metadata = None
+        if self._can_use_pre_routed_fused_ep(layer, hidden_states):
+            fused_metadata = build_pre_routed_fused_ep_metadata(
+                hidden_states,
+                topk_ids,
+                topk_weights,
+                metadata,
+                workspace,
+                dispatch_plan=dispatch_plan,
+            )
+            gate_up_result = pre_routed_fused_dispatch_gate_up(
+                hidden_states,
+                topk_ids,
+                metadata,
+                workspace,
+                fused_metadata,
+                layer.w13_weight,
+                layer.w13_weight_scale_inv,
+                block_shape=block_shape,
+                block_size=16,
+                out=None,
+                config=None,
+                expected_gemm_kernel_name="gluon_fp8_local_experts_gfx950",
+            )
+            gate_up = gate_up_result.gate_up
+            dispatch_plan = gate_up_result.dispatch_plan
+        else:
+            dispatch_step = owner_directed_dispatch(
+                hidden_states,
+                topk_ids,
+                metadata,
+                workspace,
+                dispatch_plan=dispatch_plan,
+            )
+            gate_up = owner_rank_fp8_expert_gemm(
+                dispatch_step.dispatch_buffer,
+                layer.w13_weight,
+                layer.w13_weight_scale_inv,
+                dispatch_plan.local_expert_counts,
+                block_shape=block_shape,
+                block_size=16,
+                local_expert_offsets=dispatch_plan.local_expert_offsets,
+                expected_kernel_name="gluon_fp8_local_experts_gfx950",
+            )
         intermediate = torch.empty(
             (gate_up.shape[0], gate_up.shape[1] // 2),
             dtype=gate_up.dtype,
             device=gate_up.device,
         )
         silu_and_mul(gate_up.view(-1, gate_up.shape[-1]), intermediate)
+
+        if fused_metadata is not None:
+            return pre_routed_fused_down_combine(
+                intermediate,
+                topk_ids,
+                topk_weights,
+                metadata,
+                workspace,
+                fused_metadata,
+                layer.w2_weight,
+                layer.w2_weight_scale_inv,
+                expert_owner,
+                local_expert_id,
+                block_shape=block_shape,
+                block_size=16,
+                expected_gemm_kernel_name="gluon_fp8_local_experts_gfx950",
+                expected_reduce_kernel_name="gluon_local_sum_reduce_gfx950",
+            ).output
 
         owner_outputs = owner_rank_fp8_expert_gemm(
             intermediate,
@@ -220,6 +286,21 @@ class Fp8TritonBackend(MoEBackend):
             local_expert_id,
         )
         return ep_weighted_reduce(returned_slots, topk_weights)
+
+    def _can_use_pre_routed_fused_ep(self, layer, hidden_states) -> bool:
+        if not self._supports_pre_routed_fused_ep(self.spec, self.quant_config):
+            return False
+        if hidden_states.dtype != torch.bfloat16:
+            return False
+        fp8_dtypes = _fp8_e4m3_dtypes()
+        return (
+            getattr(layer, "w13_weight", None) is not None
+            and getattr(layer, "w2_weight", None) is not None
+            and layer.w13_weight.dtype in fp8_dtypes
+            and layer.w2_weight.dtype in fp8_dtypes
+            and layer.w13_weight_scale_inv.dtype == torch.float32
+            and layer.w2_weight_scale_inv.dtype == torch.float32
+        )
 
 
 __all__ = ["Fp8TritonBackend"]
@@ -244,6 +325,18 @@ def _expert_ownership_tensors(
         )
     experts = torch.arange(num_experts, dtype=torch.int32, device=device)
     return experts // num_local_experts, experts % num_local_experts
+
+
+def _is_block_fp8_config(quant_config: object) -> bool:
+    return isinstance(quant_config, Fp8Config) and quant_config.weight_block_size is not None
+
+
+def _fp8_e4m3_dtypes() -> tuple[torch.dtype, ...]:
+    return tuple(
+        dtype
+        for name in ("float8_e4m3fn", "float8_e4m3fnuz")
+        if (dtype := getattr(torch, name, None)) is not None
+    )
 
 
 def _current_platform():
