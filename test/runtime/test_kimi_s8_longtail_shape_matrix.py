@@ -88,6 +88,13 @@ class _MatrixStatus:
     reason: str = ""
 
 
+@dataclass(frozen=True)
+class _SchedulerGraphStatus:
+    feature: str
+    status: str
+    reason: str
+
+
 _COMMON_PASS_SHAPES = (
     _ShapeCase(
         name="m0-prefill",
@@ -174,6 +181,31 @@ _STATUS_MATRIX: tuple[_MatrixStatus, ...] = tuple(
         frozenset({"skewed_rank_traffic"}),
         "not_applicable",
         "S1 is tensor-parallel only; EP rank skew is covered by S4/S5/S6.",
+    ),
+)
+
+_SCHEDULER_GRAPH_STATUS: tuple[_SchedulerGraphStatus, ...] = (
+    _SchedulerGraphStatus(
+        "prefix-caching",
+        "not_applicable",
+        "The synthetic Kimi scenario runners call the model directly and do not "
+        "construct scheduler prefix-cache state; runtime prefix-cache metadata "
+        "coverage remains in dedicated scheduler/cache tests.",
+    ),
+    _SchedulerGraphStatus(
+        "speculative-target-verify",
+        "not_applicable",
+        "The test-local MLA fixture initializes EXTEND or DECODE metadata only; "
+        "TARGET_VERIFY packed decode metadata is scheduler/backend-owned and "
+        "covered by the DeepSeek V4 metadata tests.",
+    ),
+    _SchedulerGraphStatus(
+        "cuda-hip-graph-capture",
+        "unsupported",
+        "The synthetic Kimi runners allocate Python-side contexts and include "
+        "test-helper synchronization, so they are not capture regions. Scenario "
+        "coverage is eager-only until a ModelExecutor-backed Kimi artifact "
+        "provides capture setup and replay buffers.",
     ),
 )
 
@@ -375,6 +407,19 @@ def test_kimi_s8_shape_matrix_declares_every_category() -> None:
         assert status.status in {"pass", "xfail", "not_applicable"}
 
 
+def test_kimi_s8_scheduler_graph_statuses_are_explicit() -> None:
+    features = {status.feature: status for status in _SCHEDULER_GRAPH_STATUS}
+
+    assert set(features) == {
+        "prefix-caching",
+        "speculative-target-verify",
+        "cuda-hip-graph-capture",
+    }
+    for status in features.values():
+        assert status.status in {"pass", "unsupported", "not_applicable"}
+        assert status.reason
+
+
 @pytest.mark.parametrize(
     "status",
     [
@@ -409,6 +454,41 @@ def test_kimi_s8_explicit_not_applicable_shape_status(
     status: _MatrixStatus,
 ) -> None:
     pytest.skip(status.reason)
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        pytest.param(
+            status,
+            id=status.feature,
+        )
+        for status in _SCHEDULER_GRAPH_STATUS
+        if status.status == "not_applicable"
+    ],
+)
+def test_kimi_s8_explicit_not_applicable_scheduler_graph_status(
+    status: _SchedulerGraphStatus,
+) -> None:
+    pytest.skip(status.reason)
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        pytest.param(
+            status,
+            marks=pytest.mark.xfail(reason=status.reason, strict=True),
+            id=status.feature,
+        )
+        for status in _SCHEDULER_GRAPH_STATUS
+        if status.status == "unsupported"
+    ],
+)
+def test_kimi_s8_explicit_unsupported_graph_status(
+    status: _SchedulerGraphStatus,
+) -> None:
+    assert False, status.reason
 
 
 def test_kimi_s8_empty_mla_wrappers_return_initialized_outputs() -> None:
@@ -455,6 +535,72 @@ def test_kimi_s8_empty_mla_wrappers_return_initialized_outputs() -> None:
 
     assert decode.shape == (0, 4, 32)
     assert decode.dtype == torch.bfloat16
+
+
+def test_kimi_s8_ep_workspace_reuses_buffers_and_logs_kernels(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    s1._require_cdna4_gpu()
+    kernel_calls = s4._record_kernel_calls(monkeypatch)
+    device = torch.device("cuda", torch.cuda.current_device())
+    model = s4._make_tiny_kimi_ep_language_model(
+        device,
+        ep_size=8,
+        ep_rank=7,
+    )
+    s4._init_kimi_ep_language_weights(model)
+    input_lengths = torch.tensor((2, 2, 2, 2), device=device, dtype=torch.int32)
+    experts = model.language_model.model.layers[0].mlp.experts
+    first_workspace = None
+    first_buffer_ptrs = None
+
+    for _ in range(2):
+        route_start = len(kernel_calls["route"])
+        dispatch_start = len(kernel_calls["dispatch"])
+        experts_start = len(kernel_calls["experts"])
+        combine_start = len(kernel_calls["combine"])
+
+        logits = s4._run_kimi_ep_language_logits_case(
+            model,
+            total_tokens=8,
+            input_lengths=input_lengths,
+            is_prefill=True,
+            kernel_calls=kernel_calls,
+        )
+        workspace = experts.backend._ep_workspace
+        assert workspace is not None
+        assert workspace.backend == "torch"
+        assert logits.shape == (4, 64)
+
+        buffer_ptrs = (
+            workspace.dispatch_buffer.data_ptr(),
+            workspace.combine_buffer.data_ptr(),
+            workspace.rank_counts.data_ptr(),
+            workspace.rank_offsets.data_ptr(),
+        )
+        if first_workspace is None:
+            first_workspace = workspace
+            first_buffer_ptrs = buffer_ptrs
+        else:
+            assert workspace is first_workspace
+            assert buffer_ptrs == first_buffer_ptrs
+
+        assert any(
+            call.get("expected_kernel_name") == "gluon_grouped_biased_topk_gfx950"
+            for call in kernel_calls["route"][route_start:]
+        )
+        assert any(
+            call.get("expected_kernel_name") == "gluon_ep_metadata_gfx950"
+            for call in kernel_calls["dispatch"][dispatch_start:]
+        )
+        assert sum(
+            call.get("expected_kernel_name") == "gluon_fp8_local_experts_gfx950"
+            for call in kernel_calls["experts"][experts_start:]
+        ) >= 2
+        assert any(
+            call.get("expected_kernel_name") == "gluon_local_sum_reduce_gfx950"
+            for call in kernel_calls["combine"][combine_start:]
+        )
 
 
 @pytest.mark.parametrize(
