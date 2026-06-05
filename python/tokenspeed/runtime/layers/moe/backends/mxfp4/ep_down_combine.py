@@ -95,11 +95,11 @@ def mxfp4_ep_down_gemm_combine(
         output_dtype=workspace.dtype,
     )
     combine_rows = owner_outputs.shape[0]
-    combine_buffer = workspace.combine_buffer[:combine_rows]
-    if combine_buffer.data_ptr() != owner_outputs.data_ptr():
-        combine_buffer.copy_(owner_outputs)
+    active_combine_buffer = workspace.combine_buffer[:combine_rows]
+    if active_combine_buffer.data_ptr() != owner_outputs.data_ptr():
+        active_combine_buffer.copy_(owner_outputs)
     returned_slots = owner_directed_combine(
-        combine_buffer,
+        workspace.combine_buffer,
         topk_ids,
         ep_metadata,
         dispatch_plan,
@@ -117,7 +117,7 @@ def mxfp4_ep_down_gemm_combine(
     )
     return Mxfp4DownCombineResult(
         output=output,
-        owner_outputs=combine_buffer,
+        owner_outputs=active_combine_buffer,
         returned_slots=returned_slots,
         dispatch_plan=dispatch_plan,
         fused_metadata=fused_metadata,

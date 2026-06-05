@@ -271,7 +271,8 @@ def test_mxfp4_ep_down_combine_reduces_all_remote_returned_slots(
         *_args: object,
         **_kwargs: object,
     ) -> torch.Tensor:
-        assert combine_buffer.shape == (0, hidden_size)
+        assert combine_buffer.data_ptr() == workspace.combine_buffer.data_ptr()
+        assert combine_buffer.shape == workspace.combine_buffer.shape
         return remote_slots
 
     monkeypatch.setattr(
