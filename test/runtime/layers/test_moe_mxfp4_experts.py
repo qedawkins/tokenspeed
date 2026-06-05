@@ -3,9 +3,15 @@ from __future__ import annotations
 import pytest
 import torch
 
+from tokenspeed.runtime.layers.moe.backends.mxfp4.activation import (
+    dequantize_mxfp4_activation,
+    quantize_mxfp4_activation_reference,
+)
 from tokenspeed.runtime.layers.moe.backends.mxfp4.experts import (
     dequantize_mxfp4_expert_weight,
+    kimi_swiglu_gate_up,
     owner_rank_mxfp4_expert_gemm,
+    owner_rank_mxfp4_gate_up_gemm,
 )
 
 
@@ -89,6 +95,72 @@ def test_owner_rank_mxfp4_down_uses_explicit_offsets_bias_and_empty_expert() -> 
     )
     assert actual is out
     torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
+
+
+def test_owner_rank_mxfp4_gate_up_consumes_dynamic_activation_layout() -> None:
+    torch.manual_seed(3141)
+    num_experts = 3
+    out_features = 16
+    in_features = 64
+    local_counts = torch.tensor([2, 0, 3], dtype=torch.int32)
+    local_offsets = torch.tensor([0, 2, 2, 5], dtype=torch.int32)
+    owner_tokens = torch.randn(5, in_features, dtype=torch.float32)
+    owner_tokens[0].zero_()
+    owner_tokens[2].mul_(12.0)
+    packed_tokens, token_scale = quantize_mxfp4_activation_reference(
+        owner_tokens.to(torch.bfloat16)
+    )
+    packed_weight = _random_packed_weight(num_experts, out_features, in_features)
+    weight_scale = _random_e8m0_scales(num_experts, out_features, in_features)
+    bias = torch.randn(num_experts, out_features, dtype=torch.float32) * 0.05
+
+    actual = owner_rank_mxfp4_gate_up_gemm(
+        packed_tokens,
+        token_scale,
+        packed_weight,
+        weight_scale,
+        local_counts,
+        local_expert_offsets=local_offsets,
+        bias=bias,
+    )
+
+    dequant_tokens = dequantize_mxfp4_activation(
+        packed_tokens,
+        token_scale,
+        logical_shape=tuple(owner_tokens.shape),
+    )
+    dense_weight = dequantize_mxfp4_expert_weight(packed_weight, weight_scale)
+    gate_up = _dense_owner_reference(
+        dequant_tokens,
+        dense_weight,
+        local_counts,
+        local_expert_offsets=local_offsets,
+        bias=bias,
+    )
+    expected = _kimi_swiglu_reference(gate_up)
+    torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
+
+
+def test_owner_rank_mxfp4_gate_up_handles_zero_rows_and_preallocated_out() -> None:
+    packed_tokens, token_scale = quantize_mxfp4_activation_reference(
+        torch.empty(0, 64, dtype=torch.bfloat16)
+    )
+    packed_weight = _random_packed_weight(2, 8, 64)
+    weight_scale = _random_e8m0_scales(2, 8, 64)
+    out = torch.empty(0, 4, dtype=torch.bfloat16)
+
+    actual = owner_rank_mxfp4_gate_up_gemm(
+        packed_tokens,
+        token_scale,
+        packed_weight,
+        weight_scale,
+        torch.tensor([0, 0], dtype=torch.int32),
+        output_dtype=torch.bfloat16,
+        out=out,
+    )
+
+    assert actual is out
+    assert actual.shape == (0, 4)
 
 
 def test_owner_rank_mxfp4_output_dtype_defaults_and_overrides() -> None:
@@ -176,6 +248,36 @@ def test_owner_rank_mxfp4_expert_gemm_rejects_bad_owner_layouts() -> None:
         )
 
 
+def test_owner_rank_mxfp4_gate_up_rejects_bad_activation_layouts() -> None:
+    packed_tokens, token_scale = quantize_mxfp4_activation_reference(
+        torch.randn(2, 64, dtype=torch.float32)
+    )
+    packed_weight = _random_packed_weight(1, 7, 64)
+    weight_scale = _random_e8m0_scales(1, 7, 64)
+
+    with pytest.raises(ValueError, match="packed shape"):
+        owner_rank_mxfp4_gate_up_gemm(
+            packed_tokens[:, :31],
+            token_scale,
+            _random_packed_weight(1, 8, 64),
+            _random_e8m0_scales(1, 8, 64),
+            torch.tensor([2], dtype=torch.int32),
+        )
+    with pytest.raises(ValueError, match="gate/up output dim"):
+        owner_rank_mxfp4_gate_up_gemm(
+            packed_tokens,
+            token_scale,
+            packed_weight,
+            weight_scale,
+            torch.tensor([2], dtype=torch.int32),
+        )
+    with pytest.raises(ValueError, match="out shape"):
+        kimi_swiglu_gate_up(
+            torch.randn(2, 8),
+            out=torch.empty(2, 5),
+        )
+
+
 def _random_packed_weight(
     num_experts: int,
     out_features: int,
@@ -242,3 +344,17 @@ def _dense_owner_reference(
             result = result + bias[expert_idx].float()
         expected[start:end] = result
     return expected
+
+
+def _kimi_swiglu_reference(
+    gate_up: torch.Tensor,
+    *,
+    alpha: float = 1.702,
+    limit: float | None = 7.0,
+) -> torch.Tensor:
+    gate = gate_up[..., 0::2].float()
+    up = gate_up[..., 1::2].float()
+    if limit is not None:
+        gate = gate.clamp(max=limit)
+        up = up.clamp(min=-limit, max=limit)
+    return gate * torch.sigmoid(alpha * gate) * (up + 1.0)

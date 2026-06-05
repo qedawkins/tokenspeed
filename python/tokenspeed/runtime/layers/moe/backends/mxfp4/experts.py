@@ -29,6 +29,9 @@ from __future__ import annotations
 
 import torch
 
+from tokenspeed.runtime.layers.moe.backends.mxfp4.activation import (
+    dequantize_mxfp4_activation,
+)
 from tokenspeed.runtime.layers.moe.backends.mxfp4.weights import (
     MXFP4_E2M1_BLOCK32_FORMAT,
     validate_mxfp4_expert_weight_format,
@@ -124,6 +127,94 @@ def owner_rank_mxfp4_expert_gemm(
         if bias is not None:
             result = result + bias[expert_idx].float()
         out[start:end].copy_(result.to(out.dtype))
+    return out
+
+
+def owner_rank_mxfp4_gate_up_gemm(
+    packed_owner_tokens: torch.Tensor,
+    owner_token_scale: torch.Tensor,
+    local_packed_weight: torch.Tensor,
+    local_weight_scale: torch.Tensor,
+    local_expert_counts: torch.Tensor,
+    *,
+    local_expert_offsets: torch.Tensor | None = None,
+    bias: torch.Tensor | None = None,
+    swiglu_alpha: float = 1.702,
+    swiglu_limit: float | None = 7.0,
+    output_dtype: torch.dtype | None = None,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Run local MXFP4 gate/up expert GEMM and Kimi SwiGLU activation.
+
+    ``packed_owner_tokens`` is the dynamic MXFP4 activation format produced by
+    the local activation quantizer: packed E2M1 values with one uint8 E8M0 scale
+    per 32 input elements. Weight tensors use the fused ``w13`` local expert
+    layout ``[E_local, 2 * intermediate, hidden / 2]``.
+    """
+
+    hidden_size = _validate_gate_up_weight_shape(local_packed_weight)
+    owner_tokens = dequantize_mxfp4_activation(
+        packed_owner_tokens,
+        owner_token_scale,
+        logical_shape=(*packed_owner_tokens.shape[:-1], hidden_size),
+        output_dtype=torch.float32,
+    )
+    gate_up = owner_rank_mxfp4_expert_gemm(
+        owner_tokens,
+        local_packed_weight,
+        local_weight_scale,
+        local_expert_counts,
+        local_expert_offsets=local_expert_offsets,
+        bias=bias,
+        output_dtype=torch.float32,
+    )
+    return kimi_swiglu_gate_up(
+        gate_up,
+        alpha=swiglu_alpha,
+        limit=swiglu_limit,
+        output_dtype=output_dtype,
+        out=out,
+    )
+
+
+def kimi_swiglu_gate_up(
+    gate_up: torch.Tensor,
+    *,
+    alpha: float = 1.702,
+    limit: float | None = 7.0,
+    output_dtype: torch.dtype | None = None,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Apply the interleaved gate/up SwiGLU used by Kimi packed kernels."""
+
+    if gate_up.ndim < 1:
+        raise ValueError("gate_up must have at least one dimension")
+    if gate_up.shape[-1] % 2 != 0:
+        raise ValueError(
+            f"gate/up output dim must be even, got {gate_up.shape[-1]}"
+        )
+    output_dtype = output_dtype or gate_up.dtype
+    expected_out_shape = (*gate_up.shape[:-1], gate_up.shape[-1] // 2)
+    if out is not None:
+        if out.shape != expected_out_shape:
+            raise ValueError(f"out shape {tuple(out.shape)} != {expected_out_shape}")
+        if out.device != gate_up.device:
+            raise ValueError(
+                f"out device {out.device} != gate_up device {gate_up.device}"
+            )
+        if out.dtype != output_dtype:
+            raise ValueError(f"out dtype {out.dtype} != {output_dtype}")
+
+    gate = gate_up[..., 0::2].float()
+    up = gate_up[..., 1::2].float()
+    if limit is not None:
+        gate = gate.clamp(max=limit)
+        up = up.clamp(min=-limit, max=limit)
+    activated = gate * torch.sigmoid(alpha * gate) * (up + 1.0)
+    activated = activated.to(output_dtype)
+    if out is None:
+        return activated
+    out.copy_(activated)
     return out
 
 
@@ -243,7 +334,22 @@ def _validate_component_shapes(
             )
 
 
+def _validate_gate_up_weight_shape(local_packed_weight: torch.Tensor) -> int:
+    if local_packed_weight.ndim != 3:
+        raise ValueError(
+            "local_packed_weight must be rank-3, got "
+            f"{tuple(local_packed_weight.shape)}"
+        )
+    if local_packed_weight.shape[1] % 2 != 0:
+        raise ValueError(
+            f"gate/up output dim must be even, got {local_packed_weight.shape[1]}"
+        )
+    return int(local_packed_weight.shape[2]) * MXFP4_E2M1_BLOCK32_FORMAT.pack_factor
+
+
 __all__ = [
     "dequantize_mxfp4_expert_weight",
+    "kimi_swiglu_gate_up",
     "owner_rank_mxfp4_expert_gemm",
+    "owner_rank_mxfp4_gate_up_gemm",
 ]
