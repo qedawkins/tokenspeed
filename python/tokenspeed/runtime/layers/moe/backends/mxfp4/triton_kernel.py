@@ -115,10 +115,7 @@ class Mxfp4TritonKernelBackend(MoEBackend):
         quant_config: object,
         routing_config: dict | None = None,
     ):
-        del routing_config
-        self.key = key
-        self.spec = spec
-        self.quant_config = quant_config
+        super().__init__(key, spec, quant_config, routing_config=routing_config)
         self._activation: str | None = None
         self._swiglu_arg = None
         self._is_w4a8_fp8 = (
