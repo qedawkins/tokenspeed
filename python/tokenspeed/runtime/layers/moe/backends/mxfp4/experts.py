@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import torch
 
+from tokenspeed.runtime.execution.cuda_graph_wrapper import get_is_capture_mode
 from tokenspeed.runtime.layers.moe.backends.mxfp4.activation import (
     dequantize_mxfp4_activation,
     quantize_mxfp4_activation,
@@ -38,6 +39,19 @@ from tokenspeed.runtime.layers.moe.backends.mxfp4.weights import (
     PackedExpertWeightFormat,
     validate_mxfp4_expert_weight_format,
 )
+from tokenspeed_kernel._triton import redirect_triton_to_tokenspeed_triton
+
+
+try:
+    with redirect_triton_to_tokenspeed_triton():
+        import triton
+        import triton.language as tl
+except ImportError:
+    triton = None
+    tl = None
+
+if triton is None:
+    _owner_rank_mxfp4_expert_gemm_kernel = None
 
 
 def dequantize_mxfp4_expert_weight(
@@ -159,6 +173,16 @@ def owner_rank_mxfp4_expert_gemm(
         )
     if owner_tokens.shape[0] == 0:
         return out
+
+    if _should_use_triton_owner_gemm(owner_tokens, out):
+        return _owner_rank_mxfp4_expert_gemm_triton(
+            owner_tokens,
+            local_packed_weight,
+            local_weight_scale,
+            offsets,
+            bias,
+            out,
+        )
 
     for expert_idx in range(local_packed_weight.shape[0]):
         start = int(offsets[expert_idx].item())
@@ -398,6 +422,7 @@ def _validate_counts_and_offsets(
     *,
     local_expert_offsets: torch.Tensor | None,
 ) -> torch.Tensor:
+    capture_mode = _is_capture_mode()
     if local_expert_counts.ndim != 1:
         raise ValueError(
             "local_expert_counts must be rank-1, got "
@@ -407,16 +432,10 @@ def _validate_counts_and_offsets(
         raise ValueError(
             f"local_expert_counts must be torch.int32, got {local_expert_counts.dtype}"
         )
-    if bool(local_expert_counts.lt(0).any().item()):
+    if not capture_mode and bool(local_expert_counts.lt(0).any().item()):
         raise ValueError("local_expert_counts must be non-negative")
     if local_expert_offsets is None:
-        offsets = torch.empty(
-            (local_expert_counts.numel() + 1,),
-            dtype=torch.int32,
-            device=local_expert_counts.device,
-        )
-        offsets[0] = 0
-        offsets[1:] = torch.cumsum(local_expert_counts, dim=0, dtype=torch.int32)
+        offsets = _offsets_from_counts(local_expert_counts)
     else:
         offsets = local_expert_offsets
         if offsets.shape != (local_expert_counts.numel() + 1,):
@@ -433,12 +452,14 @@ def _validate_counts_and_offsets(
                 "local_expert_offsets must be on the same device as "
                 "local_expert_counts"
             )
+        if capture_mode:
+            return offsets
         if int(offsets[0].item()) != 0:
             raise ValueError("local_expert_offsets must start at zero")
         if bool((offsets[1:] - offsets[:-1]).ne(local_expert_counts).any().item()):
             raise ValueError("local_expert_offsets must match local_expert_counts")
 
-    if int(offsets[-1].item()) != num_rows:
+    if not capture_mode and int(offsets[-1].item()) != num_rows:
         raise ValueError(
             f"local expert rows {int(offsets[-1].item())} != owner token rows "
             f"{num_rows}"
@@ -584,6 +605,204 @@ def _validate_combine_inputs(
                 f"out device {out.device} != sorted_outputs device "
                 f"{sorted_outputs.device}"
             )
+
+
+def _offsets_from_counts(counts: torch.Tensor) -> torch.Tensor:
+    offsets = torch.empty(
+        (counts.numel() + 1,),
+        dtype=torch.int32,
+        device=counts.device,
+    )
+    offsets[:1].zero_()
+    offsets[1:].copy_(torch.cumsum(counts, dim=0, dtype=torch.int32))
+    return offsets
+
+
+def _is_capture_mode() -> bool:
+    if get_is_capture_mode():
+        return True
+    if not torch.cuda.is_available():
+        return False
+    try:
+        return bool(torch.cuda.is_current_stream_capturing())
+    except RuntimeError:
+        return False
+
+
+def _should_use_triton_owner_gemm(
+    owner_tokens: torch.Tensor,
+    out: torch.Tensor,
+) -> bool:
+    return (
+        triton is not None
+        and owner_tokens.device.type == "cuda"
+        and out.dtype in {torch.float16, torch.bfloat16, torch.float32}
+    )
+
+
+def _owner_rank_mxfp4_expert_gemm_triton(
+    owner_tokens: torch.Tensor,
+    local_packed_weight: torch.Tensor,
+    local_weight_scale: torch.Tensor,
+    local_expert_offsets: torch.Tensor,
+    bias: torch.Tensor | None,
+    out: torch.Tensor,
+) -> torch.Tensor:
+    if _owner_rank_mxfp4_expert_gemm_kernel is None:
+        if _is_capture_mode():
+            raise RuntimeError("MXFP4 CUDA graph expert GEMM requires Triton support")
+        return out
+
+    num_rows = owner_tokens.shape[0]
+    num_local_experts = local_packed_weight.shape[0]
+    out_features = local_packed_weight.shape[1]
+    in_features = owner_tokens.shape[1]
+    block_m = 8
+    block_n = 16
+    block_k = 64
+    has_bias = bias is not None
+    if bias is None:
+        bias = out
+
+    out.zero_()
+    grid = (
+        num_local_experts,
+        triton.cdiv(num_rows, block_m),
+        triton.cdiv(out_features, block_n),
+    )
+    _owner_rank_mxfp4_expert_gemm_kernel[grid](
+        owner_tokens,
+        local_packed_weight,
+        local_weight_scale,
+        bias,
+        local_expert_offsets,
+        out,
+        owner_tokens.stride(0),
+        owner_tokens.stride(1),
+        local_packed_weight.stride(0),
+        local_packed_weight.stride(1),
+        local_packed_weight.stride(2),
+        local_weight_scale.stride(0),
+        local_weight_scale.stride(1),
+        local_weight_scale.stride(2),
+        bias.stride(0),
+        bias.stride(1) if bias.ndim > 1 else 0,
+        out.stride(0),
+        out.stride(1),
+        num_rows,
+        in_features,
+        out_features,
+        has_bias,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        BLOCK_K=block_k,
+        num_warps=4,
+    )
+    return out
+
+
+if triton is not None:
+
+    @triton.jit
+    def _mxfp4_e2m1_values(nibbles):
+        magnitude_bits = nibbles & 0x7
+        exponent = (magnitude_bits >> 1).to(tl.float32)
+        mantissa = (magnitude_bits & 0x1).to(tl.float32)
+        normal = (1.0 + 0.5 * mantissa) * tl.exp2(exponent - 1.0)
+        subnormal = 0.5 * mantissa
+        magnitude = tl.where(exponent == 0.0, subnormal, normal)
+        sign = 1.0 - 2.0 * ((nibbles >> 3) & 0x1).to(tl.float32)
+        return magnitude * sign
+
+    @triton.jit
+    def _owner_rank_mxfp4_expert_gemm_kernel(
+        tokens_ptr,
+        weight_ptr,
+        scale_ptr,
+        bias_ptr,
+        offsets_ptr,
+        out_ptr,
+        TOKENS_STRIDE_M: tl.constexpr,
+        TOKENS_STRIDE_K: tl.constexpr,
+        WEIGHT_STRIDE_E: tl.constexpr,
+        WEIGHT_STRIDE_N: tl.constexpr,
+        WEIGHT_STRIDE_K: tl.constexpr,
+        SCALE_STRIDE_E: tl.constexpr,
+        SCALE_STRIDE_N: tl.constexpr,
+        SCALE_STRIDE_K: tl.constexpr,
+        BIAS_STRIDE_E: tl.constexpr,
+        BIAS_STRIDE_N: tl.constexpr,
+        OUT_STRIDE_M: tl.constexpr,
+        OUT_STRIDE_N: tl.constexpr,
+        NUM_ROWS: tl.constexpr,
+        IN_FEATURES: tl.constexpr,
+        OUT_FEATURES: tl.constexpr,
+        HAS_BIAS: tl.constexpr,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+    ):
+        expert = tl.program_id(0)
+        row_block = tl.program_id(1)
+        col_block = tl.program_id(2)
+
+        expert_start = tl.load(offsets_ptr + expert).to(tl.int32)
+        expert_end = tl.load(offsets_ptr + expert + 1).to(tl.int32)
+        rows = expert_start + row_block * BLOCK_M + tl.arange(0, BLOCK_M)
+        cols = col_block * BLOCK_N + tl.arange(0, BLOCK_N)
+        k_offsets = tl.arange(0, BLOCK_K)
+        row_mask = (rows < expert_end) & (rows < NUM_ROWS)
+        col_mask = cols < OUT_FEATURES
+        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+        for k_start in range(0, IN_FEATURES, BLOCK_K):
+            ks = k_start + k_offsets
+            k_mask = ks < IN_FEATURES
+            tokens = tl.load(
+                tokens_ptr
+                + rows[:, None] * TOKENS_STRIDE_M
+                + ks[None, :] * TOKENS_STRIDE_K,
+                mask=row_mask[:, None] & k_mask[None, :],
+                other=0.0,
+            ).to(tl.float32)
+            packed = tl.load(
+                weight_ptr
+                + expert * WEIGHT_STRIDE_E
+                + cols[:, None] * WEIGHT_STRIDE_N
+                + (ks[None, :] // 2) * WEIGHT_STRIDE_K,
+                mask=col_mask[:, None] & k_mask[None, :],
+                other=0,
+            )
+            low_nibble = packed & 0xF
+            high_nibble = packed >> 4
+            nibbles = tl.where((ks[None, :] & 1) == 0, low_nibble, high_nibble)
+            weight_values = _mxfp4_e2m1_values(nibbles)
+            scale = tl.load(
+                scale_ptr
+                + expert * SCALE_STRIDE_E
+                + cols[:, None] * SCALE_STRIDE_N
+                + (ks[None, :] // 32) * SCALE_STRIDE_K,
+                mask=col_mask[:, None] & k_mask[None, :],
+                other=127,
+            ).to(tl.float32)
+            weights = weight_values * tl.exp2(scale - 127.0)
+            acc += tl.dot(tokens, tl.trans(weights))
+
+        if HAS_BIAS:
+            bias = tl.load(
+                bias_ptr
+                + expert * BIAS_STRIDE_E
+                + cols * BIAS_STRIDE_N,
+                mask=col_mask,
+                other=0.0,
+            ).to(tl.float32)
+            acc += bias[None, :]
+
+        tl.store(
+            out_ptr + rows[:, None] * OUT_STRIDE_M + cols[None, :] * OUT_STRIDE_N,
+            acc,
+            mask=row_mask[:, None] & col_mask[None, :],
+        )
 
 
 __all__ = [

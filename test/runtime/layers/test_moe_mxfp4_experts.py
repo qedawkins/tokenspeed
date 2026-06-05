@@ -97,6 +97,67 @@ def test_owner_rank_mxfp4_gate_up_matches_dequantized_dense_reference() -> None:
     torch.testing.assert_close(actual, expected, atol=1e-4, rtol=1e-4)
 
 
+def test_owner_rank_mxfp4_expert_gemm_cuda_graph_safe() -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("GPU is required for CUDA graph owner expert GEMM smoke test")
+    torch.manual_seed(20280)
+    device = "cuda"
+    num_experts = 3
+    out_features = 16
+    in_features = 64
+    local_counts = torch.tensor([2, 0, 3], dtype=torch.int32, device=device)
+    local_offsets = torch.tensor([0, 2, 2, 5], dtype=torch.int32, device=device)
+    owner_tokens = (
+        torch.randn(5, in_features, dtype=torch.float32, device=device) * 0.25
+    ).to(torch.bfloat16)
+    packed_weight = _random_packed_weight(
+        num_experts,
+        out_features,
+        in_features,
+    ).to(device)
+    scales = _random_e8m0_scales(num_experts, out_features, in_features).to(device)
+    bias = (
+        torch.randn(num_experts, out_features, dtype=torch.float32, device=device)
+        * 0.03
+    )
+
+    expected = owner_rank_mxfp4_expert_gemm(
+        owner_tokens,
+        packed_weight,
+        scales,
+        local_counts,
+        local_expert_offsets=local_offsets,
+        bias=bias,
+        output_dtype=torch.float32,
+    )
+    dense_weight = dequantize_mxfp4_expert_weight(packed_weight, scales)
+    dense_expected = _dense_owner_reference(
+        owner_tokens,
+        dense_weight,
+        local_counts,
+        local_expert_offsets=local_offsets,
+        bias=bias,
+    )
+    torch.testing.assert_close(expected, dense_expected, atol=1e-3, rtol=1e-3)
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = owner_rank_mxfp4_expert_gemm(
+            owner_tokens,
+            packed_weight,
+            scales,
+            local_counts,
+            local_expert_offsets=local_offsets,
+            bias=bias,
+            output_dtype=torch.float32,
+        )
+    graph.replay()
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(actual, expected, atol=1e-3, rtol=1e-3)
+
+
 def test_owner_rank_mxfp4_expert_gemm_dequantizes_only_active_experts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -231,6 +292,61 @@ def test_owner_rank_mxfp4_gate_up_consumes_dynamic_activation_layout() -> None:
     torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
 
 
+def test_owner_rank_mxfp4_gate_up_cuda_graph_safe() -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("GPU is required for CUDA graph gate/up smoke test")
+    torch.manual_seed(20281)
+    device = "cuda"
+    num_experts = 3
+    out_features = 16
+    in_features = 64
+    local_counts = torch.tensor([2, 0, 3], dtype=torch.int32, device=device)
+    local_offsets = torch.tensor([0, 2, 2, 5], dtype=torch.int32, device=device)
+    owner_tokens = (
+        torch.randn(5, in_features, dtype=torch.float32, device=device) * 0.25
+    ).to(torch.bfloat16)
+    packed_tokens, token_scale = quantize_mxfp4_activation_reference(owner_tokens.cpu())
+    packed_tokens = packed_tokens.to(device)
+    token_scale = token_scale.to(device)
+    packed_weight = _random_packed_weight(
+        num_experts,
+        out_features,
+        in_features,
+    ).to(device)
+    weight_scale = _random_e8m0_scales(
+        num_experts,
+        out_features,
+        in_features,
+    ).to(device)
+
+    expected = owner_rank_mxfp4_gate_up_gemm(
+        packed_tokens,
+        token_scale,
+        packed_weight,
+        weight_scale,
+        local_counts,
+        local_expert_offsets=local_offsets,
+        output_dtype=torch.float32,
+    )
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = owner_rank_mxfp4_gate_up_gemm(
+            packed_tokens,
+            token_scale,
+            packed_weight,
+            weight_scale,
+            local_counts,
+            local_expert_offsets=local_offsets,
+            output_dtype=torch.float32,
+        )
+    graph.replay()
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(actual, expected, atol=1e-3, rtol=1e-3)
+
+
 def test_owner_rank_mxfp4_gate_up_handles_zero_rows_and_preallocated_out() -> None:
     packed_tokens, token_scale = quantize_mxfp4_activation_reference(
         torch.empty(0, 64, dtype=torch.bfloat16)
@@ -311,6 +427,56 @@ def test_local_mxfp4_down_gemm_combine_matches_dense_reference() -> None:
         top_k=top_k,
     )
     torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
+
+
+def test_owner_rank_mxfp4_down_gemm_cuda_graph_safe() -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("GPU is required for CUDA graph down GEMM smoke test")
+    torch.manual_seed(20282)
+    device = "cuda"
+    num_experts = 3
+    hidden_size = 12
+    intermediate = 64
+    local_counts = torch.tensor([0, 5, 3], dtype=torch.int32, device=device)
+    local_offsets = torch.tensor([0, 0, 5, 8], dtype=torch.int32, device=device)
+    intermediate_rows = (
+        torch.randn(8, intermediate, dtype=torch.float32, device=device) * 0.25
+    ).to(torch.bfloat16)
+    packed_weight = _random_packed_weight(
+        num_experts,
+        hidden_size,
+        intermediate,
+    ).to(device)
+    weight_scale = _random_e8m0_scales(
+        num_experts,
+        hidden_size,
+        intermediate,
+    ).to(device)
+
+    expected = owner_rank_mxfp4_down_gemm(
+        intermediate_rows,
+        packed_weight,
+        weight_scale,
+        local_counts,
+        local_expert_offsets=local_offsets,
+        output_dtype=torch.float32,
+    )
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = owner_rank_mxfp4_down_gemm(
+            intermediate_rows,
+            packed_weight,
+            weight_scale,
+            local_counts,
+            local_expert_offsets=local_offsets,
+            output_dtype=torch.float32,
+        )
+    graph.replay()
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(actual, expected, atol=1e-3, rtol=1e-3)
 
 
 def test_owner_rank_mxfp4_down_gemm_handles_zero_rows_and_preallocated_out() -> None:
