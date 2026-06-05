@@ -151,6 +151,7 @@ def _reorder_w1w3_to_w3w1(x: torch.Tensor, dim: int = -2) -> torch.Tensor:
 
 class Mxfp4FlashinferMxfp4Backend(MoEBackend):
     supported_arches = frozenset({"sm100"})
+    packed_fused_features = frozenset({"self_routing"})
 
     def __init__(
         self,

@@ -41,6 +41,7 @@ class MoEBackend(ABC):
     # Static hardware capability declaration. Keep dynamic shape/quant checks in
     # supports(spec, quant_config).
     supported_arches: ClassVar[frozenset[str]] = frozenset({"any"})
+    packed_fused_features: ClassVar[frozenset[str]] = frozenset()
 
     def __init__(
         self,
@@ -59,6 +60,16 @@ class MoEBackend(ABC):
     @abstractmethod
     def supports(cls, spec: MoELayerSpec, quant_config: object) -> bool:
         raise NotImplementedError
+
+    @classmethod
+    def supports_packed_fused_contract(
+        cls,
+        spec: MoELayerSpec,
+        quant_config: object,
+        features: frozenset[str],
+    ) -> bool:
+        del spec, quant_config
+        return features <= cls.packed_fused_features
 
     @abstractmethod
     def create_layer_weights(

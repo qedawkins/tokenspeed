@@ -55,6 +55,7 @@ from tokenspeed.runtime.utils.pdl import pdl_enabled
 
 class Nvfp4FlashinferTrtllmBackend(MoEBackend):
     supported_arches = frozenset({"sm100"})
+    packed_fused_features = frozenset({"self_routing"})
 
     def __init__(
         self,

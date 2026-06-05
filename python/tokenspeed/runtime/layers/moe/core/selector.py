@@ -57,6 +57,8 @@ _AUTO_IMPL_PREFERENCE = {
     "w8a8_fp8": ("triton",),
     "wna16": ("marlin",),
 }
+_PACKED_FUSED_QUANT_KINDS = frozenset({"mxfp4", "nvfp4"})
+_FUSED_FEATURE_KEYS = ("moe_fused_features", "features")
 
 
 def _normalize_quant_kind(quant_config: object, prefix: str = "") -> str:
@@ -99,6 +101,21 @@ def _detect_arch() -> str:
     if major >= 9:
         return f"sm{major}0"
     return f"sm{major}{minor}"
+
+
+def _fused_features_from_routing_config(
+    routing_config: dict | None,
+) -> frozenset[str]:
+    if not routing_config:
+        return frozenset()
+    for key in _FUSED_FEATURE_KEYS:
+        features = routing_config.get(key)
+        if features is None:
+            continue
+        if isinstance(features, str):
+            return frozenset({features})
+        return frozenset(features)
+    return frozenset()
 
 
 def _resolve_impl_candidates(quant_kind: str) -> tuple[str, ...]:
@@ -146,6 +163,7 @@ def select_backend(
         quant_config = None
 
     arch = _detect_arch()
+    fused_features = _fused_features_from_routing_config(routing_config)
     tried = []
 
     for impl in _resolve_impl_candidates(quant_kind):
@@ -170,6 +188,18 @@ def select_backend(
             supports_fn = backend_cls.supports
         if not supports_fn(spec, quant_config):
             tried.append(f"{impl}:unsupported")
+            continue
+        if (
+            quant_kind in _PACKED_FUSED_QUANT_KINDS
+            and fused_features
+            and not backend_cls.supports_packed_fused_contract(
+                spec,
+                quant_config,
+                fused_features,
+            )
+        ):
+            feature_str = ",".join(sorted(fused_features))
+            tried.append(f"{impl}:unsupported-packed-fused({feature_str})")
             continue
 
         return backend_cls(

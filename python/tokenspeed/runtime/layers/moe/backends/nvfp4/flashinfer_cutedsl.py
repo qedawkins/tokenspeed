@@ -76,6 +76,7 @@ def get_cutedsl_graph_wrapper_capacity_hint() -> int:
 
 class Nvfp4FlashinferCuteDslBackend(MoEBackend):
     supported_arches = frozenset({"sm100", "sm110"})
+    packed_fused_features = frozenset({"pre_routed"})
 
     def __init__(
         self,

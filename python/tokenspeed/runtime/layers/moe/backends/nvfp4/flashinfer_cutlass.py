@@ -37,6 +37,7 @@ from tokenspeed.runtime.utils import next_power_of_2
 
 class Nvfp4FlashinferCutlassBackend(MoEBackend):
     supported_arches = frozenset({"sm100", "sm110", "sm120"})
+    packed_fused_features = frozenset({"pre_routed"})
 
     def __init__(
         self,
