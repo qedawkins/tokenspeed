@@ -21,11 +21,13 @@
 from __future__ import annotations
 
 import gc
+from types import SimpleNamespace
 
 import pytest
 import torch
 import torch.distributed as dist
 
+import tokenspeed.runtime.layers.moe.backends.base as base_module
 from tokenspeed.runtime.layers.moe.backends.ep_workspace import (
     EPCommunicationWorkspace,
     EPWorkspaceError,
@@ -292,6 +294,154 @@ def test_moe_backend_reuses_ep_workspace_until_capacity_grows() -> None:
     assert larger.max_dispatch_rows == 20
     assert larger.rank == spec.ep_rank
     assert larger.world_size == spec.ep_size
+
+
+def test_moe_backend_reuses_shared_auto_iris_workspace_across_instances(
+    monkeypatch,
+) -> None:
+    base_module._SHARED_IRIS_EP_WORKSPACES.clear()
+    spec = MoELayerSpec(
+        top_k=2,
+        num_experts=8,
+        num_local_experts=4,
+        hidden_size=16,
+        intermediate_size=32,
+        activation="silu",
+        tp_rank=0,
+        tp_size=1,
+        ep_rank=1,
+        ep_size=2,
+    )
+    first_backend = _DummyBackend(
+        key=BackendKey(arch="any", quant="test", impl="dummy"),
+        spec=spec,
+        quant_config=None,
+    )
+    second_backend = _DummyBackend(
+        key=BackendKey(arch="any", quant="test", impl="dummy"),
+        spec=spec,
+        quant_config=None,
+    )
+    calls = []
+
+    def fake_allocate(**kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(
+            backend="iris",
+            max_dispatch_rows=(
+                kwargs["max_tokens_per_rank"]
+                * kwargs["top_k"]
+                * kwargs["world_size"]
+            ),
+            hidden_size=kwargs["hidden_size"],
+            top_k=kwargs["top_k"],
+            world_size=kwargs["world_size"],
+            rank=kwargs["rank"],
+            dtype=kwargs["dtype"],
+            device=torch.device("cuda:0"),
+        )
+
+    monkeypatch.setattr(
+        EPCommunicationWorkspace,
+        "allocate",
+        staticmethod(fake_allocate),
+    )
+
+    try:
+        first = first_backend.ensure_ep_workspace(
+            max_tokens_per_rank=4,
+            dtype=torch.float32,
+            device="cuda:0",
+            iris_mode="auto",
+        )
+        second = second_backend.ensure_ep_workspace(
+            max_tokens_per_rank=2,
+            dtype=torch.float32,
+            device="cuda:0",
+            iris_mode="auto",
+        )
+        larger = second_backend.ensure_ep_workspace(
+            max_tokens_per_rank=5,
+            dtype=torch.float32,
+            device="cuda:0",
+            iris_mode="auto",
+        )
+    finally:
+        base_module._SHARED_IRIS_EP_WORKSPACES.clear()
+
+    assert first is second
+    assert larger is not first
+    assert larger.max_dispatch_rows == 20
+    assert len(calls) == 2
+
+
+def test_moe_backend_does_not_cache_non_iris_auto_workspace(monkeypatch) -> None:
+    base_module._SHARED_IRIS_EP_WORKSPACES.clear()
+    spec = MoELayerSpec(
+        top_k=2,
+        num_experts=8,
+        num_local_experts=4,
+        hidden_size=16,
+        intermediate_size=32,
+        activation="silu",
+        tp_rank=0,
+        tp_size=1,
+        ep_rank=1,
+        ep_size=2,
+    )
+    first_backend = _DummyBackend(
+        key=BackendKey(arch="any", quant="test", impl="dummy"),
+        spec=spec,
+        quant_config=None,
+    )
+    second_backend = _DummyBackend(
+        key=BackendKey(arch="any", quant="test", impl="dummy"),
+        spec=spec,
+        quant_config=None,
+    )
+    calls = []
+
+    def fake_allocate(**kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(
+            backend="torch",
+            max_dispatch_rows=(
+                kwargs["max_tokens_per_rank"]
+                * kwargs["top_k"]
+                * kwargs["world_size"]
+            ),
+            hidden_size=kwargs["hidden_size"],
+            top_k=kwargs["top_k"],
+            world_size=kwargs["world_size"],
+            rank=kwargs["rank"],
+            dtype=kwargs["dtype"],
+            device=torch.device("cuda:0"),
+        )
+
+    monkeypatch.setattr(
+        EPCommunicationWorkspace,
+        "allocate",
+        staticmethod(fake_allocate),
+    )
+
+    try:
+        first = first_backend.ensure_ep_workspace(
+            max_tokens_per_rank=4,
+            dtype=torch.float32,
+            device="cuda:0",
+            iris_mode="auto",
+        )
+        second = second_backend.ensure_ep_workspace(
+            max_tokens_per_rank=2,
+            dtype=torch.float32,
+            device="cuda:0",
+            iris_mode="auto",
+        )
+    finally:
+        base_module._SHARED_IRIS_EP_WORKSPACES.clear()
+
+    assert first is not second
+    assert len(calls) == 2
 
 
 @pytest.mark.parametrize("required_world_size", [2, 4, 8])

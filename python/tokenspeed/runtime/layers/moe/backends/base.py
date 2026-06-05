@@ -36,6 +36,10 @@ from tokenspeed.runtime.layers.moe.backends.weight_loaders import (
 )
 from tokenspeed.runtime.layers.moe.core.types import BackendKey, MoELayerSpec
 
+# Iris allocates a symmetric heap per context. EP workspaces are scratch buffers,
+# so share one Iris-backed workspace per rank/spec across MoE layer backends.
+_SHARED_IRIS_EP_WORKSPACES: dict[tuple[object, ...], Any] = {}
+
 
 class MoEBackend(ABC):
     # Static hardware capability declaration. Keep dynamic shape/quant checks in
@@ -132,16 +136,23 @@ class MoEBackend(ABC):
         workspace = self._ep_workspace
         requested_rows = max_tokens_per_rank * self.spec.top_k * self.spec.ep_size
         requested_device = _normalize_optional_workspace_device(device)
-        if (
-            workspace is not None
-            and workspace.max_dispatch_rows >= requested_rows
-            and workspace.hidden_size == self.spec.hidden_size
-            and workspace.top_k == self.spec.top_k
-            and workspace.world_size == self.spec.ep_size
-            and workspace.rank == self.spec.ep_rank
-            and workspace.dtype == dtype
-            and (requested_device is None or workspace.device == requested_device)
+        shared_key = _shared_iris_ep_workspace_key(
+            self,
+            dtype=dtype,
+            requested_device=requested_device,
+            iris_mode=iris_mode,
+            iris_context=iris_context,
+        )
+        if shared_key is not None:
+            workspace = _SHARED_IRIS_EP_WORKSPACES.get(shared_key)
+        if _can_reuse_ep_workspace(
+            workspace,
+            requested_rows=requested_rows,
+            spec=self.spec,
+            dtype=dtype,
+            requested_device=requested_device,
         ):
+            self._ep_workspace = workspace
             return workspace
 
         workspace = EPCommunicationWorkspace.allocate(
@@ -155,6 +166,8 @@ class MoEBackend(ABC):
             iris_mode=iris_mode,
             iris_context=iris_context,
         )
+        if shared_key is not None and workspace.backend == "iris":
+            _SHARED_IRIS_EP_WORKSPACES[shared_key] = workspace
         self._ep_workspace = workspace
         return workspace
 
@@ -202,3 +215,52 @@ def _normalize_optional_workspace_device(
     if requested_device.type == "cuda" and requested_device.index is None:
         return torch.device("cuda", torch.cuda.current_device())
     return requested_device
+
+
+def _shared_iris_ep_workspace_key(
+    backend: MoEBackend,
+    *,
+    dtype: torch.dtype,
+    requested_device: torch.device | None,
+    iris_mode: str,
+    iris_context: Any | None,
+) -> tuple[object, ...] | None:
+    if iris_context is not None or iris_mode == "disabled":
+        return None
+    if requested_device is None:
+        if not torch.cuda.is_available():
+            return None
+        requested_device = torch.device("cuda", torch.cuda.current_device())
+    if requested_device.type != "cuda":
+        return None
+    return (
+        type(backend),
+        backend.key,
+        backend.spec.hidden_size,
+        backend.spec.top_k,
+        backend.spec.ep_size,
+        backend.spec.ep_rank,
+        dtype,
+        requested_device.type,
+        requested_device.index,
+    )
+
+
+def _can_reuse_ep_workspace(
+    workspace,
+    *,
+    requested_rows: int,
+    spec: MoELayerSpec,
+    dtype: torch.dtype,
+    requested_device: torch.device | None,
+) -> bool:
+    return (
+        workspace is not None
+        and workspace.max_dispatch_rows >= requested_rows
+        and workspace.hidden_size == spec.hidden_size
+        and workspace.top_k == spec.top_k
+        and workspace.world_size == spec.ep_size
+        and workspace.rank == spec.ep_rank
+        and workspace.dtype == dtype
+        and (requested_device is None or workspace.device == requested_device)
+    )
