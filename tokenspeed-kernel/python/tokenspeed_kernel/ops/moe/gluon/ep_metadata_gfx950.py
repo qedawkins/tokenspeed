@@ -35,6 +35,10 @@ from tokenspeed_kernel.signature import format_signatures
 _EP_METADATA_SIGNATURES = format_signatures("indices", "dense", {torch.int32})
 
 
+def _next_power_of_two_at_least(n: int, minimum: int = 1) -> int:
+    return 1 << (max(n, minimum) - 1).bit_length()
+
+
 @dataclass(frozen=True)
 class EPDispatchMetadata:
     owner_counts: torch.Tensor
@@ -409,6 +413,7 @@ def gluon_ep_metadata_gfx950(
             block_n // 64,
             num_warps=1,
         )
+    copy_block_n = _next_power_of_two_at_least(num_local_experts + 1, minimum=64)
     _copy_rank_local_metadata[(1,)](
         owner_expert_counts,
         owner_expert_offsets,
@@ -416,8 +421,8 @@ def gluon_ep_metadata_gfx950(
         local_expert_offsets,
         rank,
         num_local_experts,
-        max(64, num_local_experts + 1),
-        1,
+        copy_block_n,
+        max(1, copy_block_n // 64),
         num_warps=1,
     )
 

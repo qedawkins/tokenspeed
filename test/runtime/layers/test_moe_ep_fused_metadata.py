@@ -433,6 +433,72 @@ def test_pre_routed_fused_metadata_matches_actual_s4_metadata_kernel() -> None:
     torch.testing.assert_close(fused.topk_weights, topk_weights.reshape(-1))
 
 
+def test_ep_metadata_kernel_handles_kimi_96_local_expert_layout() -> None:
+    _require_cdna4_gpu()
+    import tokenspeed_kernel
+
+    device = "cuda"
+    rank = 1
+    world_size = 4
+    num_local_experts = 96
+    topk_ids = torch.tensor(
+        [
+            [0, 95, 96, 191, 192, 287, 288, 383],
+            [97, 98, 193, 194, 289, 290, 1, 2],
+            [95, 191, 287, 383, -1, 384, 0, 96],
+        ],
+        dtype=torch.int32,
+        device=device,
+    )
+    expert_owner, local_expert_id = _uniform_owner_maps(
+        world_size,
+        num_local_experts,
+        device=device,
+    )
+    ep_metadata = tokenspeed_kernel.moe_dispatch(
+        topk_ids,
+        expert_owner,
+        local_expert_id,
+        rank,
+        world_size,
+        num_local_experts,
+        dtype=torch.int32,
+        traits={"comm_strategy": "ep_metadata"},
+        expected_kernel_name="gluon_ep_metadata_gfx950",
+    )
+    torch.cuda.synchronize()
+    expected = _reference_ep_metadata(
+        topk_ids,
+        expert_owner,
+        local_expert_id,
+        rank=rank,
+        world_size=world_size,
+        num_local_experts=num_local_experts,
+    )
+
+    assert ep_metadata.owner_expert_offsets.shape == (world_size, 97)
+    assert ep_metadata.local_expert_offsets.shape == (97,)
+    torch.testing.assert_close(ep_metadata.owner_counts, expected.owner_counts)
+    torch.testing.assert_close(
+        ep_metadata.owner_expert_counts,
+        expected.owner_expert_counts,
+    )
+    torch.testing.assert_close(
+        ep_metadata.owner_expert_offsets,
+        expected.owner_expert_offsets,
+    )
+    torch.testing.assert_close(
+        ep_metadata.local_expert_counts,
+        expected.local_expert_counts,
+    )
+    torch.testing.assert_close(
+        ep_metadata.local_expert_offsets,
+        expected.local_expert_offsets,
+    )
+    torch.testing.assert_close(ep_metadata.dispatch_offsets, expected.dispatch_offsets)
+    torch.testing.assert_close(ep_metadata.combine_offsets, expected.combine_offsets)
+
+
 @pytest.mark.parametrize(
     ("rank", "topk_ids", "expected_valid_slots"),
     [
