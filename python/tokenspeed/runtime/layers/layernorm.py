@@ -366,6 +366,23 @@ class GemmaRMSNorm(torch.nn.Module):
         return result, None, None
 
 
+def _amd_rmsnorm_view_safe(
+    norm: RMSNorm,
+    input_tensor: torch.Tensor,
+    output_tensor: torch.Tensor | None,
+) -> torch.Tensor:
+    if output_tensor is not None:
+        normed = norm(input_tensor, inplace=False)
+        output_tensor.copy_(normed)
+        return output_tensor
+    if input_tensor.is_contiguous():
+        return norm(input_tensor, inplace=True)
+
+    normed = norm(input_tensor, inplace=False)
+    input_tensor.copy_(normed)
+    return input_tensor
+
+
 class FusedRMSNorm(nn.Module):
     """Fused RMSNorm layer for normalizing two tensors simultaneously.
 
@@ -411,14 +428,16 @@ class FusedRMSNorm(nn.Module):
             Tuple of (normalized_q_a, normalized_kv_a)
         """
         if _is_amd:
-            q_out = self.q_a_norm(input_q_a, inplace=output_q_a is None)
-            if output_q_a is not None:
-                output_q_a.copy_(q_out)
-                q_out = output_q_a
-            kv_out = self.kv_a_norm(input_kv_a, inplace=output_kv_a is None)
-            if output_kv_a is not None:
-                output_kv_a.copy_(kv_out)
-                kv_out = output_kv_a
+            q_out = _amd_rmsnorm_view_safe(
+                self.q_a_norm,
+                input_q_a,
+                output_q_a,
+            )
+            kv_out = _amd_rmsnorm_view_safe(
+                self.kv_a_norm,
+                input_kv_a,
+                output_kv_a,
+            )
             return q_out, kv_out
         else:
             rmsnorm_fused_parallel(

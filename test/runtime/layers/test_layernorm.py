@@ -35,3 +35,45 @@ def test_fused_rmsnorm_hip_fallback_matches_individual_norms() -> None:
     assert actual_kv.data_ptr() == kv_inout.data_ptr()
     torch.testing.assert_close(actual_q, expected_q, atol=1e-2, rtol=1e-2)
     torch.testing.assert_close(actual_kv, expected_kv, atol=1e-2, rtol=1e-2)
+
+
+def test_fused_rmsnorm_hip_fallback_updates_noncontiguous_kv_view() -> None:
+    _require_cdna4_gpu()
+
+    torch.manual_seed(20260606)
+    q_lora_rank = 16
+    kv_lora_rank = 8
+    rope_dim = 4
+    q_norm = RMSNorm(q_lora_rank, eps=1e-6).cuda().to(torch.bfloat16)
+    kv_norm = RMSNorm(kv_lora_rank, eps=1e-6).cuda().to(torch.bfloat16)
+    fused_norm = FusedRMSNorm(q_norm, kv_norm)
+
+    qkv = torch.randn(
+        4,
+        q_lora_rank + kv_lora_rank + rope_dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    q_a, latent_cache = qkv.split(
+        [q_lora_rank, kv_lora_rank + rope_dim],
+        dim=-1,
+    )
+    kv_a = latent_cache[..., :kv_lora_rank]
+    assert not kv_a.is_contiguous()
+
+    expected_q = q_norm(q_a.clone())
+    expected_kv = kv_norm(kv_a.clone())
+    q_out = torch.empty_like(q_a)
+    actual_q, actual_kv = fused_norm(q_a, kv_a, output_q_a=q_out)
+    torch.cuda.synchronize()
+
+    assert actual_q.data_ptr() == q_out.data_ptr()
+    assert actual_kv.data_ptr() == kv_a.data_ptr()
+    torch.testing.assert_close(actual_q, expected_q, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(kv_a, expected_kv, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(
+        latent_cache[..., :kv_lora_rank],
+        expected_kv,
+        atol=1e-2,
+        rtol=1e-2,
+    )
