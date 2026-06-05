@@ -25,6 +25,23 @@ import torch
 from tokenspeed.runtime.layers.quantization import QuantizationConfig
 
 
+def _normalize_ignored_layer_patterns(patterns: list[str] | None) -> list[str]:
+    if not patterns:
+        return []
+    normalized: list[str] = []
+    for raw in patterns:
+        if not isinstance(raw, str) or not raw:
+            continue
+        if raw.startswith("re:") or "*" not in raw:
+            normalized.append(raw)
+            continue
+        import re
+
+        regex = re.escape(raw).replace(r"\*", ".*")
+        normalized.append(f"re:{regex}")
+    return normalized
+
+
 def _is_quark_w8a8_fp8(config: dict[str, Any]) -> bool:
     if not isinstance(config, dict):
         return False
@@ -67,8 +84,13 @@ class W8A8Fp8Config(QuantizationConfig):
         - If CUTLASS is not supported: Falls back to per-tensor weight quantization
     """
 
-    def __init__(self, is_checkpoint_fp8_serialized: bool = False):
+    def __init__(
+        self,
+        is_checkpoint_fp8_serialized: bool = False,
+        ignored_layers: list[str] | None = None,
+    ):
         self.is_checkpoint_fp8_serialized = is_checkpoint_fp8_serialized
+        self.ignored_layers = ignored_layers or []
 
     @classmethod
     def get_supported_act_dtypes(cls) -> list[torch.dtype]:
@@ -93,7 +115,12 @@ class W8A8Fp8Config(QuantizationConfig):
             "compressed-tensors" in quant_method or "w8a8_fp8" in quant_method
             or _is_quark_w8a8_fp8(config)
         )
-        return cls(is_checkpoint_fp8_serialized=is_checkpoint_fp8_serialized)
+        raw_ignored = cls.get_from_keys_or(config, ["ignored_layers", "exclude"], None)
+        ignored_layers = _normalize_ignored_layer_patterns(raw_ignored)
+        return cls(
+            is_checkpoint_fp8_serialized=is_checkpoint_fp8_serialized,
+            ignored_layers=ignored_layers,
+        )
 
     @classmethod
     def override_quantization_method(cls, hf_quant_cfg, user_quant) -> str | None:

@@ -42,6 +42,26 @@ def test_quark_w8a8_from_config_marks_checkpoint_serialized() -> None:
     assert config.is_checkpoint_fp8_serialized is True
 
 
+def test_quark_w8a8_config_preserves_kimi_non_expert_exclusions() -> None:
+    from tokenspeed.runtime.layers.quantization.utils import should_ignore_quant_layer
+    from tokenspeed.runtime.layers.quantization.w8a8_fp8 import W8A8Fp8Config
+
+    config = W8A8Fp8Config.from_config(quark_kimi_w8a8_quantization_config())
+
+    assert should_ignore_quant_layer(
+        "model.layers.0.self_attn.q_proj",
+        config.ignored_layers,
+    )
+    assert should_ignore_quant_layer(
+        "model.layers.0.mlp.gate_proj",
+        config.ignored_layers,
+    )
+    assert not should_ignore_quant_layer(
+        "model.layers.0.mlp.experts",
+        config.ignored_layers,
+    )
+
+
 def test_model_config_accepts_quark_w8a8_without_user_override() -> None:
     quantization = _verify_model_quantization(quark_kimi_w8a8_quantization_config())
 
