@@ -146,6 +146,50 @@ def pre_routed_fused_down_combine(
     )
 
 
+def self_routing_fused_down_combine(
+    owner_intermediate: torch.Tensor,
+    gate_up_result: Any,
+    workspace: EPCommunicationWorkspace,
+    local_down_weight: torch.Tensor,
+    local_down_weight_scale: torch.Tensor,
+    expert_owner: torch.Tensor,
+    local_expert_id: torch.Tensor,
+    *,
+    block_shape: tuple[int, int],
+    block_size: int = 16,
+    routed_scaling_factor: float = 1.0,
+    out: torch.Tensor | None = None,
+    config: dict[str, Any] | None = None,
+    expected_gemm_kernel_name: str | None = None,
+    expected_reduce_kernel_name: str | None = None,
+) -> PreRoutedFusedDownCombineResult:
+    """Reuse the pre-routed fused down+combine path for self-routing output."""
+
+    _validate_self_routing_gate_up_result(gate_up_result)
+    topk_output = gate_up_result.topk_output
+    topk_ids = topk_output.topk_ids.to(torch.int32).contiguous()
+    topk_weights = topk_output.topk_weights
+    return pre_routed_fused_down_combine(
+        owner_intermediate,
+        topk_ids,
+        topk_weights,
+        gate_up_result.ep_metadata,
+        workspace,
+        gate_up_result.fused_metadata,
+        local_down_weight,
+        local_down_weight_scale,
+        expert_owner,
+        local_expert_id,
+        block_shape=block_shape,
+        block_size=block_size,
+        routed_scaling_factor=routed_scaling_factor,
+        out=out,
+        config=config,
+        expected_gemm_kernel_name=expected_gemm_kernel_name,
+        expected_reduce_kernel_name=expected_reduce_kernel_name,
+    )
+
+
 def _dispatch_plan_from_fused_metadata(
     fused_metadata: PreRoutedFusedEPMetadata,
 ) -> EPOwnerDispatchPlan:
@@ -597,7 +641,21 @@ def _validate_pre_routed_inputs(
             "fused topk_weights device "
             f"{fused_metadata.topk_weights.device} != workspace device "
             f"{workspace.device}"
-    )
+        )
+
+
+def _validate_self_routing_gate_up_result(gate_up_result: Any) -> None:
+    for name in ("topk_output", "ep_metadata", "fused_metadata"):
+        if not hasattr(gate_up_result, name):
+            raise EPWorkspaceError(
+                "self_routing_fused_down_combine expects "
+                "SelfRoutingFusedGateUpResult"
+            )
+    topk_output = gate_up_result.topk_output
+    if not hasattr(topk_output, "topk_ids") or not hasattr(topk_output, "topk_weights"):
+        raise EPWorkspaceError(
+            "self_routing_fused_down_combine expects resolved standard top-k output"
+        )
 
 
 def _validate_owner_intermediate_rows(
@@ -729,4 +787,5 @@ def _fp8_e4m3_dtypes() -> tuple[torch.dtype, ...]:
 __all__ = [
     "PreRoutedFusedDownCombineResult",
     "pre_routed_fused_down_combine",
+    "self_routing_fused_down_combine",
 ]
