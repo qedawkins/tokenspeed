@@ -241,13 +241,19 @@ def load_group_weight_scale(
 def load_per_channel_weight_scale(
     param: torch.Tensor,
     loaded_weight: torch.Tensor,
-    local_expert_id: int,
     shard_id: str,
+    local_expert_id: int,
     tp_rank: int,
     do_transpose: bool,
 ):
     expert_data = param.data[local_expert_id]
     shard_dim = get_shard_dim(param, shard_id, do_transpose)
+    if (
+        loaded_weight.ndim == 1
+        and expert_data.ndim == 2
+        and expert_data.shape[-1] == 1
+    ):
+        loaded_weight = loaded_weight.unsqueeze(-1)
 
     # for per channel weight quantization
     if shard_id == "w2":
