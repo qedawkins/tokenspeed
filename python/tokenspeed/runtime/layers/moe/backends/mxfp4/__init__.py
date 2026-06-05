@@ -20,6 +20,7 @@
 
 __all__ = [
     "Mxfp4FlashinferMxfp4Backend",
+    "Mxfp4TritonKernelEPBackend",
     "Mxfp4TritonKernelBackend",
 ]
 
@@ -37,4 +38,10 @@ def __getattr__(name: str):
         )
 
         return Mxfp4TritonKernelBackend
+    if name == "Mxfp4TritonKernelEPBackend":
+        from tokenspeed.runtime.layers.moe.backends.mxfp4.triton_kernel_ep import (
+            Mxfp4TritonKernelEPBackend,
+        )
+
+        return Mxfp4TritonKernelEPBackend
     raise AttributeError(name)

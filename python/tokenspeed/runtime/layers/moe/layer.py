@@ -91,8 +91,14 @@ class MoELayer(torch.nn.Module):
             ep_rank, ep_size = 0, 1
         self.ep_rank, self.ep_size = ep_rank, ep_size
 
-        if tp_size > 1 and ep_size > 1:
-            raise ValueError("Mixed TP and EP is not supported yet.")
+        if (
+            tp_size > 1
+            and ep_size > 1
+            and not _supports_mixed_tp_ep_quant_config(quant_config)
+        ):
+            raise ValueError(
+                "Mixed TP and EP is only supported for checkpoint-serialized MXFP4 MoE."
+            )
 
         num_local_experts = num_experts // self.ep_size
         a2a_backend = get_all2all_backend()
@@ -203,3 +209,10 @@ class MoELayer(torch.nn.Module):
             self.w2_weight,
             w2_weight_scale,
         )
+
+
+def _supports_mixed_tp_ep_quant_config(quant_config) -> bool:
+    return bool(
+        getattr(quant_config, "is_checkpoint_mxfp4_serialized", False)
+        and not getattr(quant_config, "is_w4a8_fp8", False)
+    )

@@ -47,6 +47,7 @@ _AUTO_IMPL_PREFERENCE = {
         "flashinfer_cutlass",
     ),
     "mxfp4": (
+        "triton_kernel_ep",
         "flashinfer_mxfp4",
         "gluon_kernel",
         "triton_kernel",
@@ -138,7 +139,7 @@ def _resolve_impl_candidates(quant_kind: str) -> tuple[str, ...]:
             auto_candidates = tuple(
                 impl
                 for impl in auto_candidates
-                if impl in {"gluon_kernel", "triton_kernel"}
+                if impl in {"triton_kernel_ep", "gluon_kernel", "triton_kernel"}
             )
 
     if not backend.is_auto():

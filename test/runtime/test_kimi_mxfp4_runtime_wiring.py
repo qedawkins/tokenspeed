@@ -84,9 +84,12 @@ def _install_cpu_safe_kernel_surface(monkeypatch: pytest.MonkeyPatch) -> None:
         "tokenspeed.runtime.layers.quantization",
         "tokenspeed.runtime.layers.quantization.utils",
         "tokenspeed.runtime.layers.moe.core.selector",
+        "tokenspeed.runtime.layers.moe.layer",
         "tokenspeed.runtime.layers.moe.backends.mxfp4.triton_kernel",
+        "tokenspeed.runtime.layers.moe.backends.mxfp4.triton_kernel_ep",
         "tokenspeed.runtime.layers.moe.topk",
         "tokenspeed.runtime.moe.distribution_recorder",
+        "tokenspeed.runtime.utils.env",
     ):
         monkeypatch.delitem(sys.modules, name, raising=False)
 
@@ -136,6 +139,21 @@ def _install_cpu_safe_kernel_surface(monkeypatch: pytest.MonkeyPatch) -> None:
         "tokenspeed_kernel.ops.moe.triton_kernels",
         triton_kernels,
     )
+    communication_ops = ModuleType("tokenspeed_kernel.ops.communication")
+    trtllm_comm = ModuleType("tokenspeed_kernel.ops.communication.trtllm")
+    trtllm_comm.allgather_dual_rmsnorm = _not_called
+    trtllm_comm.allreduce_residual_rmsnorm = _not_called
+    trtllm_comm.reducescatter_residual_rmsnorm = _not_called
+    monkeypatch.setitem(
+        sys.modules,
+        "tokenspeed_kernel.ops.communication",
+        communication_ops,
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "tokenspeed_kernel.ops.communication.trtllm",
+        trtllm_comm,
+    )
 
     numerics = ModuleType("tokenspeed_kernel.numerics")
     reference = ModuleType("tokenspeed_kernel.numerics.reference")
@@ -179,6 +197,10 @@ def _install_cpu_safe_kernel_surface(monkeypatch: pytest.MonkeyPatch) -> None:
         distribution_recorder,
     )
 
+    env = ModuleType("tokenspeed.runtime.utils.env")
+    env.global_server_args_dict = {"ep_num_redundant_experts": 0}
+    monkeypatch.setitem(sys.modules, "tokenspeed.runtime.utils.env", env)
+
 
 def _not_called(*_args: object, **_kwargs: object) -> object:
     raise AssertionError("stubbed kernel function should not be called")
@@ -205,6 +227,22 @@ def _tp4_spec(*, prefix: str = "language_model.model.layers.1.mlp.experts"):
         tp_size=4,
         ep_rank=0,
         ep_size=1,
+        prefix=prefix,
+    )
+
+
+def _tp4_ep4_spec(*, prefix: str = "language_model.model.layers.1.mlp.experts"):
+    return MoELayerSpec(
+        top_k=2,
+        num_experts=16,
+        num_local_experts=4,
+        hidden_size=128,
+        intermediate_size=128,
+        activation="silu",
+        tp_rank=2,
+        tp_size=4,
+        ep_rank=2,
+        ep_size=4,
         prefix=prefix,
     )
 
@@ -260,6 +298,97 @@ def test_kimi_mxfp4_local_tp_selects_packed_moe_backend(
     assert layer.w2_weight.dtype == torch.uint8
     assert hasattr(layer.w13_weight, "weight_loader")
     assert hasattr(layer.w2_weight_scale, "weight_loader")
+
+
+def test_kimi_mxfp4_tp_ep_selects_ep_backend(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_cpu_safe_kernel_surface(monkeypatch)
+    from tokenspeed.runtime.layers.moe import utils as moe_utils
+    from tokenspeed.runtime.layers.moe.backends import _REGISTERED
+    from tokenspeed.runtime.layers.moe.core import registry
+    from tokenspeed.runtime.layers.moe.core.selector import select_backend
+    from tokenspeed.runtime.layers.moe.utils import MoeBackend
+
+    _REGISTERED.clear()
+    registry._REGISTRY.clear()
+    monkeypatch.setattr(moe_utils, "MOE_BACKEND", MoeBackend.AUTO)
+
+    quant_config = _FakeMxfp4Config(is_checkpoint_mxfp4_serialized=True)
+    backend = select_backend(_tp4_ep4_spec(), quant_config)
+
+    assert type(backend).__name__ == "Mxfp4TritonKernelEPBackend"
+    assert backend.key == BackendKey(
+        arch="gfx950",
+        quant="mxfp4",
+        impl="triton_kernel_ep",
+    )
+    assert backend.topk_output_format.is_bypassed()
+    assert backend.expert_weight_format_signature.name == "mxfp4_e2m1_block32"
+
+    layer = nn.Module()
+    layer.activation = "silu"
+    backend.create_layer_weights(layer, with_bias=True)
+    backend.process_weights_after_loading(layer)
+
+    assert tuple(layer.w13_weight.shape) == (4, 64, 64)
+    assert tuple(layer.w13_weight_scale.shape) == (4, 64, 4)
+    assert tuple(layer.w2_weight.shape) == (4, 128, 16)
+    assert tuple(layer.w2_weight_scale.shape) == (4, 128, 1)
+    assert not hasattr(layer, "w13_weight_triton_tensor")
+    assert not hasattr(layer, "w2_weight_triton_tensor")
+
+
+def test_kimi_mxfp4_moelayer_allows_tp_ep_only_for_checkpoint_mxfp4(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_cpu_safe_kernel_surface(monkeypatch)
+    from tokenspeed.runtime.layers.moe import utils as moe_utils
+    from tokenspeed.runtime.layers.moe.backends import _REGISTERED
+    from tokenspeed.runtime.layers.moe.core import registry
+    from tokenspeed.runtime.layers.moe.layer import MoELayer
+    from tokenspeed.runtime.layers.moe.utils import MoeBackend
+    from tokenspeed.runtime.utils.env import global_server_args_dict
+
+    _REGISTERED.clear()
+    registry._REGISTRY.clear()
+    monkeypatch.setattr(moe_utils, "MOE_BACKEND", MoeBackend.AUTO)
+    monkeypatch.setitem(global_server_args_dict, "ep_num_redundant_experts", 0)
+
+    layer = MoELayer(
+        top_k=2,
+        num_experts=16,
+        hidden_size=128,
+        intermediate_size=128,
+        quant_config=_FakeMxfp4Config(is_checkpoint_mxfp4_serialized=True),
+        layer_index=1,
+        prefix="language_model.model.layers.1.mlp.experts",
+        tp_rank=2,
+        tp_size=4,
+        ep_rank=2,
+        ep_size=4,
+        activation="silu",
+        with_bias=True,
+    )
+
+    assert type(layer.backend).__name__ == "Mxfp4TritonKernelEPBackend"
+    assert layer.backend.key.impl == "triton_kernel_ep"
+    assert layer.topk_output_format.is_bypassed()
+
+    with pytest.raises(ValueError, match="Mixed TP and EP"):
+        MoELayer(
+            top_k=2,
+            num_experts=16,
+            hidden_size=128,
+            intermediate_size=128,
+            quant_config=None,
+            layer_index=1,
+            prefix="language_model.model.layers.1.mlp.experts",
+            tp_rank=0,
+            tp_size=4,
+            ep_rank=0,
+            ep_size=4,
+        )
 
 
 def test_kimi_mxfp4_ignored_prefixes_remain_unquantized(

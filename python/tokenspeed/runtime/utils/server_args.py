@@ -488,8 +488,12 @@ class ServerArgs:
         )
 
         # Impl constraints:
-        if self.mapping.moe.has_tp and self.mapping.moe.has_ep:
-            raise ValueError("MoE TP and EP cannot be both > 1")
+        if (
+            self.mapping.moe.has_tp
+            and self.mapping.moe.has_ep
+            and self.quantization != "mxfp4"
+        ):
+            raise ValueError("MoE TP and EP can both be > 1 only for MXFP4")
 
         logger.info("Parallelism configuration:\n%s", self.mapping)
 

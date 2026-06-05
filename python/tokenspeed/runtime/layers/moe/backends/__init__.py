@@ -77,6 +77,10 @@ _BACKEND_SPECS = {
         "tokenspeed.runtime.layers.moe.backends.mxfp4.gluon_kernel",
         "Mxfp4GluonKernelBackend",
     ),
+    ("mxfp4", "triton_kernel_ep"): (
+        "tokenspeed.runtime.layers.moe.backends.mxfp4.triton_kernel_ep",
+        "Mxfp4TritonKernelEPBackend",
+    ),
     ("wna16", "marlin"): (
         "tokenspeed.runtime.layers.moe.backends.wna16.marlin",
         "Wna16MarlinBackend",
