@@ -80,8 +80,9 @@ class W4A8QuarkTritonBackend(MoEBackend):
     ):
         del layer, hidden_states, topk_output, num_global_tokens, max_num_tokens_per_gpu
         raise NotImplementedError(
-            "Quark W4A8 MoE forward is not implemented; "
-            "a gfx950 INT4 x dynamic-8-bit expert kernel must be wired first"
+            "Quark W4A8 MoE expert kernel is not registered for dynamic 8-bit "
+            "activations plus packed INT4 per-channel weights; a gfx950 "
+            "INT4 x dynamic-8-bit expert kernel must be wired first"
         )
 
 

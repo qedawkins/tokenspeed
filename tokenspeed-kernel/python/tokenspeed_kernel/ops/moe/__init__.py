@@ -39,6 +39,7 @@ from tokenspeed_kernel.ops.moe.expert_location_dispatch import (  # noqa: F401
     transform_select_experts_inputs,
 )
 from tokenspeed_kernel.selection import (
+    NoKernelFoundError,
     SelectionOracle,
     register_oracle,
     select_kernel,
@@ -82,6 +83,10 @@ __all__ = [
     "moe_experts",
     "moe_combine",
     "moe_fused",
+    "WEIGHT_W4A8_QUARK",
+    "W4A8_QUARK_MISSING_KERNEL_MESSAGE",
+    "w4a8_quark_experts_format_signature",
+    "select_w4a8_quark_experts_kernel",
 ]
 
 # ---------------------------------------------------------------------------
@@ -100,6 +105,7 @@ WEIGHT_BF16 = "bf16"  # dense bfloat16 weights
 WEIGHT_FP8 = "fp8"  # FP8 block-scaled weights
 WEIGHT_MXFP4 = "mxfp4"  # MXFP4 block-scaled weights
 WEIGHT_NVFP4 = "nvfp4"  # NVFP4 block-scaled weights (CuteDSL)
+WEIGHT_W4A8_QUARK = "quark-w4a8-int4"  # Quark INT4 per-channel weights
 
 # moe/route trait values — used via traits={"output_type": ...}
 ROUTE_OUTPUT_TOPK = "topk"  # returns (topk_weights, topk_ids)
@@ -141,6 +147,14 @@ _MXFP4_SCALE = ScaleFormat(
     storage_dtype=torch.uint8,
     granularity="block",
     block_shape=(32,),
+)
+_W4A8_QUARK_INT4_SCALE = ScaleFormat(
+    storage_dtype=torch.float32,
+    granularity="channel",
+)
+W4A8_QUARK_MISSING_KERNEL_MESSAGE = (
+    "Quark W4A8 MoE expert kernel is not registered for dynamic 8-bit "
+    "activations plus packed INT4 per-channel weights"
 )
 
 
@@ -189,6 +203,42 @@ def _moe_fused_format_signature(
         x = dense_tensor_format(storage_dtype)
 
     return format_signature(x=x, weight=weight)
+
+
+def w4a8_quark_experts_format_signature(
+    dtype: torch.dtype = torch.bfloat16,
+):
+    return format_signature(
+        x=dense_tensor_format(dtype),
+        weight=tensor_format(
+            WEIGHT_W4A8_QUARK,
+            torch.uint8,
+            scale=_W4A8_QUARK_INT4_SCALE,
+        ),
+    )
+
+
+def select_w4a8_quark_experts_kernel(
+    *,
+    dtype: torch.dtype = torch.bfloat16,
+    features: Optional[Set[str]] = None,
+    traits: Optional[dict] = None,
+    expected_kernel_name: Optional[str] = None,
+):
+    signature = w4a8_quark_experts_format_signature(dtype)
+    try:
+        return select_kernel(
+            "moe",
+            "experts",
+            signature,
+            features=frozenset(features) if features else None,
+            traits=traits or {},
+            expected_kernel_name=expected_kernel_name,
+        )
+    except NoKernelFoundError as exc:
+        raise NoKernelFoundError(
+            f"{W4A8_QUARK_MISSING_KERNEL_MESSAGE}: {signature}"
+        ) from exc
 
 
 def moe_route(
