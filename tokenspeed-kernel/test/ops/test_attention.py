@@ -297,10 +297,10 @@ def test_mla_prefill_triton(
     qk_head_dim: int,
     v_head_dim: int,
 ) -> None:
-    q_lens = [3, 2]
-    kv_lens = [4, 3]
-    cu_seqlens_q = torch.tensor([0, 3, 5], device=device, dtype=torch.int32)
-    cu_seqlens_kv = torch.tensor([0, 4, 7], device=device, dtype=torch.int32)
+    q_lens = [853, 1045]
+    kv_lens = [1045, 853]
+    cu_seqlens_q = torch.tensor([0, 853, 1898], device=device, dtype=torch.int32)
+    cu_seqlens_kv = torch.tensor([0, 1045, 1898], device=device, dtype=torch.int32)
     q = torch.randn(sum(q_lens), num_heads, qk_head_dim, device=device, dtype=dtype)
     k = torch.randn(sum(kv_lens), num_heads, qk_head_dim, device=device, dtype=dtype)
     v = torch.randn(sum(kv_lens), num_heads, v_head_dim, device=device, dtype=dtype)
