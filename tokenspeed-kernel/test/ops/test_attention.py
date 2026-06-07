@@ -286,10 +286,12 @@ def test_mha_decode_with_kvcache(
 
 @pytest.mark.parametrize(
     "dtype,num_heads,qk_head_dim,v_head_dim",
-    [(torch.bfloat16, 2, 192, 128)],
+    [(torch.bfloat16, 128, 192, 128)],
 )
+@pytest.mark.parametrize("solution", ["triton"])
 def test_mla_prefill_triton(
     device: str,
+    solution: str,
     dtype: torch.dtype,
     num_heads: int,
     qk_head_dim: int,
@@ -315,7 +317,7 @@ def test_mla_prefill_triton(
         softmax_scale=softmax_scale,
         is_causal=False,
         return_lse=True,
-        solution="triton",
+        solution=solution,
     )
 
     refs = []
@@ -343,10 +345,12 @@ def test_mla_prefill_triton(
 
 @pytest.mark.parametrize(
     "dtype,num_heads,kv_lora_rank,qk_rope_head_dim",
-    [(torch.bfloat16, 3, 16, 8)],
+    [(torch.bfloat16, 128, 512, 64)],
 )
+@pytest.mark.parametrize("solution", ["triton"])
 def test_mla_decode_with_kvcache_triton(
     device: str,
+    solution: str,
     dtype: torch.dtype,
     num_heads: int,
     kv_lora_rank: int,
@@ -390,7 +394,7 @@ def test_mla_decode_with_kvcache_triton(
         qk_rope_head_dim=qk_rope_head_dim,
         softmax_scale=softmax_scale,
         return_lse=True,
-        solution="triton",
+        solution=solution,
     )
 
     refs = []
