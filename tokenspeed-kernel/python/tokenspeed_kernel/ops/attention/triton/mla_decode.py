@@ -26,6 +26,9 @@ from tokenspeed_kernel.platform import CapabilityRequirement
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
+_FP8_DTYPES = frozenset({torch.float8_e4m3fn, torch.float8_e5m2, torch.float8_e4m3fnuz})
+_MLA_DECODE_DTYPES = frozenset({torch.float16, torch.bfloat16}) | _FP8_DTYPES
+
 
 @triton.jit
 def tanh(x):
@@ -253,9 +256,7 @@ def mla_decode_fwd(
     name="triton_mla_decode_with_kvcache",
     solution="triton",
     capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
-    signatures=format_signatures(
-        ("q", "kv_cache"), "dense", {torch.float16, torch.bfloat16}
-    ),
+    signatures=format_signatures(("q", "kv_cache"), "dense", _MLA_DECODE_DTYPES),
     priority=Priority.PORTABLE,
     traits={
         "q_len": frozenset({1}),
@@ -280,11 +281,7 @@ def triton_mla_decode_with_kvcache(
     out: torch.Tensor | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     if out is None:
-        out_dtype = (
-            torch.bfloat16
-            if q.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
-            else q.dtype
-        )
+        out_dtype = torch.bfloat16 if q.dtype in _FP8_DTYPES else q.dtype
         out = torch.empty(
             q.shape[:-1] + (kv_lora_rank,), dtype=out_dtype, device=q.device
         )

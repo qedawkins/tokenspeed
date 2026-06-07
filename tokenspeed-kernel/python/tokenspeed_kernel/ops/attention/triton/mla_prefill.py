@@ -26,6 +26,9 @@ from tokenspeed_kernel.platform import CapabilityRequirement
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
+_FP8_DTYPES = frozenset({torch.float8_e4m3fn, torch.float8_e5m2, torch.float8_e4m3fnuz})
+_MLA_PREFILL_DTYPES = frozenset({torch.float16, torch.bfloat16}) | _FP8_DTYPES
+
 
 @triton.jit
 def tanh(x):
@@ -279,9 +282,7 @@ def mla_prefill_fwd(
     name="triton_mla_prefill",
     solution="triton",
     capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
-    signatures=format_signatures(
-        ("q", "k", "v"), "dense", {torch.float16, torch.bfloat16}
-    ),
+    signatures=format_signatures(("q", "k", "v"), "dense", _MLA_PREFILL_DTYPES),
     priority=Priority.PORTABLE,
     traits={
         "is_causal": frozenset({False, True}),
@@ -307,11 +308,7 @@ def triton_mla_prefill(
     seq_lens_kv: torch.Tensor | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     if out is None:
-        out_dtype = (
-            torch.bfloat16
-            if q.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
-            else q.dtype
-        )
+        out_dtype = torch.bfloat16 if q.dtype in _FP8_DTYPES else q.dtype
         out = torch.empty(
             (q.shape[0], q.shape[1], v.shape[-1]),
             dtype=out_dtype,
