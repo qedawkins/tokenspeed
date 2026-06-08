@@ -119,12 +119,21 @@ def _record_kernel_calls(monkeypatch: pytest.MonkeyPatch) -> dict[str, list[dict
 
 
 def _make_layer(rank: int, world_size: int, device: torch.device):
+    from tokenspeed.runtime.distributed.mapping import Mapping
     from tokenspeed.runtime.layers.moe import utils as moe_utils
     from tokenspeed.runtime.layers.moe.layer import MoELayer
     from tokenspeed.runtime.layers.moe.utils import MoeBackend
     from tokenspeed.runtime.layers.quantization import Mxfp4Config
     from tokenspeed.runtime.utils.env import global_server_args_dict
 
+    mapping = Mapping(
+        rank=rank,
+        world_size=world_size,
+        attn_tp_size=world_size,
+        dense_tp_size=world_size,
+        moe_tp_size=2,
+        moe_ep_size=2,
+    )
     monkey_patch_backend = getattr(moe_utils, "MOE_BACKEND", None)
     moe_utils.MOE_BACKEND = MoeBackend.AUTO
     global_server_args_dict["ep_num_redundant_experts"] = 0
@@ -137,10 +146,10 @@ def _make_layer(rank: int, world_size: int, device: torch.device):
             quant_config=Mxfp4Config(is_checkpoint_mxfp4_serialized=True),
             layer_index=1,
             prefix="language_model.model.layers.1.mlp.experts",
-            tp_rank=rank,
-            tp_size=world_size,
-            ep_rank=rank,
-            ep_size=world_size,
+            tp_rank=mapping.moe.tp_rank,
+            tp_size=mapping.moe.tp_size,
+            ep_rank=mapping.moe.ep_rank,
+            ep_size=mapping.moe.ep_size,
             activation="silu",
             with_bias=True,
         ).to(device)
@@ -150,10 +159,15 @@ def _make_layer(rank: int, world_size: int, device: torch.device):
     return layer
 
 
-def _make_global_weights(device: torch.device) -> dict[str, torch.Tensor]:
+def _make_global_weights(
+    device: torch.device,
+    *,
+    tp_size: int,
+) -> dict[str, torch.Tensor]:
     num_experts = 16
     hidden_size = 64
-    intermediate_per_rank = 32
+    intermediate_size = 128
+    intermediate_per_rank = intermediate_size // tp_size
     gate_up_rows = 2 * intermediate_per_rank
     packed_patterns = torch.tensor([0x11, 0x12, 0x21, 0x22], dtype=torch.uint8)
 
@@ -199,10 +213,21 @@ def _copy_local_weights(layer, global_weights: dict[str, torch.Tensor]) -> None:
         getattr(layer, name).data.copy_(tensor[start:end])
 
 
-def _router_logits(num_tokens: int, rank: int, device: torch.device) -> torch.Tensor:
+def _router_logits(
+    num_tokens: int,
+    rank: int,
+    device: torch.device,
+    *,
+    ep_size: int,
+) -> torch.Tensor:
     num_experts = 16
+    experts_per_owner = num_experts // ep_size
     owner_interleaved = torch.tensor(
-        [0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15],
+        [
+            owner * experts_per_owner + local_id
+            for local_id in range(experts_per_owner)
+            for owner in range(ep_size)
+        ],
         dtype=torch.long,
         device=device,
     )
@@ -303,7 +328,6 @@ def _run_mxfp4_tp_ep_case(
     *,
     num_tokens: int,
     rank: int,
-    world_size: int,
     kernel_calls: MutableMapping[str, list[dict]],
 ) -> None:
     from tokenspeed.runtime.layers.moe.topk import BypassedTopKOutput, TopKConfig
@@ -312,7 +336,12 @@ def _run_mxfp4_tp_ep_case(
     hidden_states = (
         torch.randn(num_tokens, layer.hidden_size, device=layer.w13_weight.device) * 0.05
     ).bfloat16()
-    router_logits = _router_logits(num_tokens, rank, hidden_states.device)
+    router_logits = _router_logits(
+        num_tokens,
+        rank,
+        hidden_states.device,
+        ep_size=layer.ep_size,
+    )
     correction_bias = torch.zeros(layer.num_experts, device=hidden_states.device)
     topk_output = BypassedTopKOutput(
         hidden_states=hidden_states,
@@ -336,7 +365,7 @@ def _run_mxfp4_tp_ep_case(
     actual = layer(
         hidden_states,
         topk_output,
-        num_global_tokens=num_tokens * world_size,
+        num_global_tokens=num_tokens * layer.ep_size,
         max_num_tokens_per_gpu=num_tokens,
     )
     torch.cuda.synchronize()
@@ -378,27 +407,27 @@ def _run_mxfp4_tp_ep_case(
 def test_kimi_mxfp4_tp_ep_synthetic_prefill_decode_matches_reference(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    pytest.importorskip("iris")
+    pytest.importorskip("tokenspeed_kernel.ops.communication.iris")
     rank, world_size, device = _require_four_rank_cdna4_gpu()
     kernel_calls = _record_kernel_calls(monkeypatch)
     layer = _make_layer(rank, world_size, device)
-    global_weights = _make_global_weights(device)
+    global_weights = _make_global_weights(device, tp_size=layer.tp_size)
     _copy_local_weights(layer, global_weights)
 
     assert type(layer.backend).__name__ == "Mxfp4TritonKernelEPBackend"
     assert layer.backend.key.quant == "mxfp4"
     assert layer.backend.key.impl == "triton_kernel_ep"
-    assert layer.tp_rank == rank
-    assert layer.tp_size == 4
-    assert layer.ep_rank == rank
-    assert layer.ep_size == 4
+    assert layer.tp_rank == rank % 2
+    assert layer.tp_size == 2
+    assert layer.ep_rank == rank // 2
+    assert layer.ep_size == 2
     assert layer.top_k == 8
     assert layer.topk_output_format.is_bypassed()
     assert layer.expert_weight_format_signature.name == "mxfp4_e2m1_block32"
-    assert tuple(layer.w13_weight.shape) == (4, 64, 32)
-    assert tuple(layer.w13_weight_scale.shape) == (4, 64, 2)
-    assert tuple(layer.w2_weight.shape) == (4, 64, 16)
-    assert tuple(layer.w2_weight_scale.shape) == (4, 64, 1)
+    assert tuple(layer.w13_weight.shape) == (8, 128, 32)
+    assert tuple(layer.w13_weight_scale.shape) == (8, 128, 2)
+    assert tuple(layer.w2_weight.shape) == (8, 64, 32)
+    assert tuple(layer.w2_weight_scale.shape) == (8, 64, 2)
     assert not hasattr(layer, "w13_weight_triton_tensor")
     assert not hasattr(layer, "w2_weight_triton_tensor")
 
@@ -407,7 +436,6 @@ def test_kimi_mxfp4_tp_ep_synthetic_prefill_decode_matches_reference(
         global_weights,
         num_tokens=5,
         rank=rank,
-        world_size=world_size,
         kernel_calls=kernel_calls,
     )
     _run_mxfp4_tp_ep_case(
@@ -415,13 +443,14 @@ def test_kimi_mxfp4_tp_ep_synthetic_prefill_decode_matches_reference(
         global_weights,
         num_tokens=1,
         rank=rank,
-        world_size=world_size,
         kernel_calls=kernel_calls,
     )
 
     workspace = layer.backend._ep_workspace
     assert workspace is not None
     assert workspace.backend == "iris"
-    assert workspace.world_size == world_size
-    assert workspace.rank == rank
+    assert workspace.world_size == layer.ep_size
+    assert workspace.rank == layer.ep_rank
+    assert workspace.handle.context_rank_start == layer.tp_rank
+    assert workspace.handle.context_rank_stride == layer.tp_size
     dist.barrier()

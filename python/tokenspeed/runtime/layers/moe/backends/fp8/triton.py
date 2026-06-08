@@ -215,7 +215,19 @@ class Fp8TritonBackend(MoEBackend):
             dtype=hidden_states.dtype,
             device=hidden_states.device,
             iris_mode="auto",
+            context_rank_stride=self.spec.tp_size,
         )
+        if workspace.backend != "iris" and (
+            use_self_routing
+            or _has_remote_owner_rows(topk_ids, expert_owner, self.spec.ep_rank)
+        ):
+            from tokenspeed.runtime.layers.moe.backends.ep_workspace import (
+                EPWorkspaceUnavailable,
+            )
+
+            raise EPWorkspaceUnavailable(
+                "Iris-backed EP workspace is required for remote owner rows"
+            )
 
         block_shape = tuple(self.quant_config.weight_block_size)
         fused_metadata = None
@@ -433,6 +445,19 @@ def _expert_ownership_tensors(
         num_local_experts=num_local_experts,
         device=device,
     )
+
+
+def _has_remote_owner_rows(
+    topk_ids: torch.Tensor,
+    expert_owner: torch.Tensor,
+    ep_rank: int,
+) -> bool:
+    flat_topk = topk_ids.reshape(-1)
+    valid = (flat_topk >= 0) & (flat_topk < expert_owner.numel())
+    if not bool(valid.any().item()):
+        return False
+    owners = expert_owner[flat_topk[valid].long()]
+    return bool(owners.ne(ep_rank).any().item())
 
 
 def _is_block_fp8_config(quant_config: object) -> bool:

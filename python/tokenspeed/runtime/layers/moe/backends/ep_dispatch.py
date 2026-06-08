@@ -212,18 +212,23 @@ def prepare_owner_directed_dispatch(
     _validate_owner_expert_metadata(metadata, workspace)
 
     if workspace.world_size > 1 and dist.is_available() and dist.is_initialized():
-        gathered = [torch.empty_like(owner_counts) for _ in range(workspace.world_size)]
+        dist_world_size = dist.get_world_size()
+        context_ranks = _workspace_context_ranks(workspace, dist_world_size)
+        gathered = [torch.empty_like(owner_counts) for _ in range(dist_world_size)]
         dist.all_gather(gathered, owner_counts.contiguous())
-        all_counts = torch.stack(gathered, dim=0)
+        all_counts = torch.stack(gathered, dim=0).index_select(0, context_ranks)
         recv_counts = all_counts[:, workspace.rank].contiguous()
         owner_base_offsets = all_counts[: workspace.rank, :].sum(dim=0).to(torch.int32)
 
         owner_expert_counts = metadata.owner_expert_counts.contiguous()
         expert_gathered = [
-            torch.empty_like(owner_expert_counts) for _ in range(workspace.world_size)
+            torch.empty_like(owner_expert_counts) for _ in range(dist_world_size)
         ]
         dist.all_gather(expert_gathered, owner_expert_counts)
-        all_expert_counts = torch.stack(expert_gathered, dim=0)
+        all_expert_counts = torch.stack(expert_gathered, dim=0).index_select(
+            0,
+            context_ranks,
+        )
         owner_expert_base_offsets = all_expert_counts[: workspace.rank].sum(dim=0).to(
             torch.int32
         )
@@ -311,6 +316,26 @@ def _dispatch_with_iris_gluon(
         max(block_n // 64, 1),
         num_warps=1,
     )
+
+
+def _workspace_context_ranks(
+    workspace: EPCommunicationWorkspace,
+    dist_world_size: int,
+) -> torch.Tensor:
+    context_ranks = (
+        torch.arange(workspace.world_size, device=workspace.device, dtype=torch.long)
+        * workspace.handle.context_rank_stride
+        + workspace.handle.context_rank_start
+    )
+    if bool(context_ranks.ge(dist_world_size).any().item()):
+        raise EPWorkspaceError(
+            "EP workspace subgroup ranks exceed distributed world size: "
+            f"start={workspace.handle.context_rank_start}, "
+            f"stride={workspace.handle.context_rank_stride}, "
+            f"world_size={workspace.world_size}, "
+            f"distributed_world_size={dist_world_size}"
+        )
+    return context_ranks
 
 
 def _dispatch_local_torch(

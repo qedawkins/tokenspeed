@@ -138,6 +138,8 @@ class MoEBackend(ABC):
         device: torch.device | str | None = None,
         iris_mode: str = "auto",
         iris_context: Any | None = None,
+        context_rank_start: int | None = None,
+        context_rank_stride: int = 1,
     ):
         from tokenspeed.runtime.layers.moe.backends.ep_workspace import (
             EPCommunicationWorkspace,
@@ -152,6 +154,8 @@ class MoEBackend(ABC):
             requested_device=requested_device,
             iris_mode=iris_mode,
             iris_context=iris_context,
+            context_rank_start=context_rank_start,
+            context_rank_stride=context_rank_stride,
         )
         if shared_key is not None:
             workspace = _SHARED_IRIS_EP_WORKSPACES.get(shared_key)
@@ -161,6 +165,8 @@ class MoEBackend(ABC):
             spec=self.spec,
             dtype=dtype,
             requested_device=requested_device,
+            context_rank_start=context_rank_start,
+            context_rank_stride=context_rank_stride,
         ):
             self._ep_workspace = workspace
             return workspace
@@ -175,6 +181,8 @@ class MoEBackend(ABC):
             device=device,
             iris_mode=iris_mode,
             iris_context=iris_context,
+            context_rank_start=context_rank_start,
+            context_rank_stride=context_rank_stride,
         )
         if shared_key is not None and workspace.backend == "iris":
             _SHARED_IRIS_EP_WORKSPACES[shared_key] = workspace
@@ -234,6 +242,8 @@ def _shared_iris_ep_workspace_key(
     requested_device: torch.device | None,
     iris_mode: str,
     iris_context: Any | None,
+    context_rank_start: int | None,
+    context_rank_stride: int,
 ) -> tuple[object, ...] | None:
     if iris_context is not None or iris_mode == "disabled":
         return None
@@ -250,6 +260,8 @@ def _shared_iris_ep_workspace_key(
         backend.spec.top_k,
         backend.spec.ep_size,
         backend.spec.ep_rank,
+        context_rank_start,
+        context_rank_stride,
         dtype,
         requested_device.type,
         requested_device.index,
@@ -263,14 +275,23 @@ def _can_reuse_ep_workspace(
     spec: MoELayerSpec,
     dtype: torch.dtype,
     requested_device: torch.device | None,
+    context_rank_start: int | None,
+    context_rank_stride: int,
 ) -> bool:
+    if workspace is None:
+        return False
+    existing_start = workspace.handle.context_rank_start
+    requested_start_matches = (
+        context_rank_start is None or existing_start == context_rank_start
+    )
     return (
-        workspace is not None
-        and workspace.max_dispatch_rows >= requested_rows
+        workspace.max_dispatch_rows >= requested_rows
         and workspace.hidden_size == spec.hidden_size
         and workspace.top_k == spec.top_k
         and workspace.world_size == spec.ep_size
         and workspace.rank == spec.ep_rank
         and workspace.dtype == dtype
+        and requested_start_matches
+        and workspace.handle.context_rank_stride == context_rank_stride
         and (requested_device is None or workspace.device == requested_device)
     )

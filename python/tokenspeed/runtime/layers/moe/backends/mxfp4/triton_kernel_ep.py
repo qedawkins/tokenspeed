@@ -153,7 +153,20 @@ class Mxfp4TritonKernelEPBackend(Mxfp4TritonKernelBackend):
             dtype=hidden_states.dtype,
             device=hidden_states.device,
             iris_mode="auto",
+            context_rank_stride=self.spec.tp_size,
         )
+        if workspace.backend != "iris" and _has_remote_owner_rows(
+            topk_ids,
+            expert_owner,
+            self.spec.ep_rank,
+        ):
+            from tokenspeed.runtime.layers.moe.backends.ep_workspace import (
+                EPWorkspaceUnavailable,
+            )
+
+            raise EPWorkspaceUnavailable(
+                "Iris-backed EP workspace is required for remote owner rows"
+            )
 
         if self._swiglu_arg is None:
             swiglu_alpha = 1.0
@@ -199,6 +212,19 @@ def _is_bypassed_topk_output(topk_output: object) -> bool:
     output_format = getattr(topk_output, "format", None)
     is_bypassed = getattr(output_format, "is_bypassed", None)
     return is_bypassed is not None and is_bypassed()
+
+
+def _has_remote_owner_rows(
+    topk_ids: torch.Tensor,
+    expert_owner: torch.Tensor,
+    ep_rank: int,
+) -> bool:
+    flat_topk = topk_ids.reshape(-1)
+    valid = (flat_topk >= 0) & (flat_topk < expert_owner.numel())
+    if not bool(valid.any().item()):
+        return False
+    owners = expert_owner[flat_topk[valid].long()]
+    return bool(owners.ne(ep_rank).any().item())
 
 
 __all__ = ["Mxfp4TritonKernelEPBackend"]

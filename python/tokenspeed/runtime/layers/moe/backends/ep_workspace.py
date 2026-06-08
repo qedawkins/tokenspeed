@@ -51,6 +51,8 @@ class EPWorkspaceHandle:
     backend: EPWorkspaceBackend
     rank: int
     world_size: int
+    context_rank_start: int = 0
+    context_rank_stride: int = 1
     heap_bases: torch.Tensor | None = None
     device_context: torch.Tensor | None = None
 
@@ -99,6 +101,8 @@ class EPCommunicationWorkspace:
         iris_mode: EPWorkspaceIrisMode = "auto",
         iris_context: Any | None = None,
         iris_heap_size: int = 1 << 30,
+        context_rank_start: int | None = None,
+        context_rank_stride: int = 1,
     ) -> "EPCommunicationWorkspace":
         if max_tokens_per_rank < 0:
             raise EPWorkspaceError(
@@ -110,6 +114,10 @@ class EPCommunicationWorkspace:
             raise EPWorkspaceError(f"top_k must be positive, got {top_k}")
         if iris_mode not in {"auto", "required", "disabled"}:
             raise EPWorkspaceError(f"invalid iris_mode {iris_mode!r}")
+        if context_rank_stride <= 0:
+            raise EPWorkspaceError(
+                f"context_rank_stride must be positive, got {context_rank_stride}"
+            )
 
         iris_context = _resolve_iris_context(
             iris_mode=iris_mode,
@@ -123,17 +131,31 @@ class EPCommunicationWorkspace:
             ctx_world_size = int(iris_context.get_num_ranks())
             if rank is None:
                 rank = ctx_rank
-            elif rank != ctx_rank:
+            elif rank < 0:
                 raise EPWorkspaceError(
-                    f"rank {rank} does not match Iris rank {ctx_rank}"
+                    f"rank must be non-negative, got {rank}"
                 )
             if world_size is None:
                 world_size = ctx_world_size
-            elif world_size != ctx_world_size:
+            elif world_size <= 0 or world_size > ctx_world_size:
                 raise EPWorkspaceError(
-                    f"world_size {world_size} does not match Iris world size "
+                    f"world_size {world_size} is not a valid Iris subgroup of "
                     f"{ctx_world_size}"
                 )
+            if rank >= world_size:
+                raise EPWorkspaceError(
+                    f"rank must be in [0, {world_size}), got {rank}"
+                )
+            if context_rank_start is None:
+                context_rank_start = ctx_rank - rank * context_rank_stride
+            _validate_context_rank_mapping(
+                context_rank_start=context_rank_start,
+                context_rank_stride=context_rank_stride,
+                rank=rank,
+                world_size=world_size,
+                ctx_rank=ctx_rank,
+                ctx_world_size=ctx_world_size,
+            )
             device = torch.device(iris_context.get_device())
         else:
             backend = "torch"
@@ -141,6 +163,8 @@ class EPCommunicationWorkspace:
                 world_size = 1
             if rank is None:
                 rank = 0
+            if context_rank_start is None:
+                context_rank_start = 0
             device = _normalize_device(device)
 
         _validate_rank_world_size(rank=rank, world_size=world_size)
@@ -175,12 +199,23 @@ class EPCommunicationWorkspace:
             device=device,
             iris_context=iris_context,
         )
+        heap_bases = _maybe_call(iris_context, "get_heap_bases")
+        device_context = _make_ep_device_context(
+            iris_context=iris_context,
+            heap_bases=heap_bases,
+            rank=rank,
+            world_size=world_size,
+            context_rank_start=context_rank_start,
+            context_rank_stride=context_rank_stride,
+        )
         handle = EPWorkspaceHandle(
             backend=backend,
             rank=rank,
             world_size=world_size,
-            heap_bases=_maybe_call(iris_context, "get_heap_bases"),
-            device_context=_maybe_call(iris_context, "get_device_context"),
+            context_rank_start=context_rank_start,
+            context_rank_stride=context_rank_stride,
+            heap_bases=heap_bases,
+            device_context=device_context,
         )
         return cls(
             max_tokens_per_rank=max_tokens_per_rank,
@@ -355,6 +390,71 @@ def _validate_rank_world_size(*, rank: int, world_size: int) -> None:
         raise EPWorkspaceError(f"world_size must be positive, got {world_size}")
     if rank < 0 or rank >= world_size:
         raise EPWorkspaceError(f"rank must be in [0, {world_size}), got {rank}")
+
+
+def _validate_context_rank_mapping(
+    *,
+    context_rank_start: int,
+    context_rank_stride: int,
+    rank: int,
+    world_size: int,
+    ctx_rank: int,
+    ctx_world_size: int,
+) -> None:
+    if context_rank_start < 0:
+        raise EPWorkspaceError(
+            f"context_rank_start must be non-negative, got {context_rank_start}"
+        )
+    last_context_rank = context_rank_start + (world_size - 1) * context_rank_stride
+    if last_context_rank >= ctx_world_size:
+        raise EPWorkspaceError(
+            "Iris subgroup ranks exceed context world size: "
+            f"start={context_rank_start}, stride={context_rank_stride}, "
+            f"world_size={world_size}, context_world_size={ctx_world_size}"
+        )
+    expected_ctx_rank = context_rank_start + rank * context_rank_stride
+    if expected_ctx_rank != ctx_rank:
+        raise EPWorkspaceError(
+            f"rank {rank} maps to Iris rank {expected_ctx_rank}, "
+            f"but context rank is {ctx_rank}"
+        )
+
+
+def _make_ep_device_context(
+    *,
+    iris_context: Any | None,
+    heap_bases: torch.Tensor | None,
+    rank: int,
+    world_size: int,
+    context_rank_start: int,
+    context_rank_stride: int,
+) -> torch.Tensor | None:
+    if iris_context is None:
+        return None
+    full_device_context = _maybe_call(iris_context, "get_device_context")
+    if heap_bases is None or full_device_context is None:
+        return full_device_context
+    full_world_size = int(heap_bases.numel())
+    if (
+        rank == int(iris_context.get_rank())
+        and world_size == full_world_size
+        and context_rank_start == 0
+        and context_rank_stride == 1
+    ):
+        return full_device_context
+    context_ranks = (
+        torch.arange(world_size, device=heap_bases.device, dtype=torch.long)
+        * context_rank_stride
+        + context_rank_start
+    )
+    selected_heap_bases = heap_bases.index_select(0, context_ranks)
+    device_context = full_device_context.clone()
+    device_context[0] = rank
+    device_context[1] = world_size
+    device_context[2 : 2 + world_size] = selected_heap_bases.to(
+        full_device_context.dtype
+    )
+    return device_context
 
 
 def _empty(

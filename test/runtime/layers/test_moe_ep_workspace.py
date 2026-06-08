@@ -245,10 +245,57 @@ def test_ep_workspace_uses_injected_iris_context_without_exposing_iris_type() ->
     assert workspace.rank == 1
     assert workspace.world_size == 2
     assert workspace.handle.backend == "iris"
+    assert workspace.handle.context_rank_start == 0
+    assert workspace.handle.context_rank_stride == 1
     assert workspace.handle.heap_bases is fake_iris.heap_bases
     assert workspace.handle.device_context is fake_iris.device_context
     workspace.barrier()
     assert fake_iris.barrier_count == 1
+
+
+def test_ep_workspace_supports_tp_strided_iris_subgroup() -> None:
+    fake_iris = _FakeIrisContext(rank=3, world_size=4)
+    workspace = EPCommunicationWorkspace.allocate(
+        max_tokens_per_rank=2,
+        hidden_size=4,
+        top_k=2,
+        world_size=2,
+        rank=1,
+        dtype=torch.float32,
+        iris_mode="required",
+        iris_context=fake_iris,
+        context_rank_stride=2,
+    )
+
+    assert workspace.backend == "iris"
+    assert workspace.rank == 1
+    assert workspace.world_size == 2
+    assert workspace.handle.context_rank_start == 1
+    assert workspace.handle.context_rank_stride == 2
+    assert workspace.handle.device_context is not None
+    assert workspace.handle.device_context[:2].tolist() == [1, 2]
+    assert torch.equal(
+        workspace.handle.device_context[2:4],
+        fake_iris.heap_bases[[1, 3]],
+    )
+
+
+def test_ep_workspace_rejects_invalid_iris_subgroup_mapping() -> None:
+    fake_iris = _FakeIrisContext(rank=2, world_size=4)
+
+    with pytest.raises(EPWorkspaceError, match="maps to Iris rank"):
+        EPCommunicationWorkspace.allocate(
+            max_tokens_per_rank=2,
+            hidden_size=4,
+            top_k=2,
+            world_size=2,
+            rank=1,
+            dtype=torch.float32,
+            iris_mode="required",
+            iris_context=fake_iris,
+            context_rank_start=1,
+            context_rank_stride=2,
+        )
 
 
 def test_moe_backend_reuses_ep_workspace_until_capacity_grows() -> None:
@@ -339,6 +386,10 @@ def test_moe_backend_reuses_shared_auto_iris_workspace_across_instances(
             rank=kwargs["rank"],
             dtype=kwargs["dtype"],
             device=torch.device("cuda:0"),
+            handle=SimpleNamespace(
+                context_rank_start=kwargs.get("context_rank_start") or 0,
+                context_rank_stride=kwargs.get("context_rank_stride", 1),
+            ),
         )
 
     monkeypatch.setattr(
@@ -416,6 +467,10 @@ def test_moe_backend_does_not_cache_non_iris_auto_workspace(monkeypatch) -> None
             rank=kwargs["rank"],
             dtype=kwargs["dtype"],
             device=torch.device("cuda:0"),
+            handle=SimpleNamespace(
+                context_rank_start=kwargs.get("context_rank_start") or 0,
+                context_rank_stride=kwargs.get("context_rank_stride", 1),
+            ),
         )
 
     monkeypatch.setattr(
