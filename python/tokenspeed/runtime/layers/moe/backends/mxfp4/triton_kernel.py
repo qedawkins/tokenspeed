@@ -188,10 +188,18 @@ class Mxfp4TritonKernelBackend(MoEBackend):
 
         MXFP_BLOCK_SIZE = 32
 
-        w13_weight_bias = layer.w13_weight_bias.to(torch.float32)
-        w2_weight_bias = layer.w2_weight_bias.to(torch.float32)
-        layer.w13_weight_bias = Parameter(w13_weight_bias, requires_grad=False)
-        layer.w2_weight_bias = Parameter(w2_weight_bias, requires_grad=False)
+        w13_weight_bias = getattr(layer, "w13_weight_bias", None)
+        if w13_weight_bias is not None:
+            layer.w13_weight_bias = Parameter(
+                w13_weight_bias.to(torch.float32),
+                requires_grad=False,
+            )
+        w2_weight_bias = getattr(layer, "w2_weight_bias", None)
+        if w2_weight_bias is not None:
+            layer.w2_weight_bias = Parameter(
+                w2_weight_bias.to(torch.float32),
+                requires_grad=False,
+            )
 
         num_warps = 8
         w13_weight, w13_flex, w13_scale = swizzle_mxfp4(

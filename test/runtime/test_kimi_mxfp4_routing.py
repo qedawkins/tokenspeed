@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -15,7 +16,10 @@ from tokenspeed.runtime.layers.moe.backends.mxfp4.routing import (
 
 
 def _require_cdna4_gpu() -> None:
-    from tokenspeed_kernel.platform import current_platform
+    try:
+        from tokenspeed_kernel.platform import current_platform
+    except (ImportError, RuntimeError):
+        pytest.skip("AMD CDNA4 GPU is required for the MXFP4 routing capture test")
 
     if not torch.cuda.is_available() or not current_platform().is_cdna4_plus:
         pytest.skip("AMD CDNA4 GPU is required for the MXFP4 routing capture test")
@@ -295,3 +299,40 @@ def test_topk_to_ragged_metadata_rejects_bad_ids() -> None:
             num_experts=5,
             metadata_factory=_metadata_factory,
         )
+
+
+def test_topk_to_ragged_metadata_skips_host_range_check_during_capture(
+    monkeypatch,
+) -> None:
+    monkeypatch.setitem(
+        sys.modules,
+        "tokenspeed.runtime.execution.cuda_graph_wrapper",
+        SimpleNamespace(get_is_capture_mode=lambda: True),
+    )
+
+    def fail_validation(*_args, **_kwargs):
+        raise AssertionError("range validation must not run during graph capture")
+
+    monkeypatch.setattr(routing_module, "_validate_topk_id_range", fail_validation)
+
+    def fail_bincount(*_args, **_kwargs):
+        raise AssertionError("torch.bincount must not run during graph capture")
+
+    monkeypatch.setattr(torch, "bincount", fail_bincount)
+
+    topk_ids = torch.tensor([[2, 0], [1, 2]], dtype=torch.int32)
+    topk_weights = torch.tensor([[0.7, 0.3], [0.6, 0.4]], dtype=torch.float32)
+
+    metadata, gather_indx, scatter_indx, gate_scal = topk_to_ragged_metadata(
+        topk_ids,
+        topk_weights,
+        num_experts=3,
+        metadata_factory=_metadata_factory,
+    )
+
+    flat_ids = topk_ids.reshape(-1).long()
+    sort_order = torch.argsort(flat_ids, stable=True)
+    assert torch.equal(metadata.col_sum, torch.tensor([1, 1, 2], dtype=torch.int32))
+    assert torch.equal(gather_indx, (sort_order // topk_ids.shape[1]).to(torch.int32))
+    assert torch.equal(scatter_indx, sort_order.to(torch.int32))
+    torch.testing.assert_close(gate_scal, topk_weights.reshape(-1)[sort_order])

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import sys
+from contextlib import nullcontext
 from types import ModuleType, SimpleNamespace
 
 import pytest
@@ -60,6 +61,14 @@ class _StubObject:
             setattr(self, key, value)
 
 
+class _StubEnvValue:
+    def __init__(self, value: object = False) -> None:
+        self.value = value
+
+    def get(self) -> object:
+        return self.value
+
+
 class _FakeLayout:
     @staticmethod
     def make_default_matmul_mxfp4_w_layout(**_kwargs: object) -> object:
@@ -96,6 +105,7 @@ def _install_cpu_safe_kernel_surface(monkeypatch: pytest.MonkeyPatch) -> None:
     fake_platform = SimpleNamespace(
         arch_version=SimpleNamespace(major=9, minor=50),
         is_amd=True,
+        is_nvidia=False,
         is_blackwell=False,
         is_hopper=False,
         is_cdna4=True,
@@ -109,6 +119,10 @@ def _install_cpu_safe_kernel_surface(monkeypatch: pytest.MonkeyPatch) -> None:
     kernel.quantize_fp8 = _not_called
     kernel.quantize_mxfp4 = _not_called
     monkeypatch.setitem(sys.modules, "tokenspeed_kernel", kernel)
+
+    triton_redirect = ModuleType("tokenspeed_kernel._triton")
+    triton_redirect.redirect_triton_to_tokenspeed_triton = nullcontext
+    monkeypatch.setitem(sys.modules, "tokenspeed_kernel._triton", triton_redirect)
 
     platform = ModuleType("tokenspeed_kernel.platform")
     platform.current_platform = lambda: fake_platform
@@ -199,6 +213,10 @@ def _install_cpu_safe_kernel_surface(monkeypatch: pytest.MonkeyPatch) -> None:
 
     env = ModuleType("tokenspeed.runtime.utils.env")
     env.global_server_args_dict = {"ep_num_redundant_experts": 0}
+    env.envs = SimpleNamespace(
+        TOKENSPEED_MOE_PADDING=_StubEnvValue(False),
+        TOKENSPEED_NVTX=_StubEnvValue(False),
+    )
     monkeypatch.setitem(sys.modules, "tokenspeed.runtime.utils.env", env)
 
 
@@ -298,6 +316,39 @@ def test_kimi_mxfp4_local_tp_selects_packed_moe_backend(
     assert layer.w2_weight.dtype == torch.uint8
     assert hasattr(layer.w13_weight, "weight_loader")
     assert hasattr(layer.w2_weight_scale, "weight_loader")
+
+
+def test_kimi_mxfp4_local_tp_process_weights_allows_missing_bias(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_cpu_safe_kernel_surface(monkeypatch)
+    from tokenspeed.runtime.layers.moe import utils as moe_utils
+    from tokenspeed.runtime.layers.moe.backends import _REGISTERED
+    from tokenspeed.runtime.layers.moe.core import registry
+    from tokenspeed.runtime.layers.moe.core.selector import select_backend
+    from tokenspeed.runtime.layers.moe.utils import MoeBackend
+
+    _REGISTERED.clear()
+    registry._REGISTRY.clear()
+    monkeypatch.setattr(moe_utils, "MOE_BACKEND", MoeBackend.AUTO)
+
+    backend = select_backend(
+        _tp4_spec(),
+        _FakeMxfp4Config(is_checkpoint_mxfp4_serialized=True),
+    )
+    layer = nn.Module()
+    layer.activation = "silu"
+    backend.create_layer_weights(layer, with_bias=False)
+
+    assert not hasattr(layer, "w13_weight_bias")
+    assert not hasattr(layer, "w2_weight_bias")
+
+    backend.process_weights_after_loading(layer)
+
+    assert not hasattr(layer, "w13_weight_bias")
+    assert not hasattr(layer, "w2_weight_bias")
+    assert hasattr(layer, "w13_weight_triton_tensor")
+    assert hasattr(layer, "w2_weight_triton_tensor")
 
 
 def test_kimi_mxfp4_tp_ep_selects_ep_backend(

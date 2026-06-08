@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import sys
 from collections.abc import Callable
 from typing import Any
 
@@ -265,14 +266,9 @@ def topk_to_ragged_metadata(
         raise ValueError(f"num_experts must be positive, got {num_experts}")
 
     flat_ids = topk_ids.reshape(-1).to(torch.long)
-    if flat_ids.numel() > 0:
-        min_id = int(flat_ids.min().item())
-        max_id = int(flat_ids.max().item())
-        if min_id < 0 or max_id >= num_experts:
-            raise ValueError(
-                f"topk_ids must be in [0, {num_experts}), got range "
-                f"[{min_id}, {max_id}]"
-            )
+    is_capture_mode = _get_is_capture_mode()
+    if flat_ids.numel() > 0 and not is_capture_mode:
+        _validate_topk_id_range(flat_ids, num_experts)
 
     sort_order = torch.argsort(flat_ids, stable=True)
     top_k = topk_ids.shape[1]
@@ -282,9 +278,55 @@ def topk_to_ragged_metadata(
     if gate_dtype is not None and gate_scal.dtype != gate_dtype:
         gate_scal = gate_scal.to(gate_dtype)
 
-    col_sum = torch.bincount(flat_ids, minlength=num_experts).to(torch.int32)
+    col_sum = _count_topk_ids(
+        flat_ids,
+        num_experts=num_experts,
+        use_capture_safe_path=is_capture_mode,
+    )
     ragged_metadata = metadata_factory(col_sum, topk_ids.numel())
     return ragged_metadata, gather_indx, scatter_indx, gate_scal
+
+
+def _count_topk_ids(
+    flat_ids: torch.Tensor,
+    *,
+    num_experts: int,
+    use_capture_safe_path: bool,
+) -> torch.Tensor:
+    if not use_capture_safe_path:
+        return torch.bincount(flat_ids, minlength=num_experts).to(torch.int32)
+
+    col_sum = torch.zeros(
+        num_experts,
+        device=flat_ids.device,
+        dtype=torch.int32,
+    )
+    if flat_ids.numel() > 0:
+        col_sum.scatter_add_(
+            0,
+            flat_ids,
+            torch.ones_like(flat_ids, dtype=torch.int32),
+        )
+    return col_sum
+
+
+def _validate_topk_id_range(flat_ids: torch.Tensor, num_experts: int) -> None:
+    min_id = int(flat_ids.min().item())
+    max_id = int(flat_ids.max().item())
+    if min_id < 0 or max_id >= num_experts:
+        raise ValueError(
+            f"topk_ids must be in [0, {num_experts}), got range "
+            f"[{min_id}, {max_id}]"
+        )
+
+
+def _get_is_capture_mode() -> bool:
+    cuda_graph_wrapper = sys.modules.get(
+        "tokenspeed.runtime.execution.cuda_graph_wrapper"
+    )
+    if cuda_graph_wrapper is None:
+        return False
+    return bool(cuda_graph_wrapper.get_is_capture_mode())
 
 
 def _stable_descending_topk_ids(
