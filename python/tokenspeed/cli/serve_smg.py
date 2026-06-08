@@ -54,6 +54,7 @@ DEEPSEEK_V4_REASONING_PARSER = "deepseek_v31"
 DEEPSEEK_V4_TOOL_CALL_PARSER = "deepseek_v4"
 DEFAULT_SMG_LOG_LEVEL = "warn"
 DEFAULT_SMG_PROMETHEUS_PORT = 8413
+DEFAULT_SMG_HEALTH_CHECK_TIMEOUT_SECS = 30
 # smg reliability knobs we always want disabled when launched under
 # ts serve. These are tokenspeed-internal defaults: not surfaced via
 # the ts CLI, not routed through split_argv.
@@ -179,6 +180,20 @@ def _gateway_args_with_default_prometheus_port(gateway_args: list[str]) -> list[
     return [*gateway_args, "--prometheus-port", str(DEFAULT_SMG_PROMETHEUS_PORT)]
 
 
+def _gateway_args_with_default_health_check_timeout(
+    gateway_args: list[str],
+) -> list[str]:
+    """Give slow TokenSpeed health probes enough time during SMG startup."""
+
+    if "--health-check-timeout-secs" in gateway_args:
+        return gateway_args
+    return [
+        *gateway_args,
+        "--health-check-timeout-secs",
+        str(DEFAULT_SMG_HEALTH_CHECK_TIMEOUT_SECS),
+    ]
+
+
 def _user_model_id(gateway_args: list[str]) -> str | None:
     """Return the value of ``--model`` from a split gateway argv, or ``None``."""
     try:
@@ -277,6 +292,7 @@ def _gateway_args_with_defaults(gateway_args: list[str]) -> list[str]:
     gateway_args = _gateway_args_with_default_reasoning_parser(gateway_args)
     gateway_args = _gateway_args_with_smg_disable_defaults(gateway_args)
     gateway_args = _gateway_args_with_default_tokenizer_cache(gateway_args)
+    gateway_args = _gateway_args_with_default_health_check_timeout(gateway_args)
     gateway_args = _gateway_args_with_default_log_level(gateway_args)
     return _gateway_args_with_default_prometheus_port(gateway_args)
 
