@@ -179,6 +179,49 @@ def test_kimi_mxfp4_shared_and_dense_contracts_are_tp_only() -> None:
     )
 
 
+def test_kimi_mxfp4_routed_contract_supports_ep_only_moe_tp() -> None:
+    contract = build_kimi_mxfp4_sharding_contract(
+        quark_kimi_mxfp4_model_config(),
+        tp_size=4,
+        ep_size=4,
+        tp_rank=3,
+        ep_rank=3,
+        moe_tp_size=1,
+        moe_tp_rank=0,
+    )
+
+    assert contract.tp_size == 4
+    assert contract.tp_rank == 3
+    assert contract.routed_tp_size == 1
+    assert contract.routed_tp_rank == 0
+    assert contract.routed_ownership.global_expert_start == 288
+    assert contract.routed_ownership.global_expert_end == 384
+
+    assert contract.routed.rank_local_w13_weight_shape == (96, 4096, 3584)
+    assert contract.routed.rank_local_w13_scale_shape == (96, 4096, 224)
+    assert contract.routed.rank_local_w2_weight_shape == (96, 7168, 1024)
+    assert contract.routed.rank_local_w2_scale_shape == (96, 7168, 64)
+    assert contract.routed.gate_proj.checkpoint_weight_slice == (
+        (0, 2048),
+        (0, 3584),
+    )
+    assert contract.routed.up_proj.destination_weight_slice == (
+        (2048, 4096),
+        (0, 3584),
+    )
+    assert contract.routed.down_proj.checkpoint_weight_slice == (
+        (0, 7168),
+        (0, 1024),
+    )
+    assert contract.routed.down_proj.checkpoint_scale_slice == (
+        (0, 7168),
+        (0, 64),
+    )
+
+    assert contract.shared.rank_local_w13_weight_shape == (1024, 3584)
+    assert contract.dense.rank_local_w13_weight_shape == (9216, 3584)
+
+
 def test_kimi_mxfp4_contract_rejects_non_mxfp4_metadata() -> None:
     with pytest.raises(ValueError, match="Quark dynamic-FP4 MXFP4"):
         build_kimi_mxfp4_sharding_contract(quark_kimi_w8a8_model_config())
@@ -211,4 +254,10 @@ def test_kimi_mxfp4_contract_rejects_invalid_ranks() -> None:
         build_kimi_mxfp4_sharding_contract(
             quark_kimi_mxfp4_model_config(),
             ep_rank=4,
+        )
+    with pytest.raises(ValueError, match="MoE TP rank"):
+        build_kimi_mxfp4_sharding_contract(
+            quark_kimi_mxfp4_model_config(),
+            moe_tp_size=1,
+            moe_tp_rank=1,
         )

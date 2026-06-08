@@ -72,6 +72,10 @@ class Mxfp4TritonKernelEPBackend(Mxfp4TritonKernelBackend):
     def topk_output_format(self) -> TopKOutputFormat:
         return TopKOutputFormat.BYPASSED
 
+    @property
+    def returns_replicated_routed_output(self) -> bool:
+        return True
+
     def process_weights_after_loading(self, layer) -> None:
         self._activation = layer.activation
         self._swiglu_arg = getattr(layer, "swiglu_arg", None)
@@ -151,8 +155,14 @@ class Mxfp4TritonKernelEPBackend(Mxfp4TritonKernelBackend):
             iris_mode="auto",
         )
 
-        swiglu_alpha = self._swiglu_arg.alpha if self._swiglu_arg else 1.702
-        swiglu_limit = self._swiglu_arg.limit if self._swiglu_arg else 7.0
+        if self._swiglu_arg is None:
+            swiglu_alpha = 1.0
+            swiglu_limit = None
+            swiglu_beta = None
+        else:
+            swiglu_alpha = self._swiglu_arg.alpha
+            swiglu_limit = self._swiglu_arg.limit
+            swiglu_beta = getattr(layer, "swiglu_beta", None)
         gate_up_result = dispatch_mxfp4_hidden_states_gate_up(
             hidden_states,
             topk_ids,
@@ -164,6 +174,7 @@ class Mxfp4TritonKernelEPBackend(Mxfp4TritonKernelBackend):
             bias=getattr(layer, "w13_weight_bias", None),
             swiglu_alpha=swiglu_alpha,
             swiglu_limit=swiglu_limit,
+            swiglu_beta=swiglu_beta,
             output_dtype=hidden_states.dtype,
         )
         return mxfp4_ep_down_gemm_combine(

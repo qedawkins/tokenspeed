@@ -315,6 +315,7 @@ def _resolve_iris_context(
         return None
 
     try:
+        _ensure_tokenspeed_iris_bridge()
         import iris
     except ImportError as exc:
         if iris_mode == "required":
@@ -322,6 +323,12 @@ def _resolve_iris_context(
         return None
 
     return iris.iris(heap_size=iris_heap_size)
+
+
+def _ensure_tokenspeed_iris_bridge() -> None:
+    """Load Iris through TokenSpeed's Triton bridge before EP kernels compile."""
+
+    import tokenspeed_kernel.ops.communication.iris  # noqa: F401
 
 
 def _should_auto_create_iris(device: torch.device | str | None) -> bool:

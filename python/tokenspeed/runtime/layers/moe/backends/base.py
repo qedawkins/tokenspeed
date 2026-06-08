@@ -111,6 +111,16 @@ class MoEBackend(ABC):
         return False
 
     @property
+    def returns_replicated_routed_output(self) -> bool:
+        """Whether finalized routed output follows replicated input placement.
+
+        Some owner-directed EP backends combine expert results back to every
+        source rank. If the surrounding model uses post-MoE all-reduce mode,
+        callers must make that routed branch partial before the all-reduce.
+        """
+        return False
+
+    @property
     def topk_output_format(self):
         from tokenspeed.runtime.layers.moe.topk import TopKOutputFormat
 

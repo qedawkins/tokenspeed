@@ -47,6 +47,7 @@ from tokenspeed.runtime.layers.moe.backends.mxfp4.activation import (
     MXFP4_ACTIVATION_SCALE_LAYOUT,
     quantize_mxfp4_activation,
 )
+from tokenspeed.runtime.layers.moe.backends.mxfp4.experts import kimi_swiglu_gate_up
 from tokenspeed.runtime.layers.moe.backends.mxfp4.routing import (
     is_kimi_sigmoid_noaux_topk_config,
     mxfp4_kimi_sigmoid_ragged_route_from_bypassed,
@@ -295,13 +296,13 @@ class Mxfp4TritonKernelBackend(MoEBackend):
         w13_pc = getattr(layer, "w13_precision_config", None)
         w2_pc = getattr(layer, "w2_precision_config", None)
 
-        gemm1_alpha = self._swiglu_arg.alpha if self._swiglu_arg else 1.702
-        gemm1_clamp = self._swiglu_arg.limit if self._swiglu_arg else 7.0
-
-        act = FusedActivation(
-            FnSpecs("swiglu", swiglu_fn, ("alpha", "limit"), reduction_n=2),
-            (gemm1_alpha, gemm1_clamp),
-        )
+        if self._swiglu_arg is None:
+            act = None
+        else:
+            act = FusedActivation(
+                FnSpecs("swiglu", swiglu_fn, ("alpha", "limit"), reduction_n=2),
+                (self._swiglu_arg.alpha, self._swiglu_arg.limit),
+            )
 
         if self._is_w4a8_fp8:
             gemm1_input = tokenspeed_kernel.quantize_fp8(
@@ -321,7 +322,8 @@ class Mxfp4TritonKernelBackend(MoEBackend):
             gemm1_input = hidden_states
             gemm1_dtype = hidden_states.dtype
 
-        # First GEMM: gate_up projection with fused activation
+        # First GEMM: gate_up projection. Standard Kimi uses SiLU(gate) * up;
+        # explicit swiglu_arg models keep the fused GPT-OSS-style path.
         intermediate_cache = tokenspeed_kernel.moe_experts(
             gemm1_input,
             w13_weight,
@@ -334,6 +336,12 @@ class Mxfp4TritonKernelBackend(MoEBackend):
             features={"ragged_metadata", "dispatch_gemm"},
             expected_kernel_name="triton_kernels_dispatch_gemm",
         )
+        if act is None:
+            intermediate_cache = kimi_swiglu_gate_up(
+                intermediate_cache,
+                layout="concatenated",
+                output_dtype=hidden_states.dtype,
+            )
 
         if self._is_w4a8_fp8:
             gemm2_input = tokenspeed_kernel.quantize_fp8(

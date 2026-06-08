@@ -367,6 +367,9 @@ class DeepseekV3MoE(nn.Module):
                 enable_pdl=pdl_enabled(),
             )
         else:
+            routed_expert_output = self._prepare_routed_output_for_post_moe_comm(
+                routed_expert_output
+            )
             if not self.experts.apply_routed_scaling_factor_on_output:
                 routed_expert_output *= self.routed_scaling_factor
             final_hidden_states = (
@@ -375,6 +378,20 @@ class DeepseekV3MoE(nn.Module):
                 else routed_expert_output
             )
         return final_hidden_states
+
+    def _prepare_routed_output_for_post_moe_comm(
+        self, routed_expert_output: torch.Tensor
+    ) -> torch.Tensor:
+        if not self._post_moe_allreduce_will_sum_replicated_routed_output():
+            return routed_expert_output
+        return routed_expert_output * (1.0 / self.mapping.moe.tp_ep_size)
+
+    def _post_moe_allreduce_will_sum_replicated_routed_output(self) -> bool:
+        return (
+            getattr(self.experts.backend, "returns_replicated_routed_output", False)
+            and self.mapping.moe.tp_ep_size > 1
+            and self.mapping.attn.tp_size == self.mapping.moe.tp_ep_size
+        )
 
 
 def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
@@ -736,9 +753,11 @@ class DeepseekV3AttentionMLA(nn.Module):
         # latent_cache contains normalized kv_a and k_pe before rotate.
         K = latent_cache.unsqueeze(1)
         q_nope_out_view = Q[..., : self.kv_lora_rank]
-        torch.bmm(
-            q_nope.transpose(0, 1), self.w_kc, out=q_nope_out_view.transpose(0, 1)
+        q_nope_projected = torch.bmm(
+            q_nope.transpose(0, 1).contiguous(),
+            self.w_kc.contiguous(),
         )
+        q_nope_out_view.copy_(q_nope_projected.transpose(0, 1))
         # Model-owned fused FP8 decode: RoPE + quantize + KV cache write
         # all done here, so backend only needs to do attention.
         k_scale = getattr(self.attn_mqa, "k_scale_float", 1.0)
@@ -777,7 +796,7 @@ class DeepseekV3AttentionMLA(nn.Module):
 
         elif self.rotary_emb is not None and q_nope.size(0) > 0:
             # Apply RoPE directly on Q and K slices
-            self.rotary_emb(
+            q_pe_rot, k_pe_rot = self.rotary_emb(
                 positions,
                 q_pe,
                 K[..., self.kv_lora_rank :],
@@ -793,6 +812,8 @@ class DeepseekV3AttentionMLA(nn.Module):
                 ),
                 output_q_rope=Q[..., self.kv_lora_rank :],
             )
+            Q[..., self.kv_lora_rank :].copy_(q_pe_rot)
+            K[..., self.kv_lora_rank :].copy_(k_pe_rot)
         else:
             Q[..., self.kv_lora_rank :] = q_pe
 
@@ -836,12 +857,11 @@ class DeepseekV3AttentionMLA(nn.Module):
             save_kv_cache=need_save_kv,
         )
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
-        output_view = output.view(-1, self.num_local_heads, self.v_head_dim)
-        torch.bmm(
-            attn_output.transpose(0, 1),
-            self.w_vc,
-            out=output_view.transpose(0, 1),
+        projected = torch.bmm(
+            attn_output.transpose(0, 1).contiguous(),
+            self.w_vc.contiguous(),
         )
+        output.copy_(projected.transpose(0, 1).reshape_as(output))
         return output
 
     def forward_normal_chunked(
@@ -920,7 +940,7 @@ class DeepseekV3AttentionMLA(nn.Module):
 
         # BF16 path: apply RoPE, assemble Q/K, write cache
         if self.rotary_emb is not None:
-            self.rotary_emb(
+            q_pe, k_pe = self.rotary_emb(
                 positions,
                 q_pe,
                 k_pe,
@@ -1555,8 +1575,8 @@ class DeepseekV3ForCausalLM(BaseCausalLM):
             w_kc, w_vc = w.unflatten(
                 0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
             ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
-            self_attn.w_kc = w_kc.transpose(1, 2).contiguous().transpose(1, 2)
-            self_attn.w_vc = w_vc.contiguous().transpose(1, 2)
+            self_attn.w_kc = w_kc.contiguous()
+            self_attn.w_vc = w_vc.transpose(1, 2).contiguous()
 
     def load_kv_cache_scales(self, quantization_param_path: str) -> None:
         tp_size = self.mapping.attn.tp_size
@@ -1972,8 +1992,8 @@ class Eagle3DeepseekV2ForCausalLM(DeepseekV3ForCausalLM):
         w_kc, w_vc = w.unflatten(
             0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
         ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
-        self_attn.w_kc = w_kc.transpose(1, 2).contiguous().transpose(1, 2)
-        self_attn.w_vc = w_vc.contiguous().transpose(1, 2)
+        self_attn.w_kc = w_kc.contiguous()
+        self_attn.w_vc = w_vc.transpose(1, 2).contiguous()
 
     def get_hot_token_id(self):
         return self.hot_token_id

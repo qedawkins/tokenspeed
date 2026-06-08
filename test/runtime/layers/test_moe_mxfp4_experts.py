@@ -97,6 +97,58 @@ def test_owner_rank_mxfp4_gate_up_matches_dequantized_dense_reference() -> None:
     torch.testing.assert_close(actual, expected, atol=1e-4, rtol=1e-4)
 
 
+def test_kimi_swiglu_gate_up_default_uses_standard_silu() -> None:
+    gate_up = torch.tensor(
+        [[-2.0, -0.5, 0.25, 1.5, 8.0, -9.0]],
+        dtype=torch.float32,
+    )
+
+    actual = kimi_swiglu_gate_up(gate_up)
+
+    gate = gate_up[..., 0::2]
+    up = gate_up[..., 1::2]
+    expected = torch.nn.functional.silu(gate) * up
+    old_packed_formula = (
+        gate.clamp(max=7.0)
+        * torch.sigmoid(1.702 * gate.clamp(max=7.0))
+        * (up.clamp(min=-7.0, max=7.0) + 1.0)
+    )
+    torch.testing.assert_close(actual, expected)
+    assert not torch.allclose(actual, old_packed_formula)
+
+
+def test_kimi_swiglu_gate_up_explicit_swiglu_beta_matches_gpt_style() -> None:
+    gate_up = torch.tensor(
+        [[-2.0, -0.5, 0.25, 1.5, 8.0, -9.0]],
+        dtype=torch.float32,
+    )
+
+    actual = kimi_swiglu_gate_up(
+        gate_up,
+        alpha=1.702,
+        limit=7.0,
+        beta=1.0,
+    )
+
+    gate = gate_up[..., 0::2].clamp(max=7.0)
+    up = gate_up[..., 1::2].clamp(min=-7.0, max=7.0)
+    expected = gate * torch.sigmoid(1.702 * gate) * (up + 1.0)
+    torch.testing.assert_close(actual, expected)
+
+
+def test_kimi_swiglu_gate_up_supports_concatenated_kimi_layout() -> None:
+    gate = torch.tensor([[-2.0, 0.25, 8.0]], dtype=torch.float32)
+    up = torch.tensor([[-0.5, 1.5, -9.0]], dtype=torch.float32)
+    gate_up = torch.cat([gate, up], dim=-1)
+
+    actual = kimi_swiglu_gate_up(gate_up, layout="concatenated")
+
+    expected = torch.nn.functional.silu(gate) * up
+    interleaved_result = kimi_swiglu_gate_up(gate_up, layout="interleaved")
+    torch.testing.assert_close(actual, expected)
+    assert not torch.allclose(actual, interleaved_result)
+
+
 def test_owner_rank_mxfp4_expert_gemm_cuda_graph_safe() -> None:
     if not torch.cuda.is_available():
         pytest.skip("GPU is required for CUDA graph owner expert GEMM smoke test")
@@ -288,7 +340,7 @@ def test_owner_rank_mxfp4_gate_up_consumes_dynamic_activation_layout() -> None:
         local_expert_offsets=local_offsets,
         bias=bias,
     )
-    expected = _kimi_swiglu_reference(gate_up)
+    expected = _kimi_swiglu_reference(gate_up, layout="concatenated")
     torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
 
 
@@ -722,15 +774,28 @@ def _dense_owner_reference(
 def _kimi_swiglu_reference(
     gate_up: torch.Tensor,
     *,
-    alpha: float = 1.702,
-    limit: float | None = 7.0,
+    alpha: float = 1.0,
+    limit: float | None = None,
+    beta: float | None = None,
+    layout: str = "interleaved",
 ) -> torch.Tensor:
-    gate = gate_up[..., 0::2].float()
-    up = gate_up[..., 1::2].float()
+    if layout == "interleaved":
+        gate = gate_up[..., 0::2].float()
+        up = gate_up[..., 1::2].float()
+    elif layout == "concatenated":
+        gate, up = gate_up.float().chunk(2, dim=-1)
+    else:
+        raise ValueError(layout)
     if limit is not None:
         gate = gate.clamp(max=limit)
         up = up.clamp(min=-limit, max=limit)
-    return gate * torch.sigmoid(alpha * gate) * (up + 1.0)
+    if alpha == 1.0:
+        activated_gate = torch.nn.functional.silu(gate)
+    else:
+        activated_gate = gate * torch.sigmoid(alpha * gate)
+    if beta is not None:
+        up = up + beta
+    return activated_gate * up
 
 
 def _combine_reference(

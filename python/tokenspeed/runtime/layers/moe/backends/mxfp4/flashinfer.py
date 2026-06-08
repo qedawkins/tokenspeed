@@ -227,17 +227,14 @@ class Mxfp4FlashinferMxfp4Backend(MoEBackend):
         ispp_padded = self._ispp_padded
         hidden_padded = self._hidden_padded
 
-        # SwiGLU constants for the fused kernel.
-        #   - alpha   = α in silu(α·gate)
-        #   - beta    = β in (up + β); gpt-oss uses 1.0, standard SwiGLU None
-        #   - limit   = clamp limit on gate (and up, in some recipes)
-        # Models override the gpt-oss defaults via ``MoELayer(swiglu_limit=...,
-        # activation_alpha=..., swiglu_beta=...)``.
+        # SwiGLU constants for the fused kernel. Kimi/DeepSeek-style
+        # activation="silu" is standard SiLU(gate) * up; explicit
+        # activation="swiglu" models supply alpha/clamp/beta overrides.
         swiglu_arg = getattr(layer, "swiglu_arg", None)
         if swiglu_arg is None:
-            alpha = 1.702
-            limit = 7.0
-            beta = 1.0
+            alpha = 1.0
+            limit = None
+            beta = None
         else:
             alpha = swiglu_arg.alpha
             limit = swiglu_arg.limit

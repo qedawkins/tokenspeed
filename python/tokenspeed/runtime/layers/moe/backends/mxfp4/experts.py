@@ -28,6 +28,7 @@ backend, choose kernels, or expose vendor-specific packed variants.
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
 
 from tokenspeed.runtime.execution.cuda_graph_wrapper import get_is_capture_mode
 from tokenspeed.runtime.layers.moe.backends.mxfp4.activation import (
@@ -212,8 +213,10 @@ def owner_rank_mxfp4_gate_up_gemm(
     *,
     local_expert_offsets: torch.Tensor | None = None,
     bias: torch.Tensor | None = None,
-    swiglu_alpha: float = 1.702,
-    swiglu_limit: float | None = 7.0,
+    swiglu_alpha: float = 1.0,
+    swiglu_limit: float | None = None,
+    swiglu_beta: float | None = None,
+    gate_up_layout: str = "concatenated",
     output_dtype: torch.dtype | None = None,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
@@ -222,7 +225,9 @@ def owner_rank_mxfp4_gate_up_gemm(
     ``packed_owner_tokens`` is the dynamic MXFP4 activation format produced by
     the local activation quantizer: packed E2M1 values with one uint8 E8M0 scale
     per 32 input elements. Weight tensors use the fused ``w13`` local expert
-    layout ``[E_local, 2 * intermediate, hidden / 2]``.
+    layout ``[E_local, 2 * intermediate, hidden / 2]``. Kimi loaders place the
+    gate rows first and up rows second, so the activation consumes concatenated
+    gate/up output by default.
     """
 
     hidden_size = _validate_gate_up_weight_shape(local_packed_weight)
@@ -245,6 +250,8 @@ def owner_rank_mxfp4_gate_up_gemm(
         gate_up,
         alpha=swiglu_alpha,
         limit=swiglu_limit,
+        beta=swiglu_beta,
+        layout=gate_up_layout,
         output_dtype=output_dtype,
         out=out,
     )
@@ -360,12 +367,14 @@ def combine_mxfp4_routed_down_outputs(
 def kimi_swiglu_gate_up(
     gate_up: torch.Tensor,
     *,
-    alpha: float = 1.702,
-    limit: float | None = 7.0,
+    alpha: float = 1.0,
+    limit: float | None = None,
+    beta: float | None = None,
+    layout: str = "interleaved",
     output_dtype: torch.dtype | None = None,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Apply the interleaved gate/up SwiGLU used by Kimi packed kernels."""
+    """Apply Kimi SwiGLU to fused gate/up projection output."""
 
     if gate_up.ndim < 1:
         raise ValueError("gate_up must have at least one dimension")
@@ -385,12 +394,26 @@ def kimi_swiglu_gate_up(
         if out.dtype != output_dtype:
             raise ValueError(f"out dtype {out.dtype} != {output_dtype}")
 
-    gate = gate_up[..., 0::2].float()
-    up = gate_up[..., 1::2].float()
+    if layout == "interleaved":
+        gate = gate_up[..., 0::2].float()
+        up = gate_up[..., 1::2].float()
+    elif layout == "concatenated":
+        gate, up = gate_up.float().chunk(2, dim=-1)
+    else:
+        raise ValueError(
+            f"unsupported gate/up layout {layout!r}; expected "
+            "'interleaved' or 'concatenated'"
+        )
     if limit is not None:
         gate = gate.clamp(max=limit)
         up = up.clamp(min=-limit, max=limit)
-    activated = gate * torch.sigmoid(alpha * gate) * (up + 1.0)
+    if alpha == 1.0:
+        activated_gate = F.silu(gate)
+    else:
+        activated_gate = gate * torch.sigmoid(alpha * gate)
+    if beta is not None:
+        up = up + beta
+    activated = activated_gate * up
     activated = activated.to(output_dtype)
     if out is None:
         return activated

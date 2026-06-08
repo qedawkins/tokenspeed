@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import os
 import sys
+from types import SimpleNamespace
 
 # CI Registration (parsed via AST, runtime no-op)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -17,7 +18,12 @@ import pytest
 import torch
 
 import tokenspeed.runtime.layers.logits_processor as logits_processor_module
-from tokenspeed.runtime.layers.logits_processor import fused_softcap
+from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+from tokenspeed.runtime.layers.logits_processor import (
+    LogitsMetadata,
+    LogitsProcessor,
+    fused_softcap,
+)
 
 
 def test_lm_head_matmul_falls_back_when_lazy_fused_library_missing(monkeypatch):
@@ -66,6 +72,41 @@ def test_lm_head_matmul_reraises_fused_kernel_runtime_errors(monkeypatch):
 
     with pytest.raises(RuntimeError, match="kernel launch failed"):
         logits_processor_module._lm_head_matmul(hidden_states, weight)
+
+
+def test_tp_logits_all_gather_handles_zero_rows(monkeypatch):
+    processor = LogitsProcessor(
+        config=SimpleNamespace(model_type="test", vocab_size=6),
+        tp_rank=0,
+        tp_size=2,
+        tp_group=(0, 1),
+    )
+    hidden_states = torch.empty((0, 2), dtype=torch.float32)
+    lm_head = SimpleNamespace(weight=torch.ones((3, 2), dtype=torch.float32))
+    metadata = LogitsMetadata(forward_mode=ForwardMode.DECODE)
+    calls = {"all_gather": 0}
+
+    def fake_all_gather_into_tensor(output, input_, group):
+        calls["all_gather"] += 1
+        assert group == (0, 1)
+        assert tuple(output.shape) == (0, 3)
+        assert tuple(input_.shape) == (0, 3)
+
+    monkeypatch.setattr(
+        logits_processor_module,
+        "all_gather_into_tensor",
+        fake_all_gather_into_tensor,
+    )
+
+    output = processor(
+        input_ids=None,
+        hidden_states=hidden_states,
+        lm_head=lm_head,
+        logits_metadata=metadata,
+    )
+
+    assert calls["all_gather"] == 1
+    assert tuple(output.next_token_logits.shape) == (0, 6)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")

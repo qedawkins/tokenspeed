@@ -462,18 +462,20 @@ class LogitsProcessor(nn.Module):
                     safe=False,
                 )
             else:
+                num_rows = logits.size(0)
+                local_vocab_size = logits.size(1)
                 gathered_logits = torch.empty(
-                    self.tp_size * logits.size(0),
-                    logits.size(1),
+                    self.tp_size * num_rows,
+                    local_vocab_size,
                     dtype=logits.dtype,
                     device=logits.device,
                 )
                 all_gather_into_tensor(gathered_logits, logits, self.tp_group)
                 logits = (
-                    gathered_logits.view(self.tp_size, logits.size(0), logits.size(1))
+                    gathered_logits.view(self.tp_size, num_rows, local_vocab_size)
                     .transpose(0, 1)
                     .contiguous()
-                    .view(logits.size(0), -1)
+                    .view(num_rows, local_vocab_size * self.tp_size)
                 )
 
         logits = logits[:, : self.config.vocab_size].contiguous()

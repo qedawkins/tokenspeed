@@ -100,6 +100,7 @@ def _reference_mxfp4_moe(
 ) -> torch.Tensor:
     from tokenspeed.runtime.layers.moe.backends.mxfp4.experts import (
         dequantize_mxfp4_expert_weight,
+        kimi_swiglu_gate_up,
     )
 
     w13 = dequantize_mxfp4_expert_weight(
@@ -133,12 +134,12 @@ def _reference_mxfp4_moe(
             gate_up = (
                 hidden @ w13[expert].T
                 + original_weights["w13_weight_bias"][expert].float()
-            )[0]
-            gate = gate_up[0::2].clamp(max=7.0)
-            up = gate_up[1::2].clamp(min=-7.0, max=7.0)
-            activated = (
-                gate * torch.sigmoid(1.702 * gate) * (up + 1.0)
-            ).reshape(1, w2.shape[-1])
+            )
+            activated = kimi_swiglu_gate_up(
+                gate_up,
+                layout="concatenated",
+                output_dtype=torch.float32,
+            )
             down = (
                 activated @ w2[expert].T
                 + original_weights["w2_weight_bias"][expert].float()

@@ -172,6 +172,8 @@ class KimiMxfp4ShardingContract:
     ep_size: int
     tp_rank: int
     ep_rank: int
+    routed_tp_size: int
+    routed_tp_rank: int
     hidden_size: int
     dense_intermediate_size: int
     moe_intermediate_size: int
@@ -503,6 +505,8 @@ def build_kimi_mxfp4_sharding_contract(
     ep_size: int = 4,
     tp_rank: int = 0,
     ep_rank: int = 0,
+    moe_tp_size: int | None = None,
+    moe_tp_rank: int | None = None,
 ) -> KimiMxfp4ShardingContract:
     quantization_config = _extract_quantization_config(model_config)
     if quantization_config is None or not is_quark_mxfp4_dynamic_fp4_config(
@@ -516,6 +520,13 @@ def build_kimi_mxfp4_sharding_contract(
 
     _validate_rank("TP", tp_size, tp_rank)
     _validate_rank("EP", ep_size, ep_rank)
+    routed_tp_size = tp_size if moe_tp_size is None else moe_tp_size
+    routed_tp_rank = (
+        tp_rank if moe_tp_rank is None and moe_tp_size is None else tp_rank % routed_tp_size
+    )
+    if moe_tp_rank is not None:
+        routed_tp_rank = moe_tp_rank
+    _validate_rank("MoE TP", routed_tp_size, routed_tp_rank)
 
     hidden_size = _required_text_int(text_config, "hidden_size")
     dense_intermediate_size = _required_text_int(text_config, "intermediate_size")
@@ -529,10 +540,10 @@ def build_kimi_mxfp4_sharding_contract(
             "Kimi MXFP4 routed experts must be divisible by EP size: "
             f"{num_routed_experts} vs {ep_size}"
         )
-    if moe_intermediate_size % tp_size != 0:
+    if moe_intermediate_size % routed_tp_size != 0:
         raise ValueError(
             "Kimi MXFP4 MoE intermediate size must be divisible by TP size: "
-            f"{moe_intermediate_size} vs {tp_size}"
+            f"{moe_intermediate_size} vs {routed_tp_size}"
         )
     if dense_intermediate_size % tp_size != 0:
         raise ValueError(
@@ -561,8 +572,8 @@ def build_kimi_mxfp4_sharding_contract(
         checkpoint_prefix="mlp.experts.<global_expert_id>",
         hidden_size=hidden_size,
         intermediate_size=moe_intermediate_size,
-        tp_size=tp_size,
-        tp_rank=tp_rank,
+        tp_size=routed_tp_size,
+        tp_rank=routed_tp_rank,
         num_rank_local_experts=experts_per_ep_rank,
         uses_ep_ownership=True,
     )
@@ -592,6 +603,8 @@ def build_kimi_mxfp4_sharding_contract(
         ep_size=ep_size,
         tp_rank=tp_rank,
         ep_rank=ep_rank,
+        routed_tp_size=routed_tp_size,
+        routed_tp_rank=routed_tp_rank,
         hidden_size=hidden_size,
         dense_intermediate_size=dense_intermediate_size,
         moe_intermediate_size=moe_intermediate_size,

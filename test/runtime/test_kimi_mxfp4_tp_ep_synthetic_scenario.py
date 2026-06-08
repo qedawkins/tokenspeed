@@ -60,13 +60,25 @@ def _record_kernel_calls(monkeypatch: pytest.MonkeyPatch) -> dict[str, list[dict
     import tokenspeed_kernel
 
     kernel_calls: dict[str, list[dict]] = {
+        "route": [],
         "dispatch": [],
         "combine": [],
         "quantize_mxfp4": [],
     }
+    original_route = tokenspeed_kernel.moe_route
     original_dispatch = tokenspeed_kernel.moe_dispatch
     original_combine = tokenspeed_kernel.moe_combine
     original_quantize_mxfp4 = tokenspeed_kernel.quantize_mxfp4
+
+    def _record_route(*args, **kwargs):
+        result = original_route(*args, **kwargs)
+        kernel_calls["route"].append(
+            {
+                "expected_kernel_name": kwargs.get("expected_kernel_name"),
+                "traits": dict(kwargs.get("traits") or {}),
+            }
+        )
+        return result
 
     def _record_dispatch(*args, **kwargs):
         result = original_dispatch(*args, **kwargs)
@@ -99,7 +111,7 @@ def _record_kernel_calls(monkeypatch: pytest.MonkeyPatch) -> dict[str, list[dict
     monkeypatch.setattr(tokenspeed_kernel, "moe_dispatch", _record_dispatch)
     monkeypatch.setattr(tokenspeed_kernel, "moe_combine", _record_combine)
     monkeypatch.setattr(tokenspeed_kernel, "quantize_mxfp4", _record_quantize_mxfp4)
-    monkeypatch.setattr(tokenspeed_kernel, "moe_route", _forbidden_kernel)
+    monkeypatch.setattr(tokenspeed_kernel, "moe_route", _record_route)
     monkeypatch.setattr(tokenspeed_kernel, "moe_experts", _forbidden_kernel)
     if hasattr(tokenspeed_kernel, "quantize_fp8"):
         monkeypatch.setattr(tokenspeed_kernel, "quantize_fp8", _forbidden_kernel)
@@ -263,6 +275,7 @@ def _expected_mxfp4_tp_ep_output(
             )
             activated = kimi_swiglu_gate_up(
                 gate_up,
+                layout="concatenated",
                 output_dtype=hidden_states.dtype,
             )
             packed_intermediate, intermediate_scale = quantize_mxfp4_activation_reference(
@@ -317,6 +330,7 @@ def _run_mxfp4_tp_ep_case(
     )
     dispatch_start = len(kernel_calls["dispatch"])
     combine_start = len(kernel_calls["combine"])
+    route_start = len(kernel_calls["route"])
     quantize_start = len(kernel_calls["quantize_mxfp4"])
 
     actual = layer(
@@ -344,6 +358,11 @@ def _run_mxfp4_tp_ep_case(
         check_dtype=False,
     )
 
+    assert any(
+        call.get("expected_kernel_name") == "gluon_grouped_biased_topk_gfx950"
+        and call.get("traits", {}).get("output_type") == "topk"
+        for call in kernel_calls["route"][route_start:]
+    )
     assert any(
         call.get("expected_kernel_name") == "gluon_ep_metadata_gfx950"
         and call.get("traits", {}).get("comm_strategy") == "ep_metadata"
