@@ -51,8 +51,10 @@ __all__ = [
     "mha_merge_state",
     "mha_decode_scheduler_metadata",
     "mla_prefill",
+    "mla_prefill_absorbed",
     "mla_prefill_with_kvcache",
     "mla_decode_with_kvcache",
+    "mla_decode_absorbed_with_kvcache",
 ]
 
 LSE_LN = math.log2(math.e)
@@ -444,6 +446,239 @@ def mha_merge_state(
             out_b=out_b,
             lse_b=lse_b,
             lse_scale_log2=lse_scale_log2,
+        )
+
+
+def mla_prefill_absorbed(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    seq_lens: torch.Tensor,
+    cum_seq_lens: torch.Tensor,
+    max_seq_len: int,
+    batch_size: int,
+    softmax_scale: float,
+    *,
+    is_causal: bool = True,
+    return_lse: bool = False,
+    cum_seq_lens_q: torch.Tensor | None = None,
+    max_seq_len_q: int | None = None,
+    out: torch.Tensor | None = None,
+    override: str | None = None,
+    solution: str | None = None,
+) -> AttentionResult:
+    """MLA ragged prefill over already-absorbed Q/K/V rows."""
+    if q.dim() != 3 or k.dim() != 3 or v.dim() != 3:
+        raise ValueError(
+            f"q/k/v must be rank-3, got {tuple(q.shape)}, {tuple(k.shape)}, {tuple(v.shape)}"
+        )
+    if q.shape[-1] != k.shape[-1]:
+        raise ValueError(
+            f"q and k head dims must match, got {q.shape[-1]} and {k.shape[-1]}"
+        )
+    if k.shape[1] != v.shape[1]:
+        raise ValueError(
+            f"k/v head counts must match, got {k.shape[1]} and {v.shape[1]}"
+        )
+    if q.shape[1] % k.shape[1] != 0:
+        raise ValueError(
+            f"q heads {q.shape[1]} must be divisible by k heads {k.shape[1]}"
+        )
+    if seq_lens.shape[0] != batch_size:
+        raise ValueError(
+            f"seq_lens must have batch_size entries, got {seq_lens.shape[0]}"
+        )
+
+    cum_seq_lens_q = cum_seq_lens if cum_seq_lens_q is None else cum_seq_lens_q
+    max_seq_len_q = max_seq_len if max_seq_len_q is None else max_seq_len_q
+    if cum_seq_lens_q.shape[0] != batch_size + 1:
+        raise ValueError(
+            f"cum_seq_lens_q must have batch_size+1 entries, got {cum_seq_lens_q.shape[0]}"
+        )
+    if cum_seq_lens.shape[0] != batch_size + 1:
+        raise ValueError(
+            f"cum_seq_lens must have batch_size+1 entries, got {cum_seq_lens.shape[0]}"
+        )
+
+    traits = {
+        "num_q_heads": q.shape[1],
+        "num_kv_heads": k.shape[1],
+        "query_dim": q.shape[-1],
+        "value_head_dim": v.shape[-1],
+        "is_causal": is_causal,
+        "return_lse": return_lse,
+    }
+    signature = _attention_format_signature(q=q, k=k, v=v)
+    kernel = select_kernel(
+        "attention",
+        "mla_prefill",
+        signature,
+        features=frozenset({"mla"}),
+        traits=traits,
+        solution=solution,
+        override=override,
+    )
+
+    shape_params = {
+        "batch_size": batch_size,
+        "total_q": q.shape[0],
+        "total_kv": k.shape[0],
+        "num_q_heads": q.shape[1],
+        "num_kv_heads": k.shape[1],
+        "query_dim": q.shape[-1],
+        "value_head_dim": v.shape[-1],
+        "max_seq_len_q": max_seq_len_q,
+        "max_seq_len_kv": max_seq_len,
+    }
+    ShapeCapture.get().record(
+        "attention",
+        "mla_prefill",
+        kernel.name,
+        q.dtype,
+        shape_params,
+    )
+
+    with kernel_scope(
+        "attention",
+        "mla_prefill",
+        q.dtype,
+        kernel_name=kernel.name,
+        **shape_params,
+    ):
+        return kernel(
+            q=q,
+            k=k,
+            v=v,
+            cum_seq_lens=cum_seq_lens,
+            max_seq_len=max_seq_len,
+            batch_size=batch_size,
+            softmax_scale=softmax_scale,
+            is_causal=is_causal,
+            return_lse=return_lse,
+            cum_seq_lens_q=cum_seq_lens_q,
+            max_seq_len_q=max_seq_len_q,
+            out=out,
+        )
+
+
+def mla_decode_absorbed_with_kvcache(
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    max_seqlen_k: int,
+    *,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    value_head_dim: int | None = None,
+    softmax_scale: float | None = None,
+    override: str | None = None,
+    solution: str | None = None,
+) -> torch.Tensor:
+    """MLA decode for already-absorbed query rows and latent paged KV cache."""
+    if q.dim() != 3:
+        raise ValueError(f"q must be rank-3 [M,H,D], got shape {tuple(q.shape)}")
+    if kv_cache.dim() == 4:
+        if kv_cache.shape[1] != 1:
+            raise ValueError(
+                "4D MLA kv_cache must have singleton axis 1, got "
+                f"shape {tuple(kv_cache.shape)}"
+            )
+        kv_cache = kv_cache.squeeze(1)
+    if kv_cache.dim() != 3:
+        raise ValueError(
+            "kv_cache must be rank-3 [pages,page_size,D] or rank-4 "
+            f"[pages,1,page_size,D], got shape {tuple(kv_cache.shape)}"
+        )
+
+    expected_cache_dim = kv_lora_rank + qk_rope_head_dim
+    if q.shape[-1] != expected_cache_dim:
+        raise ValueError(
+            f"q last dim must be kv_lora_rank + qk_rope_head_dim "
+            f"({expected_cache_dim}), got {q.shape[-1]}"
+        )
+    if kv_cache.shape[-1] != expected_cache_dim:
+        raise ValueError(
+            f"kv_cache last dim must be kv_lora_rank + qk_rope_head_dim "
+            f"({expected_cache_dim}), got {kv_cache.shape[-1]}"
+        )
+
+    value_head_dim = kv_lora_rank if value_head_dim is None else value_head_dim
+    if not (0 < value_head_dim <= kv_lora_rank):
+        raise ValueError(
+            f"value_head_dim must be in [1, {kv_lora_rank}], got {value_head_dim}"
+        )
+    if page_table.shape[0] != q.shape[0]:
+        raise ValueError(
+            f"page_table rows {page_table.shape[0]} must match q rows {q.shape[0]}"
+        )
+    if cache_seqlens.shape[0] != q.shape[0]:
+        raise ValueError(
+            f"cache_seqlens length {cache_seqlens.shape[0]} must match q rows {q.shape[0]}"
+        )
+
+    softmax_scale = (
+        1.0 / math.sqrt(expected_cache_dim)
+        if softmax_scale is None
+        else softmax_scale
+    )
+
+    traits = {
+        "num_q_heads": q.shape[1],
+        "query_dim": q.shape[-1],
+        "kv_lora_rank": kv_lora_rank,
+        "qk_rope_head_dim": qk_rope_head_dim,
+        "value_head_dim": value_head_dim,
+        "page_size": kv_cache.shape[1],
+    }
+    signature = _attention_format_signature(q=q, kv_cache=kv_cache)
+    kernel = select_kernel(
+        "attention",
+        "mla_decode_with_kvcache",
+        signature,
+        features=frozenset({"paged", "mla"}),
+        traits=traits,
+        solution=solution,
+        override=override,
+    )
+
+    shape_params = {
+        "decode_rows": q.shape[0],
+        "num_pages": kv_cache.shape[0],
+        "page_size": kv_cache.shape[1],
+        "max_pages_per_seq": page_table.shape[1],
+        "num_q_heads": q.shape[1],
+        "query_dim": q.shape[-1],
+        "kv_lora_rank": kv_lora_rank,
+        "qk_rope_head_dim": qk_rope_head_dim,
+        "value_head_dim": value_head_dim,
+        "max_seqlen_k": max_seqlen_k,
+    }
+    ShapeCapture.get().record(
+        "attention",
+        "mla_decode_with_kvcache",
+        kernel.name,
+        q.dtype,
+        shape_params,
+    )
+
+    with kernel_scope(
+        "attention",
+        "mla_decode_with_kvcache",
+        q.dtype,
+        kernel_name=kernel.name,
+        **shape_params,
+    ):
+        return kernel(
+            q=q,
+            kv_cache=kv_cache,
+            page_table=page_table,
+            cache_seqlens=cache_seqlens,
+            max_seqlen_k=max_seqlen_k,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+            value_head_dim=value_head_dim,
+            softmax_scale=softmax_scale,
         )
 
 
