@@ -1,0 +1,812 @@
+from __future__ import annotations
+
+import pytest
+import torch
+
+from tokenspeed.runtime.layers.moe.backends.mxfp4 import experts as mxfp4_experts_module
+from tokenspeed.runtime.layers.moe.backends.mxfp4.activation import (
+    dequantize_mxfp4_activation,
+    quantize_mxfp4_activation_reference,
+)
+from tokenspeed.runtime.layers.moe.backends.mxfp4.experts import (
+    combine_mxfp4_routed_down_outputs,
+    dequantize_mxfp4_expert_weight,
+    kimi_swiglu_gate_up,
+    local_mxfp4_down_gemm_combine,
+    owner_rank_mxfp4_down_gemm,
+    owner_rank_mxfp4_expert_gemm,
+    owner_rank_mxfp4_gate_up_gemm,
+)
+
+
+def test_dequantize_mxfp4_expert_weight_applies_pack_order_and_scales() -> None:
+    row = torch.tensor(
+        [0x21, 0x43, 0x65, 0x17] + [0] * 12,
+        dtype=torch.uint8,
+    )
+    packed = torch.cat((row, row)).reshape(1, 1, 32)
+    scales = torch.tensor([[[127, 128]]], dtype=torch.uint8)
+
+    actual = dequantize_mxfp4_expert_weight(
+        packed,
+        scales,
+        logical_shape=(1, 1, 64),
+    )
+
+    first_values = torch.tensor(
+        [0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 0.5],
+        dtype=torch.float32,
+    )
+    expected = torch.zeros(1, 1, 64, dtype=torch.float32)
+    expected[0, 0, :8] = first_values
+    expected[0, 0, 32:40] = first_values * 2.0
+    torch.testing.assert_close(actual, expected)
+
+
+def test_dequantize_mxfp4_expert_weight_cuda_graph_safe() -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("GPU is required for CUDA graph expert dequant smoke test")
+    row = torch.tensor(
+        [0x21, 0x43, 0x65, 0x17] + [0] * 12,
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    packed = torch.cat((row, row)).reshape(1, 1, 32)
+    scales = torch.tensor([[[127, 128]]], dtype=torch.uint8, device="cuda")
+
+    expected = dequantize_mxfp4_expert_weight(
+        packed,
+        scales,
+        logical_shape=(1, 1, 64),
+    )
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = dequantize_mxfp4_expert_weight(
+            packed,
+            scales,
+            logical_shape=(1, 1, 64),
+        )
+    graph.replay()
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(actual, expected)
+
+
+def test_owner_rank_mxfp4_gate_up_matches_dequantized_dense_reference() -> None:
+    torch.manual_seed(1729)
+    num_experts = 2
+    out_features = 12
+    in_features = 64
+    local_counts = torch.tensor([3, 2], dtype=torch.int32)
+    owner_tokens = torch.randn(5, in_features, dtype=torch.float32).to(torch.bfloat16)
+    packed_weight = _random_packed_weight(num_experts, out_features, in_features)
+    scales = _random_e8m0_scales(num_experts, out_features, in_features)
+
+    actual = owner_rank_mxfp4_expert_gemm(
+        owner_tokens,
+        packed_weight,
+        scales,
+        local_counts,
+        output_dtype=torch.float32,
+    )
+
+    dense_weight = dequantize_mxfp4_expert_weight(packed_weight, scales)
+    expected = _dense_owner_reference(owner_tokens, dense_weight, local_counts)
+    torch.testing.assert_close(actual, expected, atol=1e-4, rtol=1e-4)
+
+
+def test_kimi_swiglu_gate_up_default_uses_standard_silu() -> None:
+    gate_up = torch.tensor(
+        [[-2.0, -0.5, 0.25, 1.5, 8.0, -9.0]],
+        dtype=torch.float32,
+    )
+
+    actual = kimi_swiglu_gate_up(gate_up)
+
+    gate = gate_up[..., 0::2]
+    up = gate_up[..., 1::2]
+    expected = torch.nn.functional.silu(gate) * up
+    old_packed_formula = (
+        gate.clamp(max=7.0)
+        * torch.sigmoid(1.702 * gate.clamp(max=7.0))
+        * (up.clamp(min=-7.0, max=7.0) + 1.0)
+    )
+    torch.testing.assert_close(actual, expected)
+    assert not torch.allclose(actual, old_packed_formula)
+
+
+def test_kimi_swiglu_gate_up_explicit_swiglu_beta_matches_gpt_style() -> None:
+    gate_up = torch.tensor(
+        [[-2.0, -0.5, 0.25, 1.5, 8.0, -9.0]],
+        dtype=torch.float32,
+    )
+
+    actual = kimi_swiglu_gate_up(
+        gate_up,
+        alpha=1.702,
+        limit=7.0,
+        beta=1.0,
+    )
+
+    gate = gate_up[..., 0::2].clamp(max=7.0)
+    up = gate_up[..., 1::2].clamp(min=-7.0, max=7.0)
+    expected = gate * torch.sigmoid(1.702 * gate) * (up + 1.0)
+    torch.testing.assert_close(actual, expected)
+
+
+def test_kimi_swiglu_gate_up_supports_concatenated_kimi_layout() -> None:
+    gate = torch.tensor([[-2.0, 0.25, 8.0]], dtype=torch.float32)
+    up = torch.tensor([[-0.5, 1.5, -9.0]], dtype=torch.float32)
+    gate_up = torch.cat([gate, up], dim=-1)
+
+    actual = kimi_swiglu_gate_up(gate_up, layout="concatenated")
+
+    expected = torch.nn.functional.silu(gate) * up
+    interleaved_result = kimi_swiglu_gate_up(gate_up, layout="interleaved")
+    torch.testing.assert_close(actual, expected)
+    assert not torch.allclose(actual, interleaved_result)
+
+
+def test_owner_rank_mxfp4_expert_gemm_cuda_graph_safe() -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("GPU is required for CUDA graph owner expert GEMM smoke test")
+    torch.manual_seed(20280)
+    device = "cuda"
+    num_experts = 3
+    out_features = 16
+    in_features = 64
+    local_counts = torch.tensor([2, 0, 3], dtype=torch.int32, device=device)
+    local_offsets = torch.tensor([0, 2, 2, 5], dtype=torch.int32, device=device)
+    owner_tokens = (
+        torch.randn(5, in_features, dtype=torch.float32, device=device) * 0.25
+    ).to(torch.bfloat16)
+    packed_weight = _random_packed_weight(
+        num_experts,
+        out_features,
+        in_features,
+    ).to(device)
+    scales = _random_e8m0_scales(num_experts, out_features, in_features).to(device)
+    bias = (
+        torch.randn(num_experts, out_features, dtype=torch.float32, device=device)
+        * 0.03
+    )
+
+    expected = owner_rank_mxfp4_expert_gemm(
+        owner_tokens,
+        packed_weight,
+        scales,
+        local_counts,
+        local_expert_offsets=local_offsets,
+        bias=bias,
+        output_dtype=torch.float32,
+    )
+    dense_weight = dequantize_mxfp4_expert_weight(packed_weight, scales)
+    dense_expected = _dense_owner_reference(
+        owner_tokens,
+        dense_weight,
+        local_counts,
+        local_expert_offsets=local_offsets,
+        bias=bias,
+    )
+    torch.testing.assert_close(expected, dense_expected, atol=1e-3, rtol=1e-3)
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = owner_rank_mxfp4_expert_gemm(
+            owner_tokens,
+            packed_weight,
+            scales,
+            local_counts,
+            local_expert_offsets=local_offsets,
+            bias=bias,
+            output_dtype=torch.float32,
+        )
+    graph.replay()
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(actual, expected, atol=1e-3, rtol=1e-3)
+
+
+def test_owner_rank_mxfp4_expert_gemm_dequantizes_only_active_experts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    torch.manual_seed(1848)
+    num_experts = 4
+    out_features = 10
+    in_features = 64
+    local_counts = torch.tensor([0, 2, 0, 1], dtype=torch.int32)
+    owner_tokens = torch.randn(3, in_features, dtype=torch.float32).to(torch.bfloat16)
+    packed_weight = _random_packed_weight(num_experts, out_features, in_features)
+    scales = _random_e8m0_scales(num_experts, out_features, in_features)
+
+    dense_weight = dequantize_mxfp4_expert_weight(packed_weight, scales)
+    expected = _dense_owner_reference(owner_tokens, dense_weight, local_counts)
+    dequant_shapes: list[tuple[int, int, int]] = []
+    original_dequant = (
+        mxfp4_experts_module._dequantize_mxfp4_expert_weight_unchecked
+    )
+
+    def tracked_dequant(
+        packed: torch.Tensor,
+        scale: torch.Tensor,
+        *,
+        logical_shape: tuple[int, int, int],
+        signature: object,
+    ) -> torch.Tensor:
+        dequant_shapes.append(logical_shape)
+        return original_dequant(
+            packed,
+            scale,
+            logical_shape=logical_shape,
+            signature=signature,
+        )
+
+    monkeypatch.setattr(
+        mxfp4_experts_module,
+        "_dequantize_mxfp4_expert_weight_unchecked",
+        tracked_dequant,
+    )
+
+    actual = owner_rank_mxfp4_expert_gemm(
+        owner_tokens,
+        packed_weight,
+        scales,
+        local_counts,
+        output_dtype=torch.float32,
+    )
+
+    assert dequant_shapes == [
+        (1, out_features, in_features),
+        (1, out_features, in_features),
+    ]
+    torch.testing.assert_close(actual, expected, atol=1e-4, rtol=1e-4)
+
+
+def test_owner_rank_mxfp4_down_uses_explicit_offsets_bias_and_empty_expert() -> None:
+    torch.manual_seed(2718)
+    num_experts = 3
+    out_features = 8
+    in_features = 64
+    local_counts = torch.tensor([2, 0, 3], dtype=torch.int32)
+    local_offsets = torch.tensor([0, 2, 2, 5], dtype=torch.int32)
+    owner_tokens = torch.randn(5, in_features, dtype=torch.float32)
+    packed_weight = _random_packed_weight(num_experts, out_features, in_features)
+    scales = _random_e8m0_scales(num_experts, out_features, in_features)
+    bias = torch.randn(num_experts, out_features, dtype=torch.float32) * 0.05
+    out = torch.empty(5, out_features, dtype=torch.float32)
+
+    actual = owner_rank_mxfp4_expert_gemm(
+        owner_tokens,
+        packed_weight,
+        scales,
+        local_counts,
+        local_expert_offsets=local_offsets,
+        bias=bias,
+        out=out,
+    )
+
+    dense_weight = dequantize_mxfp4_expert_weight(packed_weight, scales)
+    expected = _dense_owner_reference(
+        owner_tokens,
+        dense_weight,
+        local_counts,
+        local_expert_offsets=local_offsets,
+        bias=bias,
+    )
+    assert actual is out
+    torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
+
+
+def test_owner_rank_mxfp4_gate_up_consumes_dynamic_activation_layout() -> None:
+    torch.manual_seed(3141)
+    num_experts = 3
+    out_features = 16
+    in_features = 64
+    local_counts = torch.tensor([2, 0, 3], dtype=torch.int32)
+    local_offsets = torch.tensor([0, 2, 2, 5], dtype=torch.int32)
+    owner_tokens = torch.randn(5, in_features, dtype=torch.float32)
+    owner_tokens[0].zero_()
+    owner_tokens[2].mul_(12.0)
+    packed_tokens, token_scale = quantize_mxfp4_activation_reference(
+        owner_tokens.to(torch.bfloat16)
+    )
+    packed_weight = _random_packed_weight(num_experts, out_features, in_features)
+    weight_scale = _random_e8m0_scales(num_experts, out_features, in_features)
+    bias = torch.randn(num_experts, out_features, dtype=torch.float32) * 0.05
+
+    actual = owner_rank_mxfp4_gate_up_gemm(
+        packed_tokens,
+        token_scale,
+        packed_weight,
+        weight_scale,
+        local_counts,
+        local_expert_offsets=local_offsets,
+        bias=bias,
+    )
+
+    dequant_tokens = dequantize_mxfp4_activation(
+        packed_tokens,
+        token_scale,
+        logical_shape=tuple(owner_tokens.shape),
+    )
+    dense_weight = dequantize_mxfp4_expert_weight(packed_weight, weight_scale)
+    gate_up = _dense_owner_reference(
+        dequant_tokens,
+        dense_weight,
+        local_counts,
+        local_expert_offsets=local_offsets,
+        bias=bias,
+    )
+    expected = _kimi_swiglu_reference(gate_up, layout="concatenated")
+    torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
+
+
+def test_owner_rank_mxfp4_gate_up_cuda_graph_safe() -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("GPU is required for CUDA graph gate/up smoke test")
+    torch.manual_seed(20281)
+    device = "cuda"
+    num_experts = 3
+    out_features = 16
+    in_features = 64
+    local_counts = torch.tensor([2, 0, 3], dtype=torch.int32, device=device)
+    local_offsets = torch.tensor([0, 2, 2, 5], dtype=torch.int32, device=device)
+    owner_tokens = (
+        torch.randn(5, in_features, dtype=torch.float32, device=device) * 0.25
+    ).to(torch.bfloat16)
+    packed_tokens, token_scale = quantize_mxfp4_activation_reference(owner_tokens.cpu())
+    packed_tokens = packed_tokens.to(device)
+    token_scale = token_scale.to(device)
+    packed_weight = _random_packed_weight(
+        num_experts,
+        out_features,
+        in_features,
+    ).to(device)
+    weight_scale = _random_e8m0_scales(
+        num_experts,
+        out_features,
+        in_features,
+    ).to(device)
+
+    expected = owner_rank_mxfp4_gate_up_gemm(
+        packed_tokens,
+        token_scale,
+        packed_weight,
+        weight_scale,
+        local_counts,
+        local_expert_offsets=local_offsets,
+        output_dtype=torch.float32,
+    )
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = owner_rank_mxfp4_gate_up_gemm(
+            packed_tokens,
+            token_scale,
+            packed_weight,
+            weight_scale,
+            local_counts,
+            local_expert_offsets=local_offsets,
+            output_dtype=torch.float32,
+        )
+    graph.replay()
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(actual, expected, atol=1e-3, rtol=1e-3)
+
+
+def test_owner_rank_mxfp4_gate_up_handles_zero_rows_and_preallocated_out() -> None:
+    packed_tokens, token_scale = quantize_mxfp4_activation_reference(
+        torch.empty(0, 64, dtype=torch.bfloat16)
+    )
+    packed_weight = _random_packed_weight(2, 8, 64)
+    weight_scale = _random_e8m0_scales(2, 8, 64)
+    out = torch.empty(0, 4, dtype=torch.bfloat16)
+
+    actual = owner_rank_mxfp4_gate_up_gemm(
+        packed_tokens,
+        token_scale,
+        packed_weight,
+        weight_scale,
+        torch.tensor([0, 0], dtype=torch.int32),
+        output_dtype=torch.bfloat16,
+        out=out,
+    )
+
+    assert actual is out
+    assert actual.shape == (0, 4)
+
+
+def test_local_mxfp4_down_gemm_combine_matches_dense_reference() -> None:
+    torch.manual_seed(1618)
+    num_experts = 3
+    hidden_size = 12
+    intermediate = 64
+    num_tokens = 4
+    top_k = 2
+    local_counts = torch.tensor([0, 5, 3], dtype=torch.int32)
+    local_offsets = torch.tensor([0, 0, 5, 8], dtype=torch.int32)
+    slot_intermediate = torch.randn(num_tokens * top_k, intermediate, dtype=torch.float32)
+    slot_intermediate[1].mul_(10.0)
+    packed_weight = _random_packed_weight(num_experts, hidden_size, intermediate)
+    weight_scale = _random_e8m0_scales(num_experts, hidden_size, intermediate)
+    bias = torch.randn(num_experts, hidden_size, dtype=torch.float32) * 0.03
+    scatter_indices = torch.tensor([3, 0, 6, 1, 4, 7, 2, 5], dtype=torch.int32)
+    routed_weights = torch.tensor(
+        [0.0, 1.0, 0.125, 0.875, 0.5, 1.0, 0.25, 0.75],
+        dtype=torch.float32,
+    )
+
+    actual = local_mxfp4_down_gemm_combine(
+        slot_intermediate.to(torch.bfloat16),
+        packed_weight,
+        weight_scale,
+        local_counts,
+        scatter_indices=scatter_indices,
+        routed_weights=routed_weights,
+        num_tokens=num_tokens,
+        top_k=top_k,
+        local_expert_offsets=local_offsets,
+        bias=bias,
+        output_dtype=torch.float32,
+    )
+
+    packed_intermediate, intermediate_scale = quantize_mxfp4_activation_reference(
+        slot_intermediate.to(torch.bfloat16)
+    )
+    dequant_intermediate = dequantize_mxfp4_activation(
+        packed_intermediate,
+        intermediate_scale,
+        logical_shape=tuple(slot_intermediate.shape),
+    )
+    dense_weight = dequantize_mxfp4_expert_weight(packed_weight, weight_scale)
+    sorted_outputs = _dense_owner_reference(
+        dequant_intermediate,
+        dense_weight,
+        local_counts,
+        local_expert_offsets=local_offsets,
+        bias=bias,
+    )
+    expected = _combine_reference(
+        sorted_outputs,
+        scatter_indices,
+        routed_weights,
+        num_tokens=num_tokens,
+        top_k=top_k,
+    )
+    torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
+
+
+def test_owner_rank_mxfp4_down_gemm_cuda_graph_safe() -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("GPU is required for CUDA graph down GEMM smoke test")
+    torch.manual_seed(20282)
+    device = "cuda"
+    num_experts = 3
+    hidden_size = 12
+    intermediate = 64
+    local_counts = torch.tensor([0, 5, 3], dtype=torch.int32, device=device)
+    local_offsets = torch.tensor([0, 0, 5, 8], dtype=torch.int32, device=device)
+    intermediate_rows = (
+        torch.randn(8, intermediate, dtype=torch.float32, device=device) * 0.25
+    ).to(torch.bfloat16)
+    packed_weight = _random_packed_weight(
+        num_experts,
+        hidden_size,
+        intermediate,
+    ).to(device)
+    weight_scale = _random_e8m0_scales(
+        num_experts,
+        hidden_size,
+        intermediate,
+    ).to(device)
+
+    expected = owner_rank_mxfp4_down_gemm(
+        intermediate_rows,
+        packed_weight,
+        weight_scale,
+        local_counts,
+        local_expert_offsets=local_offsets,
+        output_dtype=torch.float32,
+    )
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = owner_rank_mxfp4_down_gemm(
+            intermediate_rows,
+            packed_weight,
+            weight_scale,
+            local_counts,
+            local_expert_offsets=local_offsets,
+            output_dtype=torch.float32,
+        )
+    graph.replay()
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(actual, expected, atol=1e-3, rtol=1e-3)
+
+
+def test_owner_rank_mxfp4_down_gemm_handles_zero_rows_and_preallocated_out() -> None:
+    intermediate = torch.empty(0, 64, dtype=torch.bfloat16)
+    packed_weight = _random_packed_weight(2, 8, 64)
+    weight_scale = _random_e8m0_scales(2, 8, 64)
+    out = torch.empty(0, 8, dtype=torch.bfloat16)
+
+    actual = owner_rank_mxfp4_down_gemm(
+        intermediate,
+        packed_weight,
+        weight_scale,
+        torch.tensor([0, 0], dtype=torch.int32),
+        out=out,
+    )
+
+    assert actual is out
+    assert actual.shape == (0, 8)
+
+
+def test_owner_rank_mxfp4_output_dtype_defaults_and_overrides() -> None:
+    local_counts = torch.tensor([1], dtype=torch.int32)
+    owner_tokens = torch.randn(1, 64, dtype=torch.float32).to(torch.bfloat16)
+    packed_weight = _random_packed_weight(1, 4, 64)
+    scales = _random_e8m0_scales(1, 4, 64)
+
+    default_out = owner_rank_mxfp4_expert_gemm(
+        owner_tokens,
+        packed_weight,
+        scales,
+        local_counts,
+    )
+    fp32_out = owner_rank_mxfp4_expert_gemm(
+        owner_tokens,
+        packed_weight,
+        scales,
+        local_counts,
+        output_dtype=torch.float32,
+    )
+    preallocated = torch.empty(1, 4, dtype=torch.float64)
+    returned = owner_rank_mxfp4_expert_gemm(
+        owner_tokens,
+        packed_weight,
+        scales,
+        local_counts,
+        out=preallocated,
+    )
+
+    assert default_out.dtype == torch.bfloat16
+    assert fp32_out.dtype == torch.float32
+    assert returned is preallocated
+    assert returned.dtype == torch.float64
+
+
+def test_owner_rank_mxfp4_expert_gemm_rejects_bad_owner_layouts() -> None:
+    packed_weight = _random_packed_weight(2, 4, 64)
+    scales = _random_e8m0_scales(2, 4, 64)
+    owner_tokens = torch.randn(3, 64)
+
+    with pytest.raises(ValueError, match="owner token rows"):
+        owner_rank_mxfp4_expert_gemm(
+            owner_tokens,
+            packed_weight,
+            scales,
+            torch.tensor([2, 2], dtype=torch.int32),
+        )
+    with pytest.raises(ValueError, match="local_expert_offsets must match"):
+        owner_rank_mxfp4_expert_gemm(
+            owner_tokens,
+            packed_weight,
+            scales,
+            torch.tensor([1, 2], dtype=torch.int32),
+            local_expert_offsets=torch.tensor([0, 2, 3], dtype=torch.int32),
+        )
+    with pytest.raises(ValueError, match="scale shape"):
+        owner_rank_mxfp4_expert_gemm(
+            owner_tokens,
+            packed_weight,
+            scales[:, :, :1],
+            torch.tensor([1, 2], dtype=torch.int32),
+        )
+    with pytest.raises(ValueError, match="local_expert_counts must be torch.int32"):
+        owner_rank_mxfp4_expert_gemm(
+            owner_tokens,
+            packed_weight,
+            scales,
+            torch.tensor([1, 2], dtype=torch.int64),
+        )
+    with pytest.raises(ValueError, match="non-negative"):
+        owner_rank_mxfp4_expert_gemm(
+            owner_tokens,
+            packed_weight,
+            scales,
+            torch.tensor([4, -1], dtype=torch.int32),
+        )
+    with pytest.raises(ValueError, match="local_expert_offsets must be torch.int32"):
+        owner_rank_mxfp4_expert_gemm(
+            owner_tokens,
+            packed_weight,
+            scales,
+            torch.tensor([1, 2], dtype=torch.int32),
+            local_expert_offsets=torch.tensor([0, 1, 3], dtype=torch.int64),
+        )
+
+
+def test_owner_rank_mxfp4_gate_up_rejects_bad_activation_layouts() -> None:
+    packed_tokens, token_scale = quantize_mxfp4_activation_reference(
+        torch.randn(2, 64, dtype=torch.float32)
+    )
+    packed_weight = _random_packed_weight(1, 7, 64)
+    weight_scale = _random_e8m0_scales(1, 7, 64)
+
+    with pytest.raises(ValueError, match="packed shape"):
+        owner_rank_mxfp4_gate_up_gemm(
+            packed_tokens[:, :31],
+            token_scale,
+            _random_packed_weight(1, 8, 64),
+            _random_e8m0_scales(1, 8, 64),
+            torch.tensor([2], dtype=torch.int32),
+        )
+    with pytest.raises(ValueError, match="gate/up output dim"):
+        owner_rank_mxfp4_gate_up_gemm(
+            packed_tokens,
+            token_scale,
+            packed_weight,
+            weight_scale,
+            torch.tensor([2], dtype=torch.int32),
+        )
+    with pytest.raises(ValueError, match="out shape"):
+        kimi_swiglu_gate_up(
+            torch.randn(2, 8),
+            out=torch.empty(2, 5),
+        )
+
+
+def test_local_mxfp4_down_gemm_combine_rejects_bad_layouts() -> None:
+    sorted_outputs = torch.randn(2, 4)
+    scatter_indices = torch.tensor([0, 1], dtype=torch.int32)
+    routed_weights = torch.ones(2)
+
+    with pytest.raises(ValueError, match="local down weight input"):
+        owner_rank_mxfp4_down_gemm(
+            torch.randn(2, 32),
+            _random_packed_weight(1, 4, 64),
+            _random_e8m0_scales(1, 4, 64),
+            torch.tensor([2], dtype=torch.int32),
+        )
+    with pytest.raises(ValueError, match="scatter_indices shape"):
+        combine_mxfp4_routed_down_outputs(
+            sorted_outputs,
+            scatter_indices[:1],
+            routed_weights,
+            num_tokens=1,
+            top_k=2,
+        )
+    with pytest.raises(ValueError, match="scatter_indices must be in"):
+        combine_mxfp4_routed_down_outputs(
+            sorted_outputs,
+            torch.tensor([0, 2], dtype=torch.int32),
+            routed_weights,
+            num_tokens=1,
+            top_k=2,
+        )
+    with pytest.raises(ValueError, match="out shape"):
+        combine_mxfp4_routed_down_outputs(
+            sorted_outputs,
+            scatter_indices,
+            routed_weights,
+            num_tokens=1,
+            top_k=2,
+            out=torch.empty(1, 5),
+        )
+
+
+def _random_packed_weight(
+    num_experts: int,
+    out_features: int,
+    in_features: int,
+) -> torch.Tensor:
+    if in_features % 2 != 0:
+        raise ValueError("in_features must be divisible by 2")
+    return torch.randint(
+        0,
+        256,
+        (num_experts, out_features, in_features // 2),
+        dtype=torch.uint8,
+    )
+
+
+def _random_e8m0_scales(
+    num_experts: int,
+    out_features: int,
+    in_features: int,
+) -> torch.Tensor:
+    if in_features % 32 != 0:
+        raise ValueError("in_features must be divisible by 32")
+    return torch.randint(
+        125,
+        130,
+        (num_experts, out_features, in_features // 32),
+        dtype=torch.uint8,
+    )
+
+
+def _dense_owner_reference(
+    owner_tokens: torch.Tensor,
+    dense_weight: torch.Tensor,
+    local_expert_counts: torch.Tensor,
+    *,
+    local_expert_offsets: torch.Tensor | None = None,
+    bias: torch.Tensor | None = None,
+) -> torch.Tensor:
+    if local_expert_offsets is None:
+        local_expert_offsets = torch.empty(
+            local_expert_counts.numel() + 1,
+            dtype=torch.int32,
+        )
+        local_expert_offsets[0] = 0
+        local_expert_offsets[1:] = torch.cumsum(
+            local_expert_counts,
+            dim=0,
+            dtype=torch.int32,
+        )
+
+    expected = torch.empty(
+        owner_tokens.shape[0],
+        dense_weight.shape[1],
+        dtype=torch.float32,
+        device=owner_tokens.device,
+    )
+    for expert_idx in range(dense_weight.shape[0]):
+        start = int(local_expert_offsets[expert_idx].item())
+        end = int(local_expert_offsets[expert_idx + 1].item())
+        if start == end:
+            continue
+        result = owner_tokens[start:end].float() @ dense_weight[expert_idx].T
+        if bias is not None:
+            result = result + bias[expert_idx].float()
+        expected[start:end] = result
+    return expected
+
+
+def _kimi_swiglu_reference(
+    gate_up: torch.Tensor,
+    *,
+    alpha: float = 1.0,
+    limit: float | None = None,
+    beta: float | None = None,
+    layout: str = "interleaved",
+) -> torch.Tensor:
+    if layout == "interleaved":
+        gate = gate_up[..., 0::2].float()
+        up = gate_up[..., 1::2].float()
+    elif layout == "concatenated":
+        gate, up = gate_up.float().chunk(2, dim=-1)
+    else:
+        raise ValueError(layout)
+    if limit is not None:
+        gate = gate.clamp(max=limit)
+        up = up.clamp(min=-limit, max=limit)
+    if alpha == 1.0:
+        activated_gate = torch.nn.functional.silu(gate)
+    else:
+        activated_gate = gate * torch.sigmoid(alpha * gate)
+    if beta is not None:
+        up = up + beta
+    return activated_gate * up
+
+
+def _combine_reference(
+    sorted_outputs: torch.Tensor,
+    scatter_indices: torch.Tensor,
+    routed_weights: torch.Tensor,
+    *,
+    num_tokens: int,
+    top_k: int,
+) -> torch.Tensor:
+    slot_outputs = torch.zeros(num_tokens * top_k, sorted_outputs.shape[1])
+    weighted = sorted_outputs.float() * routed_weights.reshape(-1, 1).float()
+    slot_outputs.index_add_(0, scatter_indices.long(), weighted)
+    return slot_outputs.view(num_tokens, top_k, sorted_outputs.shape[1]).sum(dim=1)
