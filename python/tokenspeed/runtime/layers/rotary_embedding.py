@@ -720,6 +720,8 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
             key = key_rot
         return query.to(dtype), key.to(dtype)
 
+    forward_native = forward
+
 
 class Llama3RotaryEmbedding(RotaryEmbedding):
 
