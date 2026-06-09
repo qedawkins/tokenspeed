@@ -29,6 +29,7 @@ from torch.nn.parameter import Parameter
 from tokenspeed.runtime.layers.moe.backends.base import MoEBackend
 from tokenspeed.runtime.layers.moe.backends.mxfp4.weights import (
     MXFP4_BLOCK,
+    MXFP4_E2M1_BLOCK32_FORMAT,
     create_mxfp4_weights,
 )
 from tokenspeed.runtime.layers.moe.core.types import MoELayerSpec
@@ -150,6 +151,7 @@ def _reorder_w1w3_to_w3w1(x: torch.Tensor, dim: int = -2) -> torch.Tensor:
 
 class Mxfp4FlashinferMxfp4Backend(MoEBackend):
     supported_arches = frozenset({"sm100"})
+    packed_fused_features = frozenset({"self_routing"})
 
     def __init__(
         self,
@@ -183,6 +185,10 @@ class Mxfp4FlashinferMxfp4Backend(MoEBackend):
     @property
     def topk_output_format(self) -> TopKOutputFormat:
         return TopKOutputFormat.BYPASSED
+
+    @property
+    def expert_weight_format_signature(self):
+        return MXFP4_E2M1_BLOCK32_FORMAT
 
     def create_layer_weights(
         self, layer: nn.Module, *, with_bias: bool = False
@@ -221,17 +227,14 @@ class Mxfp4FlashinferMxfp4Backend(MoEBackend):
         ispp_padded = self._ispp_padded
         hidden_padded = self._hidden_padded
 
-        # SwiGLU constants for the fused kernel.
-        #   - alpha   = α in silu(α·gate)
-        #   - beta    = β in (up + β); gpt-oss uses 1.0, standard SwiGLU None
-        #   - limit   = clamp limit on gate (and up, in some recipes)
-        # Models override the gpt-oss defaults via ``MoELayer(swiglu_limit=...,
-        # activation_alpha=..., swiglu_beta=...)``.
+        # SwiGLU constants for the fused kernel. Kimi/DeepSeek-style
+        # activation="silu" is standard SiLU(gate) * up; explicit
+        # activation="swiglu" models supply alpha/clamp/beta overrides.
         swiglu_arg = getattr(layer, "swiglu_arg", None)
         if swiglu_arg is None:
-            alpha = 1.702
-            limit = 7.0
-            beta = 1.0
+            alpha = 1.0
+            limit = None
+            beta = None
         else:
             alpha = swiglu_arg.alpha
             limit = swiglu_arg.limit
