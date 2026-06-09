@@ -23,7 +23,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from functools import partial
-from typing import ClassVar
+from typing import Any, ClassVar
 
 import torch
 from torch import nn
@@ -35,7 +35,10 @@ from tokenspeed.runtime.layers.moe.backends.weight_loaders import (
     load_per_tensor_weight_scale,
 )
 from tokenspeed.runtime.layers.moe.core.types import BackendKey, MoELayerSpec
-from tokenspeed.runtime.layers.moe.topk import TopKOutputFormat
+
+# Iris allocates a symmetric heap per context. EP workspaces are scratch buffers,
+# so share one Iris-backed workspace per rank/spec across MoE layer backends.
+_SHARED_IRIS_EP_WORKSPACES: dict[tuple[object, ...], Any] = {}
 
 
 class MoEBackend(ABC):
@@ -54,6 +57,7 @@ class MoEBackend(ABC):
         self.spec = spec
         self.quant_config = quant_config
         self.routing_config = routing_config
+        self._ep_workspace = None
 
     @classmethod
     @abstractmethod
@@ -96,8 +100,83 @@ class MoEBackend(ABC):
         return False
 
     @property
-    def topk_output_format(self) -> TopKOutputFormat:
+    def returns_replicated_routed_output(self) -> bool:
+        """Whether finalized routed output follows replicated input placement.
+
+        Some owner-directed EP backends combine expert results back to every
+        source rank. If the surrounding model uses post-MoE all-reduce mode,
+        callers must make that routed branch partial before the all-reduce.
+        """
+        return False
+
+    @property
+    def topk_output_format(self):
+        from tokenspeed.runtime.layers.moe.topk import TopKOutputFormat
+
         return TopKOutputFormat.STANDARD
+
+    @property
+    def expert_weight_format_signature(self):
+        return None
+
+    def ensure_ep_workspace(
+        self,
+        *,
+        max_tokens_per_rank: int,
+        dtype: torch.dtype,
+        device: torch.device | str | None = None,
+        iris_mode: str = "auto",
+        iris_context: Any | None = None,
+        context_rank_start: int | None = None,
+        context_rank_stride: int = 1,
+    ):
+        from tokenspeed.runtime.layers.moe.backends.ep_workspace import (
+            EPCommunicationWorkspace,
+        )
+
+        workspace = self._ep_workspace
+        requested_rows = max_tokens_per_rank * self.spec.top_k * self.spec.ep_size
+        requested_device = _normalize_optional_workspace_device(device)
+        shared_key = _shared_iris_ep_workspace_key(
+            self,
+            dtype=dtype,
+            requested_device=requested_device,
+            iris_mode=iris_mode,
+            iris_context=iris_context,
+            context_rank_start=context_rank_start,
+            context_rank_stride=context_rank_stride,
+        )
+        if shared_key is not None:
+            workspace = _SHARED_IRIS_EP_WORKSPACES.get(shared_key)
+        if _can_reuse_ep_workspace(
+            workspace,
+            requested_rows=requested_rows,
+            spec=self.spec,
+            dtype=dtype,
+            requested_device=requested_device,
+            context_rank_start=context_rank_start,
+            context_rank_stride=context_rank_stride,
+        ):
+            self._ep_workspace = workspace
+            return workspace
+
+        workspace = EPCommunicationWorkspace.allocate(
+            max_tokens_per_rank=max_tokens_per_rank,
+            hidden_size=self.spec.hidden_size,
+            top_k=self.spec.top_k,
+            world_size=self.spec.ep_size,
+            rank=self.spec.ep_rank,
+            dtype=dtype,
+            device=device,
+            iris_mode=iris_mode,
+            iris_context=iris_context,
+            context_rank_start=context_rank_start,
+            context_rank_stride=context_rank_stride,
+        )
+        if shared_key is not None and workspace.backend == "iris":
+            _SHARED_IRIS_EP_WORKSPACES[shared_key] = workspace
+        self._ep_workspace = workspace
+        return workspace
 
     def _make_weight_loader(
         self,
@@ -132,3 +211,76 @@ class MoEBackend(ABC):
     @staticmethod
     def _per_tensor_scale_loader() -> Callable:
         return load_per_tensor_weight_scale
+
+
+def _normalize_optional_workspace_device(
+    device: torch.device | str | None,
+) -> torch.device | None:
+    if device is None:
+        return None
+    requested_device = torch.device(device)
+    if requested_device.type == "cuda" and requested_device.index is None:
+        return torch.device("cuda", torch.cuda.current_device())
+    return requested_device
+
+
+def _shared_iris_ep_workspace_key(
+    backend: MoEBackend,
+    *,
+    dtype: torch.dtype,
+    requested_device: torch.device | None,
+    iris_mode: str,
+    iris_context: Any | None,
+    context_rank_start: int | None,
+    context_rank_stride: int,
+) -> tuple[object, ...] | None:
+    if iris_context is not None or iris_mode == "disabled":
+        return None
+    if requested_device is None:
+        if not torch.cuda.is_available():
+            return None
+        requested_device = torch.device("cuda", torch.cuda.current_device())
+    if requested_device.type != "cuda":
+        return None
+    return (
+        type(backend),
+        backend.key,
+        backend.spec.hidden_size,
+        backend.spec.top_k,
+        backend.spec.ep_size,
+        backend.spec.ep_rank,
+        context_rank_start,
+        context_rank_stride,
+        dtype,
+        requested_device.type,
+        requested_device.index,
+    )
+
+
+def _can_reuse_ep_workspace(
+    workspace,
+    *,
+    requested_rows: int,
+    spec: MoELayerSpec,
+    dtype: torch.dtype,
+    requested_device: torch.device | None,
+    context_rank_start: int | None,
+    context_rank_stride: int,
+) -> bool:
+    if workspace is None:
+        return False
+    existing_start = workspace.handle.context_rank_start
+    requested_start_matches = (
+        context_rank_start is None or existing_start == context_rank_start
+    )
+    return (
+        workspace.max_dispatch_rows >= requested_rows
+        and workspace.hidden_size == spec.hidden_size
+        and workspace.top_k == spec.top_k
+        and workspace.world_size == spec.ep_size
+        and workspace.rank == spec.ep_rank
+        and workspace.dtype == dtype
+        and requested_start_matches
+        and workspace.handle.context_rank_stride == context_rank_stride
+        and (requested_device is None or workspace.device == requested_device)
+    )
