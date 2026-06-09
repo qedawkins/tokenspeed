@@ -34,13 +34,15 @@ import pytest
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.join(REPO_ROOT, "python"))
 
-from tokenspeed.cli._argsplit import OrchestratorOpts
-from tokenspeed.cli.serve_smg import (
+from tokenspeed.cli._argsplit import OrchestratorOpts  # noqa: E402
+from tokenspeed.cli.serve_smg import (  # noqa: E402
     _DEFAULT_SMG_DISABLE_FLAGS,
     DEEPSEEK_V4_REASONING_PARSER,
     DEEPSEEK_V4_TOOL_CALL_PARSER,
+    DEFAULT_SMG_HEALTH_CHECK_TIMEOUT_SECS,
     DEFAULT_REASONING_PARSER,
     _args_with_default_model_parsers,
+    _gateway_args_with_default_health_check_timeout,
     _gateway_args_with_default_log_level,
     _gateway_args_with_default_port,
     _gateway_args_with_default_prometheus_port,
@@ -110,6 +112,8 @@ def test_gateway_args_defaults_include_port_and_reasoning_parser():
         "--disable-retries",
         "--tokenizer-cache-enable-l0",
         "--tokenizer-cache-enable-l1",
+        "--health-check-timeout-secs",
+        "30",
         "--log-level",
         "warn",
         "--prometheus-port",
@@ -127,6 +131,25 @@ def test_gateway_args_preserve_user_log_level():
     gateway_args = _gateway_args_with_default_log_level(["--log-level", "debug"])
 
     assert gateway_args == ["--log-level", "debug"]
+
+
+def test_gateway_args_default_health_check_timeout_is_30():
+    gateway_args = _gateway_args_with_default_health_check_timeout(["--model", "/tmp/x"])
+
+    assert gateway_args == [
+        "--model",
+        "/tmp/x",
+        "--health-check-timeout-secs",
+        str(DEFAULT_SMG_HEALTH_CHECK_TIMEOUT_SECS),
+    ]
+
+
+def test_gateway_args_preserve_user_health_check_timeout():
+    gateway_args = _gateway_args_with_default_health_check_timeout(
+        ["--health-check-timeout-secs", "7"]
+    )
+
+    assert gateway_args == ["--health-check-timeout-secs", "7"]
 
 
 def test_gateway_args_default_prometheus_port_is_8413():

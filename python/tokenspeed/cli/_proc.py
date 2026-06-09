@@ -32,7 +32,7 @@ import time
 logger = logging.getLogger(__name__)
 
 _GATEWAY_MODULE = "smg"
-_ENGINE_MODULE_DEFAULT = "smg_grpc_servicer.tokenspeed"
+_ENGINE_MODULE_DEFAULT = "tokenspeed.cli._smg_grpc_engine"
 
 
 async def spawn_engine(
