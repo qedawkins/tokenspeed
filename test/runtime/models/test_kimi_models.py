@@ -12,14 +12,20 @@ Usage:
     python3 -m unittest models.test_kimi_models.TestKimiK25.test_nvckpt_eagle3 -v
 
 Environment (all optional):
-    KIMI_K25_MODEL            HF model id or path (default: nvidia/Kimi-K2.5-NVFP4)
-    KIMI_K25_WORLD_SIZE       GPU count (default: 4)
-    KIMI_K25_DRAFT_MODEL      EAGLE3 draft repo (default: lightseekorg/kimi-k2.5-eagle3)
-    KIMI_K25_MLA_DRAFT_MODEL  MLA EAGLE3 draft repo (default: nvidia/Kimi-K2.5-Thinking-Eagle3)
+    KIMI_K25_RUN_REAL_CHECKPOINT  Set to 1 to run server tests.
+    KIMI_K25_ALLOW_HF_ID          Set to 1 to allow non-local HF repo IDs.
+    KIMI_K25_MODEL                HF model id or path (default: nvidia/Kimi-K2.5-NVFP4)
+    KIMI_K25_QUANTIZATION         Quantization mode (default: nvfp4)
+    KIMI_K25_WORLD_SIZE           GPU count (default: 4)
+    KIMI_K25_LANGUAGE_MODEL_ONLY  Set to 1 for local multimodal Kimi artifacts.
+    KIMI_K25_EXTRA_ARGS           Extra shell-style tokens appended to serve.
+    KIMI_K25_DRAFT_MODEL          EAGLE3 draft repo (default: lightseekorg/kimi-k2.5-eagle3)
+    KIMI_K25_MLA_DRAFT_MODEL      MLA EAGLE3 draft repo (default: nvidia/Kimi-K2.5-Thinking-Eagle3)
 """
 
 import dataclasses
 import os
+import shlex
 import subprocess
 import sys
 import time
@@ -27,17 +33,31 @@ import unittest
 
 import requests
 
-from tokenspeed.runtime.utils.process import kill_process_tree
-
 MODEL = os.environ.get("KIMI_K25_MODEL", "nvidia/Kimi-K2.5-NVFP4")
+QUANTIZATION = os.environ.get("KIMI_K25_QUANTIZATION", "nvfp4")
 WORLD_SIZE = int(os.environ.get("KIMI_K25_WORLD_SIZE", "4"))
 DRAFT_MODEL = os.environ.get("KIMI_K25_DRAFT_MODEL", "lightseekorg/kimi-k2.5-eagle3")
 MLA_DRAFT_MODEL = os.environ.get(
     "KIMI_K25_MLA_DRAFT_MODEL", "nvidia/Kimi-K2.5-Thinking-Eagle3"
 )
 TIMEOUT = 600
+EXTRA_ARGS = tuple(shlex.split(os.environ.get("KIMI_K25_EXTRA_ARGS", "")))
 
 _server_port = 22000
+
+
+def _env_flag(name: str) -> bool:
+    return os.environ.get(name, "").lower() in {"1", "true", "yes", "on"}
+
+
+def _is_local_model_path(model: str) -> bool:
+    return os.path.isdir(os.path.expanduser(model))
+
+
+def _kill_process_tree(pid: int) -> None:
+    from tokenspeed.runtime.utils.process import kill_process_tree
+
+    kill_process_tree(pid)
 
 
 def _next_server_port() -> int:
@@ -68,7 +88,7 @@ def _serve_server(port: int, extra_args=()) -> subprocess.Popen:
         "--max-model-len",
         "81920",
         "--quantization",
-        "nvfp4",
+        QUANTIZATION,
         "--gpu-memory-utilization",
         "0.85",
         "--max-num-seqs",
@@ -81,7 +101,10 @@ def _serve_server(port: int, extra_args=()) -> subprocess.Popen:
         str(WORLD_SIZE),
         "--dense-tp-size",
         str(WORLD_SIZE),
-    ] + list(extra_args)
+    ]
+    if _env_flag("KIMI_K25_LANGUAGE_MODEL_ONLY"):
+        cmd.append("--language-model-only")
+    cmd += list(EXTRA_ARGS) + list(extra_args)
     return subprocess.Popen(cmd, env=os.environ.copy())
 
 
@@ -212,6 +235,18 @@ MESH_CASES = {
 
 
 class TestKimiK25(unittest.TestCase):
+    def setUp(self):
+        if not _env_flag("KIMI_K25_RUN_REAL_CHECKPOINT"):
+            self.skipTest(
+                "real Kimi checkpoint test is artifact-gated; set "
+                "KIMI_K25_RUN_REAL_CHECKPOINT=1 with a local KIMI_K25_MODEL "
+                "to run it"
+            )
+        if not _is_local_model_path(MODEL) and not _env_flag("KIMI_K25_ALLOW_HF_ID"):
+            self.skipTest(
+                "refusing to use a Hugging Face repo ID by default; set "
+                "KIMI_K25_ALLOW_HF_ID=1 only when downloads are intentional"
+            )
 
     def _run_quality_checks(self, case: MeshCase):
         port = _next_server_port()
@@ -230,10 +265,10 @@ class TestKimiK25(unittest.TestCase):
                     f'expected {q["expected"]!r} in {content!r}',
                 )
         finally:
-            kill_process_tree(proc.pid)
+            _kill_process_tree(proc.pid)
 
     def test_base(self):
-        """Kimi K2.5 with NVFP4 quantization."""
+        """Kimi K2.5 with explicit quantization."""
         self._run_quality_checks(MESH_CASES["base"])
 
     def test_tsckpt_eagle3(self):
