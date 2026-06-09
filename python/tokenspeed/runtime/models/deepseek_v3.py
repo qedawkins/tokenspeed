@@ -89,6 +89,7 @@ from tokenspeed.runtime.layers.moe.layer import MoELayer
 from tokenspeed.runtime.layers.moe.topk import TopK
 from tokenspeed.runtime.layers.moe.utils import RoutingMethodType
 from tokenspeed.runtime.layers.paged_attention import PagedAttention
+from tokenspeed.runtime.layers.quantization import Mxfp4Config
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.layers.quantization.nvfp4 import Nvfp4Config
 from tokenspeed.runtime.layers.quantization.utils import (
@@ -305,6 +306,7 @@ class DeepseekV3MoE(nn.Module):
                 "correction_bias": self.gate.e_score_correction_bias,
                 "routing_method_type": RoutingMethodType.DeepSeekV3,
             },
+            with_bias=isinstance(quant_config, Mxfp4Config),
         )
 
         self.topk = TopK(
