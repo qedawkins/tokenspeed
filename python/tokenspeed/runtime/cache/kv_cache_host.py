@@ -31,6 +31,21 @@ from typing import Optional
 
 import psutil
 import torch
+from tokenspeed_kernel.ops.kvcache.cuda import (
+    transfer_kv_all_layer_lf_pf,
+    transfer_kv_all_layer_lf_ph,
+    transfer_kv_all_layer_mla,
+    transfer_kv_all_layer_mla_lf_pf,
+    transfer_kv_direct,
+    transfer_kv_per_layer_mla,
+    transfer_kv_per_layer_mla_pf_lf,
+    transfer_kv_per_layer_pf_lf,
+    transfer_kv_per_layer_ph_lf,
+)
+from tokenspeed_kernel.ops.kvcache.triton import (
+    transfer_kv_all_layer,
+    transfer_kv_per_layer,
+)
 from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.layers.attention.kv_cache.base import BaseTokenToKVPool
@@ -39,23 +54,6 @@ from tokenspeed.runtime.layers.attention.kv_cache.mla import MLATokenToKVPool
 from tokenspeed.runtime.utils import get_colorful_logger
 
 logger = get_colorful_logger(__name__)
-_is_nvidia = current_platform().is_nvidia
-if _is_nvidia:
-    from tokenspeed_kernel.ops.kvcache.cuda import (
-        transfer_kv_all_layer_lf_pf,
-        transfer_kv_all_layer_lf_ph,
-        transfer_kv_all_layer_mla,
-        transfer_kv_all_layer_mla_lf_pf,
-        transfer_kv_direct,
-        transfer_kv_per_layer_mla,
-        transfer_kv_per_layer_mla_pf_lf,
-        transfer_kv_per_layer_pf_lf,
-        transfer_kv_per_layer_ph_lf,
-    )
-from tokenspeed_kernel.ops.kvcache.triton import (
-    transfer_kv_all_layer,
-    transfer_kv_per_layer,
-)
 
 MLA_KVSTORE_LOADBACK_BLOCK_QUOTA = 16
 MLA_KVSTORE_WRITEBACK_BLOCK_QUOTA = 16
