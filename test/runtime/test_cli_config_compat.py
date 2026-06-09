@@ -151,6 +151,47 @@ class TestCLIConfigCompat(unittest.TestCase):
         sa = self._from_cli_args_no_init(args)
         self.assertFalse(sa.enable_expert_parallel)
 
+    def test_mxfp4_allows_mixed_moe_tp_ep(self):
+        args = self._parse_args(
+            [
+                "--model",
+                "amd/Kimi-K2.5-MXFP4",
+                "--world-size",
+                "4",
+                "--moe-tp-size",
+                "2",
+                "--expert-parallel-size",
+                "2",
+                "--quantization",
+                "mxfp4",
+            ]
+        )
+        sa = self._from_cli_args_no_init(args)
+        sa.resolve_parallelism()
+
+        self.assertEqual(sa.mapping.moe.tp_size, 2)
+        self.assertEqual(sa.mapping.moe.ep_size, 2)
+
+    def test_non_mxfp4_rejects_mixed_moe_tp_ep(self):
+        args = self._parse_args(
+            [
+                "--model",
+                "test/model",
+                "--world-size",
+                "4",
+                "--moe-tp-size",
+                "2",
+                "--expert-parallel-size",
+                "2",
+                "--quantization",
+                "fp8",
+            ]
+        )
+        sa = self._from_cli_args_no_init(args)
+
+        with self.assertRaisesRegex(ValueError, "only for MXFP4"):
+            sa.resolve_parallelism()
+
     # ---- vLLM config names ----
 
     def test_tokenizer_arg(self):
