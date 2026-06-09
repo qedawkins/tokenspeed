@@ -129,6 +129,10 @@ class MoELayer(torch.nn.Module):
         return self.backend.topk_output_format
 
     @property
+    def expert_weight_format_signature(self):
+        return self.backend.expert_weight_format_signature
+
+    @property
     def apply_routed_scaling_factor_on_output(self):
         return self.backend.apply_routed_scaling_factor_on_output
 
