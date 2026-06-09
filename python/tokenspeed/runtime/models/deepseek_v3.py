@@ -370,6 +370,9 @@ class DeepseekV3MoE(nn.Module):
                 enable_pdl=pdl_enabled(),
             )
         else:
+            routed_expert_output = self._prepare_routed_output_for_post_moe_comm(
+                routed_expert_output
+            )
             if not self.experts.apply_routed_scaling_factor_on_output:
                 routed_expert_output *= self.routed_scaling_factor
             final_hidden_states = (
@@ -378,6 +381,20 @@ class DeepseekV3MoE(nn.Module):
                 else routed_expert_output
             )
         return final_hidden_states
+
+    def _prepare_routed_output_for_post_moe_comm(
+        self, routed_expert_output: torch.Tensor
+    ) -> torch.Tensor:
+        if not self._post_moe_allreduce_will_sum_replicated_routed_output():
+            return routed_expert_output
+        return routed_expert_output * (1.0 / self.mapping.moe.tp_ep_size)
+
+    def _post_moe_allreduce_will_sum_replicated_routed_output(self) -> bool:
+        return (
+            getattr(self.experts.backend, "returns_replicated_routed_output", False)
+            and self.mapping.moe.tp_ep_size > 1
+            and self.mapping.attn.tp_size == self.mapping.moe.tp_ep_size
+        )
 
 
 def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
