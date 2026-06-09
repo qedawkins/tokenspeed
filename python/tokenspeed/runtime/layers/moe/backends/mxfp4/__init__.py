@@ -18,14 +18,30 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-from tokenspeed.runtime.layers.moe.backends.mxfp4.flashinfer import (
-    Mxfp4FlashinferMxfp4Backend,
-)
-from tokenspeed.runtime.layers.moe.backends.mxfp4.triton_kernel import (
-    Mxfp4TritonKernelBackend,
-)
-
 __all__ = [
     "Mxfp4FlashinferMxfp4Backend",
+    "Mxfp4TritonKernelEPBackend",
     "Mxfp4TritonKernelBackend",
 ]
+
+
+def __getattr__(name: str):
+    if name == "Mxfp4FlashinferMxfp4Backend":
+        from tokenspeed.runtime.layers.moe.backends.mxfp4.flashinfer import (
+            Mxfp4FlashinferMxfp4Backend,
+        )
+
+        return Mxfp4FlashinferMxfp4Backend
+    if name == "Mxfp4TritonKernelBackend":
+        from tokenspeed.runtime.layers.moe.backends.mxfp4.triton_kernel import (
+            Mxfp4TritonKernelBackend,
+        )
+
+        return Mxfp4TritonKernelBackend
+    if name == "Mxfp4TritonKernelEPBackend":
+        from tokenspeed.runtime.layers.moe.backends.mxfp4.triton_kernel_ep import (
+            Mxfp4TritonKernelEPBackend,
+        )
+
+        return Mxfp4TritonKernelEPBackend
+    raise AttributeError(name)
