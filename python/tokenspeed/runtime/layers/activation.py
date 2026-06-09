@@ -35,7 +35,19 @@ from tokenspeed.runtime.utils.pdl import pdl_enabled
 
 _is_amd = current_platform().is_amd
 
-if not _is_amd:
+if _is_amd:
+
+    def silu_and_mul(
+        input: torch.Tensor,
+        out: torch.Tensor,
+        enable_pdl: bool = False,
+    ) -> torch.Tensor:
+        del enable_pdl
+        d = input.shape[-1] // 2
+        torch.mul(F.silu(input[..., :d]), input[..., d:], out=out)
+        return out
+
+else:
     from tokenspeed_kernel.ops.activation.flashinfer import (
         silu_and_mul,
     )
