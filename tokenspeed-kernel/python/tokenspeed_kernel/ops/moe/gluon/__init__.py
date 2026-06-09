@@ -20,6 +20,9 @@
 
 from __future__ import annotations
 
+from tokenspeed_kernel.ops.moe.gluon.combine_gfx950 import (  # noqa: F401
+    gluon_local_sum_reduce_gfx950,
+)
 from tokenspeed_kernel.ops.moe.gluon.dispatch_gfx950 import (  # noqa: F401
     gluon_local_dispatch_gfx950,
 )
@@ -30,4 +33,5 @@ from tokenspeed_kernel.ops.moe.gluon.route_topk_gfx950 import (  # noqa: F401
 __all__ = [
     "gluon_grouped_biased_topk_gfx950",
     "gluon_local_dispatch_gfx950",
+    "gluon_local_sum_reduce_gfx950",
 ]
