@@ -23,6 +23,8 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
+from tokenspeed_kernel.platform import current_platform
+
 from tokenspeed.runtime.configs.model_config import AttentionArch, is_deepseek_v4
 from tokenspeed.runtime.layers.attention.configs.base import BaseAttnConfig
 from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
@@ -104,6 +106,8 @@ _BACKEND_ALIASES = {
 
 def _get_default_backend_name(arch: AttentionArch) -> str:
     if arch == AttentionArch.MLA:
+        if current_platform().is_amd:
+            return "tokenspeed_mla"
         return "mla"
     else:
         return "mha"
