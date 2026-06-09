@@ -441,12 +441,16 @@ class CudaGraphWrapper:
         global _is_capture_mode
         _is_capture_mode = True
         global global_graph_memory_pool
-        with torch.cuda.graph(graph, pool=global_graph_memory_pool, stream=self.stream):
-            out = run_once()
+        try:
+            with torch.cuda.graph(
+                graph, pool=global_graph_memory_pool, stream=self.stream
+            ):
+                out = run_once()
+        finally:
+            _is_capture_mode = False
 
         torch.cuda.synchronize()
         dist.barrier()
-        _is_capture_mode = False
 
         # Graph capture records the hostfunc launches without invoking
         # them, so the dummy run_once pushed stays queued — drain it, and
