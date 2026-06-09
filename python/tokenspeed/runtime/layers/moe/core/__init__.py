@@ -18,7 +18,14 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-from tokenspeed.runtime.layers.moe.core.selector import select_backend
 from tokenspeed.runtime.layers.moe.core.types import BackendKey, MoELayerSpec
 
 __all__ = ["BackendKey", "MoELayerSpec", "select_backend"]
+
+
+def __getattr__(name: str):
+    if name == "select_backend":
+        from tokenspeed.runtime.layers.moe.core.selector import select_backend
+
+        return select_backend
+    raise AttributeError(name)
