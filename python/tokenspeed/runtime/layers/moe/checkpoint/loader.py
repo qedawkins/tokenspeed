@@ -27,7 +27,6 @@ import torch
 from torch import nn
 
 from tokenspeed.runtime.layers.moe.checkpoint.schema import ExpertCheckpointSchema
-from tokenspeed.runtime.model_loader.weight_utils import default_weight_loader
 
 
 @dataclass(frozen=True)
@@ -59,6 +58,29 @@ class MoECheckpointLoadError(RuntimeError):
     pass
 
 
+def _default_weight_loader():
+    from tokenspeed.runtime.model_loader.weight_utils import default_weight_loader
+
+    return default_weight_loader
+
+
+def _num_local_experts_for_ep(
+    *,
+    num_experts: int,
+    ep_rank: int,
+    ep_size: int,
+) -> int:
+    if ep_size <= 0:
+        raise ValueError(f"ep_size must be positive, got {ep_size}")
+    if not 0 <= ep_rank < ep_size:
+        raise ValueError(f"ep_rank {ep_rank} is outside [0, {ep_size})")
+    if num_experts % ep_size != 0:
+        raise ValueError(
+            f"num_experts {num_experts} must be divisible by ep_size {ep_size}"
+        )
+    return num_experts // ep_size
+
+
 def _build_default_expert_plan(
     schema: ExpertCheckpointSchema,
     *,
@@ -68,7 +90,11 @@ def _build_default_expert_plan(
 ) -> list[ExpertWeightPlanEntry]:
     # Expert ownership is assumed to be a contiguous per-rank range here.
     # EPLB-aware remapping would need a different planning step.
-    num_local_experts = num_experts // ep_size
+    num_local_experts = _num_local_experts_for_ep(
+        num_experts=num_experts,
+        ep_rank=ep_rank,
+        ep_size=ep_size,
+    )
     start_expert = num_local_experts * ep_rank
     expert_plan: list[ExpertWeightPlanEntry] = []
     for local_expert_id in range(num_local_experts):
@@ -213,7 +239,11 @@ def _load_fused_expert_tensor(
 ) -> None:
     # Expert ownership is assumed to be a contiguous per-rank range here.
     # EPLB-aware remapping would need a different loading step.
-    num_local_experts = num_experts // ep_size
+    num_local_experts = _num_local_experts_for_ep(
+        num_experts=num_experts,
+        ep_rank=ep_rank,
+        ep_size=ep_size,
+    )
     start_expert = num_local_experts * ep_rank
     end_expert = start_expert + num_local_experts
     weight_loader = param.weight_loader
@@ -272,6 +302,8 @@ class MoECheckpointLoader:
             mapped_name = plan_entry.resolve_param_name(name)
             param = self._params_dict.get(mapped_name)
             if param is None:
+                if mapped_name.endswith((".w13_input_scale", ".w2_input_scale")):
+                    return mapped_name
                 continue
 
             param.weight_loader(
@@ -354,9 +386,9 @@ class MoECheckpointLoader:
                     * (self._ep_rank + 1)
                 ]
                 if tensor_to_load.dtype == torch.float8_e5m2:
-                    default_weight_loader(param, local_experts.to(torch.bfloat16))
+                    _default_weight_loader()(param, local_experts.to(torch.bfloat16))
                 else:
-                    default_weight_loader(param, local_experts)
+                    _default_weight_loader()(param, local_experts)
 
             loaded_any = True
 
