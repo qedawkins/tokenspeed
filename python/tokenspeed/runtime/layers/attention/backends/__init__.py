@@ -54,5 +54,9 @@ if platform.is_nvidia:
     )  # noqa: F401
     from tokenspeed.runtime.layers.attention.backends import trtllm  # noqa: F401
     from tokenspeed.runtime.layers.attention.backends import trtllm_mla  # noqa: F401
+elif platform.is_amd:
+    from tokenspeed.runtime.layers.attention.backends import (
+        tokenspeed_mla,
+    )  # noqa: F401
 
 from tokenspeed.runtime.layers.attention.backends import mha  # noqa: F401

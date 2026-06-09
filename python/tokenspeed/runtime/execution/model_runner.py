@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from tokenspeed.runtime.configs.model_config import AttentionArch, is_deepseek_v4
 from tokenspeed.runtime.execution.weight_loader import WeightLoader
 from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.env import global_server_args_dict_update
@@ -38,6 +39,33 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.utils.server_args import ServerArgs
 
 logger = get_colorful_logger(__name__)
+
+
+def _resolve_model_specific_attention_defaults(
+    server_args: "ServerArgs",
+    model_config: "ModelConfig",
+) -> None:
+    if model_config.attention_arch != AttentionArch.MLA:
+        return
+    if is_deepseek_v4(model_config.hf_config):
+        return
+    from tokenspeed_kernel.platform import current_platform
+
+    if not current_platform().is_amd:
+        return
+
+    if server_args.attention_backend is None:
+        server_args.attention_backend = "tokenspeed_mla"
+        logger.info("Auto-selected attention_backend=tokenspeed_mla for AMD MLA model")
+
+    if (
+        server_args.attention_backend == "tokenspeed_mla"
+        and server_args.kv_cache_dtype == "auto"
+    ):
+        server_args.kv_cache_dtype = "fp8_e4m3"
+        logger.info(
+            "Auto-selected kv_cache_dtype=fp8_e4m3 for AMD tokenspeed_mla backend"
+        )
 
 
 class ModelRunner:
@@ -76,6 +104,8 @@ class ModelRunner:
         if draft_moe_override:
             saved_moe_backend = server_args.moe_backend
             server_args.moe_backend = server_args.draft_moe_backend
+
+        _resolve_model_specific_attention_defaults(server_args, model_config)
 
         # Auto-detect FP8 KV cache from checkpoint quant config (e.g. NVFP4 models
         # with kv_cache_quant_algo: "FP8" in hf_quant_config.json).

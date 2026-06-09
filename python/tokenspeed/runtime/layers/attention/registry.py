@@ -107,6 +107,8 @@ _BACKEND_ALIASES = {
 def _get_default_backend_name(arch: AttentionArch) -> str:
     platform = current_platform()
     if arch == AttentionArch.MLA:
+        if platform.is_amd:
+            return "tokenspeed_mla"
         if platform.is_blackwell:
             return "trtllm_mla"
         if platform.is_hopper:
