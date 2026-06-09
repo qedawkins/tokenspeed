@@ -28,6 +28,9 @@ from tokenspeed_kernel.ops.attention import (
     mha_extend_with_kvcache,
     mha_merge_state,
     mha_prefill,
+    mla_decode_with_kvcache,
+    mla_prefill,
+    mla_prefill_with_kvcache,
 )
 from tokenspeed_kernel.ops.gemm import mm
 from tokenspeed_kernel.ops.moe import (
@@ -60,6 +63,9 @@ __all__ = [
     "mha_decode_with_kvcache",
     "mha_merge_state",
     "mha_decode_scheduler_metadata",
+    "mla_prefill",
+    "mla_prefill_with_kvcache",
+    "mla_decode_with_kvcache",
     # quantization
     "quantize_fp8",
     "quantize_fp8_with_scale",

@@ -41,9 +41,13 @@ from tokenspeed_kernel.ops.quantization.flashinfer import fp4_quantize
 from tokenspeed_kernel.ops.quantization.triton import fp8_quantize
 from tokenspeed_kernel.ops.routing.cuda import dsv3_router_gemm
 from tokenspeed_kernel.platform import current_platform
-from tokenspeed_kernel.thirdparty.cuda.merge_state import merge_state
 from torch import nn
 from transformers import PretrainedConfig
+
+if current_platform().is_amd:
+    from tokenspeed_kernel.ops.attention.triton import merge_state
+else:
+    from tokenspeed_kernel.ops.attention.cuda import merge_state
 
 from tokenspeed.runtime.configs.utils import get_rope_theta
 from tokenspeed.runtime.layers.moe.checkpoint import (
@@ -464,9 +468,7 @@ class DeepseekV3FusedQkvAProjWithMqa(ReplicatedLinear):
 
 class DeepseekV3AttentionMLA(nn.Module):
     # Backends that use non-absorbed MLA kernels (ragged prefill, paged KV decode).
-    _MLA_KERNEL_BACKENDS = ("trtllm_mla", "tokenspeed_mla")
-    # Backends that support chunked ragged prefill with prefix replay.
-    _RAGGED_PREFILL_BACKENDS = ("trtllm_mla", "tokenspeed_mla")
+    _MLA_KERNEL_BACKENDS = ("mla", "trtllm_mla", "tokenspeed_mla")
 
     def __init__(
         self,

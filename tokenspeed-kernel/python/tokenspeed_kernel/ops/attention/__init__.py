@@ -25,6 +25,7 @@ import math
 # Backend registration (side-effect imports)
 import tokenspeed_kernel.ops.attention.cuda  # noqa: F401
 import tokenspeed_kernel.ops.attention.flash_attn  # noqa: F401
+import tokenspeed_kernel.ops.attention.flash_mla  # noqa: F401
 import tokenspeed_kernel.ops.attention.flashinfer  # noqa: F401
 import tokenspeed_kernel.ops.attention.gluon  # noqa: F401
 import tokenspeed_kernel.ops.attention.triton  # noqa: F401
@@ -49,9 +50,24 @@ __all__ = [
     "mha_decode_with_kvcache",
     "mha_merge_state",
     "mha_decode_scheduler_metadata",
+    "mla_prefill",
+    "mla_prefill_with_kvcache",
+    "mla_decode_with_kvcache",
 ]
 
 LSE_LN = math.log2(math.e)
+
+
+def _requires_logit_cap(logit_cap: float) -> bool:
+    return logit_cap != 0.0
+
+
+def _mla_page_size(kv_cache: torch.Tensor) -> int:
+    if kv_cache.dim() == 3:
+        return kv_cache.shape[1]
+    if kv_cache.shape[1] == 1:
+        return kv_cache.shape[2]
+    return kv_cache.shape[1]
 
 
 def mha_prefill(
@@ -428,4 +444,369 @@ def mha_merge_state(
             out_b=out_b,
             lse_b=lse_b,
             lse_scale_log2=lse_scale_log2,
+        )
+
+
+def mla_prefill(
+    q_nope: torch.Tensor,
+    q_pe: torch.Tensor,
+    k_nope: torch.Tensor,
+    k_pe: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_kv: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    # attention options
+    softmax_scale: float | None = None,
+    is_causal: bool = True,
+    window_left: int = -1,
+    logit_cap: float = 0.0,
+    return_lse: bool = False,
+    # dispatch options
+    override: str | None = None,
+    solution: str | None = None,
+) -> AttentionResult:
+    """Ragged MLA prefill without reading a paged KV cache.
+
+    Args:
+        q_nope: Query no-PE component with shape
+            [total_q, num_q_heads, qk_nope_head_dim].
+        q_pe: Query RoPE component with shape
+            [total_q, num_q_heads, qk_rope_head_dim].
+        k_nope: Key no-PE component with shape
+            [total_kv, num_kv_heads, qk_nope_head_dim].
+        k_pe: Key RoPE component with shape
+            [total_kv, num_kv_heads, qk_rope_head_dim].
+        v: Value tensor with shape [total_kv, num_kv_heads, v_head_dim].
+        cu_seqlens_q: Query cumulative sequence lengths with shape [batch + 1].
+        cu_seqlens_kv: KV cumulative sequence lengths with shape [batch + 1].
+        max_seqlen_q: Maximum query length.
+        max_seqlen_k: Maximum KV length.
+        softmax_scale: Optional scale factor applied before softmax.
+        is_causal: Whether to apply causal masking.
+        window_left: Inclusive left sliding-window size. -1 means full attention.
+        logit_cap: Optional soft cap applied to attention logits.
+        return_lse: Whether to also return log-sum-exp values.
+        override: Optional kernel override name.
+
+    Returns:
+        Attention output with shape [total_q, num_q_heads, v_head_dim], or
+        ``(output, lse)`` when ``return_lse`` is true.
+    """
+
+    traits = {
+        "num_q_heads": q_nope.shape[1],
+        "num_kv_heads": k_nope.shape[1],
+        "kv_lora_rank": q_nope.shape[-1],
+        "qk_rope_head_dim": q_pe.shape[-1],
+        "v_head_dim": v.shape[-1],
+        "is_causal": is_causal,
+        "sliding_window": window_left >= 0,
+        "support_logit_cap": _requires_logit_cap(logit_cap),
+        "return_lse": return_lse,
+    }
+    signature = _attention_format_signature(
+        q_nope=q_nope,
+        q_pe=q_pe,
+        k_nope=k_nope,
+        k_pe=k_pe,
+        v=v,
+    )
+    kernel = select_kernel(
+        "attention",
+        "mla_prefill",
+        signature,
+        features=frozenset({"mla"}),
+        traits=traits,
+        solution=solution,
+        override=override,
+    )
+
+    shape_params = {
+        "batch_size": cu_seqlens_q.shape[0] - 1,
+        "total_q": q_nope.shape[0],
+        "total_kv": k_nope.shape[0],
+        "num_q_heads": q_nope.shape[1],
+        "num_kv_heads": k_nope.shape[1],
+        "kv_lora_rank": q_nope.shape[-1],
+        "qk_rope_head_dim": q_pe.shape[-1],
+        "v_head_dim": v.shape[-1],
+        "max_seqlen_q": max_seqlen_q,
+        "max_seqlen_k": max_seqlen_k,
+    }
+    ShapeCapture.get().record(
+        "attention",
+        "mla_prefill",
+        kernel.name,
+        q_nope.dtype,
+        shape_params,
+    )
+
+    with kernel_scope(
+        "attention",
+        "mla_prefill",
+        q_nope.dtype,
+        kernel_name=kernel.name,
+        **shape_params,
+    ):
+        return kernel(
+            q_nope=q_nope,
+            q_pe=q_pe,
+            k_nope=k_nope,
+            k_pe=k_pe,
+            v=v,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_kv=cu_seqlens_kv,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            softmax_scale=softmax_scale,
+            is_causal=is_causal,
+            window_left=window_left,
+            logit_cap=logit_cap,
+            return_lse=return_lse,
+        )
+
+
+def mla_prefill_with_kvcache(
+    q_nope: torch.Tensor,
+    q_pe: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    # attention options
+    softmax_scale: float | None = None,
+    is_causal: bool = True,
+    window_left: int = -1,
+    logit_cap: float = 0.0,
+    return_lse: bool = False,
+    qk_nope_head_dim: int | None = None,
+    # dispatch options
+    override: str | None = None,
+    solution: str | None = None,
+) -> AttentionResult:
+    """Ragged MLA prefill using a paged compressed MLA KV cache.
+
+    The cache is not stored as separated full K/V tensors. It stores the
+    compressed latent KV slice followed by the RoPE key slice in one tensor:
+    ``[ckv | k_pe]``.
+
+    Args:
+        q_nope: Query no-PE component in the cached attention space with shape
+            [total_q, num_q_heads, kv_lora_rank].
+        q_pe: Query RoPE component with shape
+            [total_q, num_q_heads, qk_rope_head_dim].
+        cu_seqlens_q: Query cumulative sequence lengths with shape [batch + 1].
+        kv_cache: Paged compressed MLA KV cache with shape
+            [num_pages, page_size, kv_lora_rank + qk_rope_head_dim] or
+            [num_pages, 1, page_size, kv_lora_rank + qk_rope_head_dim].
+        page_table: Page table with shape [batch, max_pages_per_seq].
+        cache_seqlens: Total visible KV lengths, shape [batch].
+        max_seqlen_q: Maximum query length.
+        max_seqlen_k: Maximum KV length.
+        softmax_scale: Optional scale factor applied before softmax.
+        is_causal: Whether to apply causal masking.
+        window_left: Inclusive left sliding-window size. -1 means full attention.
+        logit_cap: Optional soft cap applied to attention logits.
+        return_lse: Whether to also return log-sum-exp values.
+        qk_nope_head_dim: Optional original no-PE key dimension for kernels that
+            need it when ``q_nope`` has already been absorbed to ``kv_lora_rank``.
+        override: Optional kernel override name.
+
+    Returns:
+        Latent attention output with shape [total_q, num_q_heads, kv_lora_rank],
+        or ``(output, lse)`` when ``return_lse`` is true.
+    """
+
+    page_size = _mla_page_size(kv_cache)
+    traits = {
+        "num_q_heads": q_nope.shape[1],
+        "num_kv_heads": 1,
+        "kv_lora_rank": q_nope.shape[-1],
+        "qk_rope_head_dim": q_pe.shape[-1],
+        "v_head_dim": q_nope.shape[-1],
+        "page_size": page_size,
+        "is_causal": is_causal,
+        "sliding_window": window_left >= 0,
+        "support_logit_cap": _requires_logit_cap(logit_cap),
+        "kv_cache_mode": "cached",
+        "return_lse": return_lse,
+    }
+    signature = _attention_format_signature(q_nope=q_nope, q_pe=q_pe, kv_cache=kv_cache)
+    kernel = select_kernel(
+        "attention",
+        "mla_prefill_with_kvcache",
+        signature,
+        features=frozenset({"mla", "paged"}),
+        traits=traits,
+        solution=solution,
+        override=override,
+    )
+
+    shape_params = {
+        "batch_size": cache_seqlens.shape[0],
+        "total_q": q_nope.shape[0],
+        "num_pages": kv_cache.shape[0],
+        "page_size": page_size,
+        "max_pages_per_seq": page_table.shape[1],
+        "num_q_heads": q_nope.shape[1],
+        "kv_lora_rank": q_nope.shape[-1],
+        "qk_rope_head_dim": q_pe.shape[-1],
+        "max_seqlen_q": max_seqlen_q,
+        "max_seqlen_k": max_seqlen_k,
+    }
+    ShapeCapture.get().record(
+        "attention",
+        "mla_prefill_with_kvcache",
+        kernel.name,
+        q_nope.dtype,
+        shape_params,
+    )
+
+    with kernel_scope(
+        "attention",
+        "mla_prefill_with_kvcache",
+        q_nope.dtype,
+        kernel_name=kernel.name,
+        **shape_params,
+    ):
+        return kernel(
+            q_nope=q_nope,
+            q_pe=q_pe,
+            cu_seqlens_q=cu_seqlens_q,
+            kv_cache=kv_cache,
+            page_table=page_table,
+            cache_seqlens=cache_seqlens,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            softmax_scale=softmax_scale,
+            is_causal=is_causal,
+            window_left=window_left,
+            logit_cap=logit_cap,
+            return_lse=return_lse,
+            qk_nope_head_dim=qk_nope_head_dim,
+        )
+
+
+def mla_decode_with_kvcache(
+    q_nope: torch.Tensor,
+    q_pe: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    max_seqlen_k: int,
+    # attention options
+    softmax_scale: float | None = None,
+    is_causal: bool = True,
+    window_left: int = -1,
+    logit_cap: float = 0.0,
+    return_lse: bool = False,
+    qk_nope_head_dim: int | None = None,
+    # dispatch options
+    override: str | None = None,
+    solution: str | None = None,
+) -> AttentionResult:
+    """Single-token MLA decode using a paged compressed MLA KV cache.
+
+    The cache is not stored as separated full K/V tensors. It stores the
+    compressed latent KV slice followed by the RoPE key slice in one tensor:
+    ``[ckv | k_pe]``.
+
+    Args:
+        q_nope: Query no-PE component in the cached attention space with shape
+            [batch, num_q_heads, kv_lora_rank].
+        q_pe: Query RoPE component with shape
+            [batch, num_q_heads, qk_rope_head_dim].
+        cu_seqlens_q: Query cumulative sequence lengths with shape [batch + 1].
+        kv_cache: Paged compressed MLA KV cache with shape
+            [num_pages, page_size, kv_lora_rank + qk_rope_head_dim] or
+            [num_pages, 1, page_size, kv_lora_rank + qk_rope_head_dim].
+        page_table: Page table with shape [batch, max_pages_per_seq].
+        cache_seqlens: Total visible KV lengths, shape [batch].
+        max_seqlen_k: Maximum KV length.
+        softmax_scale: Optional scale factor applied before softmax.
+        is_causal: Whether to apply causal masking.
+        window_left: Inclusive left sliding-window size. -1 means full attention.
+        logit_cap: Optional soft cap applied to attention logits.
+        return_lse: Whether to also return log-sum-exp values.
+        qk_nope_head_dim: Optional original no-PE key dimension for kernels that
+            need it when ``q_nope`` has already been absorbed to ``kv_lora_rank``.
+        override: Optional kernel override name.
+
+    Returns:
+        Latent attention output with shape [batch, num_q_heads, kv_lora_rank],
+        or ``(output, lse)`` when ``return_lse`` is true.
+    """
+
+    page_size = _mla_page_size(kv_cache)
+    traits = {
+        "num_q_heads": q_nope.shape[1],
+        "num_kv_heads": 1,
+        "kv_lora_rank": q_nope.shape[-1],
+        "qk_rope_head_dim": q_pe.shape[-1],
+        "v_head_dim": q_nope.shape[-1],
+        "page_size": page_size,
+        "is_causal": is_causal,
+        "sliding_window": window_left >= 0,
+        "support_logit_cap": _requires_logit_cap(logit_cap),
+        "kv_cache_mode": "cached",
+        "return_lse": return_lse,
+        "uniform_query_len": True,
+        "query_len": 1,
+    }
+    signature = _attention_format_signature(q_nope=q_nope, q_pe=q_pe, kv_cache=kv_cache)
+    kernel = select_kernel(
+        "attention",
+        "mla_decode_with_kvcache",
+        signature,
+        features=frozenset({"mla", "paged"}),
+        traits=traits,
+        solution=solution,
+        override=override,
+    )
+
+    shape_params = {
+        "batch_size": cache_seqlens.shape[0],
+        "total_q": q_nope.shape[0],
+        "num_pages": kv_cache.shape[0],
+        "page_size": page_size,
+        "max_pages_per_seq": page_table.shape[1],
+        "num_q_heads": q_nope.shape[1],
+        "kv_lora_rank": q_nope.shape[-1],
+        "qk_rope_head_dim": q_pe.shape[-1],
+        "max_seqlen_k": max_seqlen_k,
+    }
+    ShapeCapture.get().record(
+        "attention",
+        "mla_decode_with_kvcache",
+        kernel.name,
+        q_nope.dtype,
+        shape_params,
+    )
+
+    with kernel_scope(
+        "attention",
+        "mla_decode_with_kvcache",
+        q_nope.dtype,
+        kernel_name=kernel.name,
+        **shape_params,
+    ):
+        return kernel(
+            q_nope=q_nope,
+            q_pe=q_pe,
+            cu_seqlens_q=cu_seqlens_q,
+            kv_cache=kv_cache,
+            page_table=page_table,
+            cache_seqlens=cache_seqlens,
+            max_seqlen_k=max_seqlen_k,
+            softmax_scale=softmax_scale,
+            is_causal=is_causal,
+            window_left=window_left,
+            logit_cap=logit_cap,
+            return_lse=return_lse,
+            qk_nope_head_dim=qk_nope_head_dim,
         )

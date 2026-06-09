@@ -21,8 +21,6 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
-import torch
-
 from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.layers.attention import registry
 from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
@@ -104,42 +102,8 @@ class TestAttentionBackendChoices(unittest.TestCase):
                 MHAAttnBackend,
             )
 
-    def test_sm90_defaults_to_flashmla_for_mla(self):
-        platform = SimpleNamespace(is_amd=False, is_blackwell=False, is_hopper=True)
-        with mock.patch.object(registry, "current_platform", return_value=platform):
-            self.assertEqual(
-                registry._get_default_backend_name(AttentionArch.MLA), "flashmla"
-            )
-
-    def test_amd_defaults_to_tokenspeed_mla_for_mla(self):
-        platform = SimpleNamespace(is_amd=True, is_blackwell=False, is_hopper=False)
-        with mock.patch.object(registry, "current_platform", return_value=platform):
-            self.assertEqual(
-                registry._get_default_backend_name(AttentionArch.MLA), "tokenspeed_mla"
-            )
-
-    def test_tokenspeed_mla_workspace_uses_platform_sm_fallback(self):
-        from tokenspeed.runtime.layers.attention.backends import tokenspeed_mla
-
-        device = torch.device("meta")
-        tokenspeed_mla._cutedsl_workspace_buffer.pop(device, None)
-        platform = SimpleNamespace(sm_count=7)
-        with (
-            mock.patch.object(
-                tokenspeed_mla,
-                "get_num_sm",
-                side_effect=RuntimeError("Kernel implementation not found"),
-            ),
-            mock.patch.object(tokenspeed_mla, "current_platform", return_value=platform),
-        ):
-            workspace = tokenspeed_mla.get_cutedsl_workspace_buffer(
-                device,
-                num_heads_per_tp=2,
-                kv_lora_rank=3,
-                q_len_capacity=5,
-            )
-
-        self.assertEqual(workspace.numel(), 7 * 2 * 5 * (3 + 1) * 4)
+    def test_defaults_to_unified_mla_for_mla(self):
+        self.assertEqual(registry._get_default_backend_name(AttentionArch.MLA), "mla")
 
     def test_mha_config_propagates_speculative_settings(self):
         server_args = SimpleNamespace(
