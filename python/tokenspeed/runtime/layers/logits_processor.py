@@ -161,8 +161,22 @@ def _lm_head_matmul(hidden_states: torch.Tensor, weight: torch.Tensor) -> torch.
     cast_hidden = hidden_states.to(weight.dtype)
     should_use_fused, lm_head_gemm = _get_fused_lm_head_gemm()
     if should_use_fused is not None and should_use_fused(cast_hidden, weight):
-        return lm_head_gemm(cast_hidden, weight, enable_pdl=True)
+        try:
+            return lm_head_gemm(cast_hidden, weight, enable_pdl=True)
+        except Exception as exc:
+            if not _is_fused_lm_head_unavailable(exc):
+                raise
+            global _FUSED_LM_HEAD_GEMM
+            _FUSED_LM_HEAD_GEMM = (None, None)
     return torch.matmul(cast_hidden, weight.T)
+
+
+def _is_fused_lm_head_unavailable(exc: Exception) -> bool:
+    message = str(exc)
+    return (
+        "lm_head_gemm library not found" in message
+        or "cannot open shared object file" in message
+    )
 
 
 class LogitsProcessor(nn.Module):
@@ -448,18 +462,20 @@ class LogitsProcessor(nn.Module):
                     safe=False,
                 )
             else:
+                num_rows = logits.size(0)
+                local_vocab_size = logits.size(1)
                 gathered_logits = torch.empty(
-                    self.tp_size * logits.size(0),
-                    logits.size(1),
+                    self.tp_size * num_rows,
+                    local_vocab_size,
                     dtype=logits.dtype,
                     device=logits.device,
                 )
                 all_gather_into_tensor(gathered_logits, logits, self.tp_group)
                 logits = (
-                    gathered_logits.view(self.tp_size, logits.size(0), logits.size(1))
+                    gathered_logits.view(self.tp_size, num_rows, local_vocab_size)
                     .transpose(0, 1)
                     .contiguous()
-                    .view(logits.size(0), -1)
+                    .view(num_rows, local_vocab_size * self.tp_size)
                 )
 
         logits = logits[:, : self.config.vocab_size].contiguous()
