@@ -221,6 +221,50 @@ def triton_quantize_fp8(
     return fp8_quantize(x, scale=scale, enable_pdl=enable_pdl)
 
 
+@register_kernel(
+    "quantization",
+    "mxfp4",
+    name="triton_quantize_mxfp4",
+    solution="triton",
+    signatures=format_signatures("x", "dense", {torch.bfloat16, torch.float16}),
+    traits={
+        "scale_size": frozenset({32}),
+        "scale_layout": frozenset({"linear"}),
+        "has_global_scale": frozenset({False}),
+        "scale_encoding": frozenset({"ue8m0"}),
+    },
+    priority=Priority.PORTABLE,
+)
+def triton_quantize_mxfp4(
+    x: torch.Tensor,
+    global_scale: float | None = None,
+    scale_size: int = 32,
+    scale_layout: str = "linear",
+    enable_pdl: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if global_scale is not None:
+        raise ValueError("triton_quantize_mxfp4 computes dynamic local scales")
+    if scale_size != 32:
+        raise ValueError(f"scale_size must be 32 for MXFP4, got {scale_size}")
+    if scale_layout != "linear":
+        raise ValueError(
+            f"triton_quantize_mxfp4 only supports linear scales, got {scale_layout!r}"
+        )
+    if enable_pdl:
+        raise NotImplementedError("MXFP4 activation quantization PDL is not wired")
+
+    from triton_kernels.numerics_details.mxfp import downcast_to_mxfp
+
+    return downcast_to_mxfp(
+        x.contiguous(),
+        torch.uint8,
+        axis=-1,
+        scale_dtype=torch.uint8,
+        microblock_size=scale_size,
+    )
+
+
 __all__ = [
     "fp8_quantize",
+    "triton_quantize_mxfp4",
 ]
