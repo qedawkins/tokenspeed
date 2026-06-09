@@ -41,6 +41,7 @@ from tokenspeed_kernel.ops.attention.tokenspeed_mla import (
     tokenspeed_mla_prefill,
     warmup_compile_prefill,
 )
+from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
@@ -74,6 +75,15 @@ _cutedsl_workspace_buffer: dict[torch.device, torch.Tensor] = {}
 _CUTEDSL_INITIAL_Q_LEN_CAPACITY = 8
 
 
+def _get_num_sms(device: torch.device) -> int:
+    try:
+        return get_num_sm(device)
+    except RuntimeError as exc:
+        if "Kernel implementation not found" not in str(exc):
+            raise
+        return current_platform().sm_count
+
+
 def get_cutedsl_workspace_buffer(
     device: torch.device,
     num_heads_per_tp: int,
@@ -81,7 +91,7 @@ def get_cutedsl_workspace_buffer(
     q_len_capacity: int = _CUTEDSL_INITIAL_Q_LEN_CAPACITY,
 ) -> torch.Tensor:
     """Get or grow the per-device CuteDSL workspace buffer."""
-    num_sms = get_num_sm(device)
+    num_sms = _get_num_sms(device)
     required = num_sms * num_heads_per_tp * q_len_capacity * (kv_lora_rank + 1) * 4
 
     existing = _cutedsl_workspace_buffer.get(device)
