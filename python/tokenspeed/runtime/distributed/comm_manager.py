@@ -56,8 +56,20 @@ class CommManager:
         return [base + 1] * remainder + [base] * (tp_size - remainder)
 
     def get_num_tokens(self, ctx: ForwardContext):
+        if self.is_moe and self.use_all_reduce(is_moe=True):
+            num_tokens = self._replicated_num_tokens(ctx)
+            return num_tokens * self.mapping.moe.tp_ep_size, num_tokens
         scattered = self.scattered_num_tokens(ctx)
         return sum(scattered), max(scattered)
+
+    def _replicated_num_tokens(self, ctx: ForwardContext) -> int:
+        global_counts = (
+            ctx.global_bs if ctx.draft_first_step_reduce else ctx.global_num_tokens
+        )
+        if global_counts is not None:
+            start = self.mapping.moe.dp_rank * self.mapping.moe.tp_ep_size
+            return int(global_counts[start])
+        return ctx.bs if ctx.draft_first_step_reduce else ctx.input_num_tokens
 
     def scattered_num_tokens(self, ctx: ForwardContext) -> list[int]:
         # Under draft first-step reduce, comm operates on bs / global_bs since
