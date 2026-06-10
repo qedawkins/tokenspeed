@@ -131,8 +131,10 @@ class MoELayer(torch.nn.Module):
         internal_activation_dtype = None
         if self._quant_kind == "fp8":
             fp8_scale_block_shape = tuple(self.quant_config.weight_block_size)
-        if self._quant_kind == "mxfp4" and self.quant_config.is_w4a8_fp8:
-            internal_activation_dtype = "fp8"
+        if self._quant_kind == "mxfp4":
+            internal_activation_dtype = (
+                "fp8" if self.quant_config.is_w4a8_fp8 else "input"
+            )
 
         input_dtype = torch.get_default_dtype()
         if input_dtype not in {torch.float16, torch.bfloat16}:
