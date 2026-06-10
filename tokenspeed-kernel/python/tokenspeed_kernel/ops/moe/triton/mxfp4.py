@@ -101,6 +101,13 @@ def _with_activation_mx_scale(
     return precision_config
 
 
+def _release_parameter(module: torch.nn.Module, name: str) -> None:
+    if name in module._parameters:
+        module.register_parameter(name, None)
+    elif hasattr(module, name):
+        delattr(module, name)
+
+
 def _silu_gate_up(
     gate_up: torch.Tensor,
     *,
@@ -362,6 +369,10 @@ def triton_kernels_mxfp4_moe_process_weights(plan: dict, w: torch.nn.Module):
     )
     w.w13_weight_triton_tensor = w13_weight
     w.w2_weight_triton_tensor = w2_weight
+    _release_parameter(w, "w13_weight")
+    _release_parameter(w, "w13_weight_scale")
+    _release_parameter(w, "w2_weight")
+    _release_parameter(w, "w2_weight_scale")
     return None
 
 
