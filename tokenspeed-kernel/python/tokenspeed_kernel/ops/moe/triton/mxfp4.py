@@ -255,6 +255,24 @@ def _routing_from_topk(
     return ragged_metadata, gather_indx, scatter_indx, gate_scal
 
 
+def _local_topk_for_ep(
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    w: torch.nn.Module,
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    ep_size = int(getattr(w, "ep_size", 1))
+    if ep_size <= 1:
+        return topk_weights, topk_ids, int(getattr(w, "num_experts"))
+
+    num_local_experts = int(getattr(w, "num_local_experts"))
+    expert_offset = int(getattr(w, "ep_rank", 0)) * num_local_experts
+    local_ids = topk_ids - expert_offset
+    local_mask = (local_ids >= 0) & (local_ids < num_local_experts)
+    local_weights = torch.where(local_mask, topk_weights, torch.zeros_like(topk_weights))
+    local_ids = torch.where(local_mask, local_ids, topk_ids.new_full((), -1))
+    return local_weights, local_ids, num_local_experts
+
+
 @register_kernel(
     "moe",
     "process_weights",
@@ -397,6 +415,28 @@ def triton_kernels_mxfp4_moe_process_weights(plan: dict, w: torch.nn.Module):
 @register_kernel(
     "moe",
     "apply",
+    name="triton_kernels_mxfp4_ep_precomputed_moe_apply",
+    solution="triton_kernels",
+    signatures=format_signatures(
+        "x",
+        "dense",
+        {torch.float16, torch.bfloat16},
+    ),
+    traits={
+        "weight_dtype": frozenset({"mxfp4"}),
+        "activation": frozenset({"silu", "swiglu"}),
+        "supports_deferred_finalize": frozenset({False}),
+        "supports_ep": frozenset({True}),
+        "supports_all_to_all_ep": frozenset({False}),
+        "ispp_alignment": frozenset({1}),
+        "internal_activation_dtype": frozenset({"input"}),
+        "supports_bias": frozenset({True}),
+    },
+    priority=Priority.PERFORMANT + 1,
+)
+@register_kernel(
+    "moe",
+    "apply",
     name="triton_kernels_mxfp4_fp8_activation_moe_apply",
     solution="triton_kernels",
     capability=CapabilityRequirement(vendors=frozenset({"amd"})),
@@ -433,10 +473,15 @@ def triton_kernels_mxfp4_moe_apply(
     if topk_weights is not None or topk_ids is not None:
         if topk_weights is None or topk_ids is None:
             raise ValueError("topk_weights and topk_ids must be provided together")
+        topk_weights, topk_ids, num_experts = _local_topk_for_ep(
+            topk_weights,
+            topk_ids,
+            w,
+        )
         ragged_metadata, gather_indx, scatter_indx, gate_scal = _routing_from_topk(
             topk_weights,
             topk_ids,
-            num_experts=getattr(w, "num_experts"),
+            num_experts=num_experts,
             dtype=router_logits.dtype,
         )
     else:
