@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import copy
 from contextlib import contextmanager
 
 import tokenspeed_kernel
@@ -66,6 +67,38 @@ from triton_kernels.topk import topk
 platform = current_platform()
 
 MXFP4_BLOCK = 32
+MXFP4_ACTIVATION_SCALE_LAYOUT = "linear"
+
+
+def _uses_dynamic_mxfp4_activations(w: torch.nn.Module) -> bool:
+    quant_config = getattr(w, "quant_config", None)
+    return current_platform().is_amd and bool(
+        getattr(quant_config, "use_dynamic_mxfp4_activations", False)
+    )
+
+
+def _quantize_mxfp4_activation(
+    activations: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return tokenspeed_kernel.quantize_mxfp4(
+        activations.contiguous(),
+        scale_size=MXFP4_BLOCK,
+        scale_layout=MXFP4_ACTIVATION_SCALE_LAYOUT,
+        solution="triton",
+        enable_pdl=False,
+    )
+
+
+def _with_activation_mx_scale(
+    precision_config: PrecisionConfig | None,
+    activation_scale: torch.Tensor,
+) -> PrecisionConfig:
+    if precision_config is None:
+        precision_config = PrecisionConfig()
+    precision_config = copy.copy(precision_config)
+    precision_config.a_mx_scale = activation_scale
+    precision_config.a_microblock_size = MXFP4_BLOCK
+    return precision_config
 
 
 def _silu_gate_up(
@@ -313,7 +346,7 @@ def triton_kernels_mxfp4_moe_process_weights(plan: dict, w: torch.nn.Module):
     else:
         w13_lhs = InFlexData()
         w2_lhs = InFlexData()
-        out_dtype = None
+        out_dtype = torch.bfloat16 if _uses_dynamic_mxfp4_activations(w) else None
 
     w.w13_precision_config = PrecisionConfig(
         flex_ctx=FlexCtx(lhs_data=w13_lhs, rhs_data=w13_flex),
@@ -372,7 +405,7 @@ def triton_kernels_mxfp4_moe_process_weights(plan: dict, w: torch.nn.Module):
         "supports_ep": frozenset({False}),
         "supports_all_to_all_ep": frozenset({False}),
         "ispp_alignment": frozenset({1}),
-        "internal_activation_dtype": frozenset({"fp8"}),
+        "internal_activation_dtype": frozenset({"fp8", "input"}),
         "supports_bias": frozenset({True}),
     },
     priority=Priority.SPECIALIZED + 2,
@@ -394,7 +427,7 @@ def triton_kernels_mxfp4_moe_process_weights(plan: dict, w: torch.nn.Module):
         "supports_ep": frozenset({True}),
         "supports_all_to_all_ep": frozenset({False}),
         "ispp_alignment": frozenset({1}),
-        "internal_activation_dtype": frozenset({"fp8"}),
+        "internal_activation_dtype": frozenset({"fp8", "input"}),
         "supports_bias": frozenset({True}),
     },
     priority=Priority.SPECIALIZED + 1,
@@ -467,6 +500,7 @@ def triton_kernels_mxfp4_moe_apply(
             (swiglu_arg.alpha, swiglu_arg.limit),
         )
 
+    use_dynamic_mxfp4 = _uses_dynamic_mxfp4_activations(w)
     w13_precision_config = getattr(w, "w13_precision_config", None)
     w2_precision_config = getattr(w, "w2_precision_config", None)
     if hasattr(w, "w13_act_scale"):
@@ -474,6 +508,12 @@ def triton_kernels_mxfp4_moe_apply(
             x,
             scale=w.w13_act_scale,
             solution="triton",
+        )
+    elif use_dynamic_mxfp4:
+        gemm1_input, gemm1_scale = _quantize_mxfp4_activation(x)
+        w13_precision_config = _with_activation_mx_scale(
+            w13_precision_config,
+            gemm1_scale,
         )
     else:
         gemm1_input = x
@@ -498,6 +538,12 @@ def triton_kernels_mxfp4_moe_apply(
             intermediate_cache,
             scale=w.w2_act_scale,
             solution="triton",
+        )
+    elif use_dynamic_mxfp4:
+        gemm2_input, gemm2_scale = _quantize_mxfp4_activation(intermediate_cache)
+        w2_precision_config = _with_activation_mx_scale(
+            w2_precision_config,
+            gemm2_scale,
         )
     else:
         gemm2_input = intermediate_cache

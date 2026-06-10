@@ -551,7 +551,7 @@ def _moe_apply_mxfp4_precomputed_tp() -> object:
         input_dtype=torch.bfloat16,
         activation="silu",
         ep_size=1,
-        internal_activation_dtype="fp8",
+        internal_activation_dtype="input",
     )
     x = torch.empty((4, 16), dtype=torch.bfloat16)
     router_logits = torch.empty((4, 8), dtype=torch.float32)
@@ -573,7 +573,7 @@ def _moe_apply_mxfp4_precomputed_ep() -> object:
         input_dtype=torch.bfloat16,
         activation="silu",
         ep_size=4,
-        internal_activation_dtype="fp8",
+        internal_activation_dtype="input",
     )
     x = torch.empty((4, 16), dtype=torch.bfloat16)
     router_logits = torch.empty((4, 8), dtype=torch.float32)
