@@ -157,17 +157,28 @@ def _lm_head_matmul(hidden_states: torch.Tensor, weight: torch.Tensor) -> torch.
     template and the bench-driven perf gate accepts (``should_use_fused``).
     Otherwise falls back to ``torch.matmul``.
 
-    Only enabled for Kimi (``model_type == "kimi_k2"``) at the call site —
-    on DSv3 the fused kernel's PDL launch surface caused a downstream EAGLE3
-    spec decode AR regression that we have not characterised end-to-end; on
-    Kimi the perf win is the largest and the regression has not been
-    reproduced, so we gate the fused path to Kimi only.
+    The fused path is selected only by the fused kernel's own availability and
+    shape predicate. Unsupported builds or shapes use the Torch fallback.
     """
     cast_hidden = hidden_states.to(weight.dtype)
     should_use_fused, lm_head_gemm = _get_fused_lm_head_gemm()
     if should_use_fused is not None and should_use_fused(cast_hidden, weight):
-        return lm_head_gemm(cast_hidden, weight, enable_pdl=True)
+        try:
+            return lm_head_gemm(cast_hidden, weight, enable_pdl=True)
+        except Exception as exc:
+            if not _is_fused_lm_head_unavailable(exc):
+                raise
+            global _FUSED_LM_HEAD_GEMM
+            _FUSED_LM_HEAD_GEMM = (None, None)
     return torch.matmul(cast_hidden, weight.T)
+
+
+def _is_fused_lm_head_unavailable(exc: Exception) -> bool:
+    message = str(exc)
+    return (
+        "lm_head_gemm library not found" in message
+        or "cannot open shared object file" in message
+    )
 
 
 class LogitsProcessor(nn.Module):
@@ -211,9 +222,6 @@ class LogitsProcessor(nn.Module):
             and self.final_logit_softcapping < 0
         ):
             self.final_logit_softcapping = None
-
-        # Gate the fused lm_head GEMM to Kimi only. See ``_lm_head_matmul``.
-        self._use_fused_lm_head = getattr(self.config, "model_type", None) == "kimi_k2"
 
     def configure_dp_logits_layout(self, runtime: DpSamplingRuntimeConfig) -> None:
         if (
@@ -499,12 +507,7 @@ class LogitsProcessor(nn.Module):
             )
 
         if hasattr(lm_head, "weight"):
-            if self._use_fused_lm_head:
-                logits = _lm_head_matmul(hidden_states, lm_head.weight)
-            else:
-                logits = torch.matmul(
-                    hidden_states.to(lm_head.weight.dtype), lm_head.weight.T
-                )
+            logits = _lm_head_matmul(hidden_states, lm_head.weight)
         else:
             # GGUF models
             logits = lm_head.linear_method.apply(lm_head, hidden_states, embedding_bias)
@@ -535,18 +538,20 @@ class LogitsProcessor(nn.Module):
                     safe=False,
                 )
             else:
+                num_rows = logits.size(0)
+                local_vocab_size = logits.size(1)
                 gathered_logits = torch.empty(
-                    self.tp_size * logits.size(0),
-                    logits.size(1),
+                    self.tp_size * num_rows,
+                    local_vocab_size,
                     dtype=logits.dtype,
                     device=logits.device,
                 )
                 all_gather_into_tensor(gathered_logits, logits, self.tp_group)
                 logits = (
-                    gathered_logits.view(self.tp_size, logits.size(0), logits.size(1))
+                    gathered_logits.view(self.tp_size, num_rows, local_vocab_size)
                     .transpose(0, 1)
                     .contiguous()
-                    .view(logits.size(0), -1)
+                    .view(num_rows, local_vocab_size * self.tp_size)
                 )
 
         logits = logits[:, : self.config.vocab_size].contiguous()
