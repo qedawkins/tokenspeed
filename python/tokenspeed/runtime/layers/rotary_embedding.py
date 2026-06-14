@@ -28,11 +28,7 @@ from typing import Any, Tuple
 import torch
 import torch.nn as nn
 from tokenspeed_kernel.ops.embedding import FusedSetKVBufferArg, apply_rope
-from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.torch_compile import get_compiler_backend
-
-_is_nvidia = current_platform().is_nvidia
-_is_amd = current_platform().is_amd
 
 
 def _rotate_neox(x: torch.Tensor) -> torch.Tensor:
@@ -623,10 +619,6 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
             head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype
         )
 
-        # Re-dispatch
-        if _is_amd:
-            self._forward_method = self.forward_native
-
     def _compute_inv_freq(self, scaling_factor: float) -> torch.Tensor:
         pos_freqs = self.base ** (
             torch.arange(0, self.rotary_dim, 2, dtype=torch.float, device=self.device)
@@ -677,48 +669,14 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         output_q_rope=None,
         offsets: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if _is_nvidia:
-            return super().forward(
-                positions=positions,
-                query=query,
-                key=key,
-                fused_set_kv_buffer_arg=fused_set_kv_buffer_arg,
-                output_q_rope=output_q_rope,
-                offsets=offsets,
-            )
-
-        dtype = query.dtype
-        query_rot = query[..., : self.rotary_dim]
-        key_rot = key[..., : self.rotary_dim]
-        if self.rotary_dim < self.head_size:
-            query_pass = query[..., self.rotary_dim :]
-            key_pass = key[..., self.rotary_dim :]
-
-        self.cos_sin_cache: torch.Tensor = self.cos_sin_cache.to(positions.device)
-        cos_sin = self.cos_sin_cache[
-            torch.add(positions, offsets) if offsets is not None else positions
-        ]
-        cos, sin = cos_sin.chunk(2, dim=-1)
-        if self.is_neox_style:
-            #  Here we assume that the positions tensor has the
-            # shape [batch_size, seq_len].
-            cos = cos.repeat(1, 1, 2).unsqueeze(-2)
-            sin = sin.repeat(1, 1, 2).unsqueeze(-2)
-        else:
-            cos = cos.repeat_interleave(2, dim=-1).unsqueeze(-2)
-            sin = sin.repeat_interleave(2, dim=-1).unsqueeze(-2)
-
-        rotate_fn = _rotate_neox if self.is_neox_style else _rotate_gptj
-        query_rot = query_rot * cos + rotate_fn(query_rot) * sin
-        key_rot = key_rot * cos + rotate_fn(key_rot) * sin
-
-        if self.rotary_dim < self.head_size:
-            query = torch.cat((query_rot, query_pass), dim=-1)
-            key = torch.cat((key_rot, key_pass), dim=-1)
-        else:
-            query = query_rot
-            key = key_rot
-        return query.to(dtype), key.to(dtype)
+        return super().forward(
+            positions=positions,
+            query=query,
+            key=key,
+            fused_set_kv_buffer_arg=fused_set_kv_buffer_arg,
+            output_q_rope=output_q_rope,
+            offsets=offsets,
+        )
 
 
 class Llama3RotaryEmbedding(RotaryEmbedding):
