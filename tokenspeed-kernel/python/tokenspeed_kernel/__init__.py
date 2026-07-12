@@ -39,7 +39,7 @@ from tokenspeed_kernel.ops.attention import (
     mla_decode_with_kvcache,
     mla_prefill,
 )
-from tokenspeed_kernel.ops.gemm import mm
+from tokenspeed_kernel.ops.gemm import bmm, mm
 from tokenspeed_kernel.ops.moe import moe_apply, moe_plan, moe_process_weights
 from tokenspeed_kernel.ops.quantization import (
     quantize_fp8,
@@ -56,6 +56,7 @@ __all__ = [
     # exceptions
     "NoKernelFoundError",
     # gemm
+    "bmm",
     "mm",
     # attention
     "mha_plan",

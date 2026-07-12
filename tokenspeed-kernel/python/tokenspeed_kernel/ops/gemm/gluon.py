@@ -73,6 +73,7 @@ if _dense16_impl is not None:
         *,
         alpha: torch.Tensor | None = None,
         block_size: list[int] | None = None,
+        out: torch.Tensor | None = None,
     ):
         if A_scales is not None:
             raise ValueError("A_scales are not supported for dense16 Gluon GEMM")
@@ -81,14 +82,23 @@ if _dense16_impl is not None:
         if block_size is not None:
             raise ValueError("block_size is not supported for dense16 Gluon GEMM")
 
-        output = _dense16_impl(A, B, out_dtype, alpha=alpha)
+        output = _dense16_impl(A, B, out_dtype, alpha=alpha, out=out)
         if output is not None:
             return output
 
         # TODO: Optimize M >= 256 and M <= 1024 dense16 cases in Gluon.
+        if out is not None and out_dtype == A.dtype:
+            output = torch.mm(A, B.T, out=out)
+            if alpha is not None:
+                output.mul_(alpha.to(device=output.device, dtype=output.dtype))
+            return output
+
         output = F.linear(A, B)
         if alpha is not None:
-            output = output * alpha.to(dtype=output.dtype)
+            output.mul_(alpha.to(device=output.device, dtype=output.dtype))
         if output.dtype != out_dtype:
             output = output.to(out_dtype)
+        if out is not None:
+            out.copy_(output)
+            return out
         return output

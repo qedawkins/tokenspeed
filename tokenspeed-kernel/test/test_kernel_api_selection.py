@@ -263,6 +263,12 @@ def _mm_dense_gluon_gfx950() -> torch.Tensor:
     return tokenspeed_kernel.mm(a, b)
 
 
+def _bmm_dense() -> torch.Tensor:
+    a = torch.empty((4, 2, 16), dtype=torch.bfloat16)
+    b = torch.empty((4, 32, 16), dtype=torch.bfloat16)
+    return tokenspeed_kernel.bmm(a, b)
+
+
 def _mm_mxfp8() -> torch.Tensor:
     a = torch.empty((4, 128), dtype=_fp8_dtype())
     b = torch.empty((128, 128), dtype=_fp8_dtype())
@@ -380,6 +386,29 @@ def test_gemm_fp8_scaled_signature_uses_channel_granularity() -> None:
     b = torch.empty((128, 128), dtype=_fp8_dtype())
     a_scales = torch.empty((4,), dtype=torch.float32)
     b_scales = torch.empty((128,), dtype=torch.float32)
+
+    signature = _gemm_pkg._gemm_format_signature(
+        a,
+        b,
+        a_scales,
+        b_scales,
+        torch.bfloat16,
+        "fp8",
+        None,
+    )
+
+    for role in ("a", "b"):
+        tensor_format = signature.format_for(role)
+        assert tensor_format is not None
+        assert tensor_format.scale is not None
+        assert tensor_format.scale.granularity == "channel"
+
+
+def test_bmm_fp8_scaled_signature_uses_channel_granularity() -> None:
+    a = torch.empty((4, 2, 128), dtype=_fp8_dtype())
+    b = torch.empty((4, 32, 128), dtype=_fp8_dtype())
+    a_scales = torch.empty((4, 2), dtype=torch.float32)
+    b_scales = torch.empty((4, 32), dtype=torch.float32)
 
     signature = _gemm_pkg._gemm_format_signature(
         a,
@@ -1185,6 +1214,14 @@ _CASES = [
     # GEMM API x architecture golden cases.
     _case(_is_supported_gpu, "supported-gpu", "gemm", "mm", "torch_mm", _mm_dense),
     _case(
+        _is_supported_gpu,
+        "supported-gpu",
+        "gemm",
+        "bmm",
+        "torch_bmm",
+        _bmm_dense,
+    ),
+    _case(
         _is_cdna4,
         "cdna4",
         "gemm",
@@ -1377,6 +1414,11 @@ def selected_kernel_spy(monkeypatch):
 
         if case.family == "gemm":
             a, b, _a_scales, _b_scales, out_dtype = args[:5]
+            if case.mode == "bmm":
+                n = b.shape[-2]
+                return torch.empty(
+                    (a.shape[0], a.shape[1], n), dtype=out_dtype, device=a.device
+                )
             n = b.shape[-1] if b.shape[0] == a.shape[-1] else b.shape[0]
             return torch.empty((a.shape[0], n), dtype=out_dtype, device=a.device)
 
