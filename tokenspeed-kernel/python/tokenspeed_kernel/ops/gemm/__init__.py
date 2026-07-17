@@ -493,6 +493,9 @@ def bmm(
         "k_align_128": K % 128 == 0,
     }
 
+    # BMM shares MM's advertised quantization surface. FP4 signatures may be
+    # constructed here, but no FP4 BMM backend is registered yet, so
+    # NoKernelFoundError is the expected result until that support is added.
     signature = _gemm_format_signature(
         A, B, A_scales, B_scales, out_dtype, quant, block_size
     )
