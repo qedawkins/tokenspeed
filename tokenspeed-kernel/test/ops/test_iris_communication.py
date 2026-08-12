@@ -280,6 +280,48 @@ def test_iris_all_reduce_correctness_world8():
     _run_ar_test(world_size=8)
 
 
+def _subgroup_ar_worker_fn(rank, world_size, port, error_dict):
+    try:
+        _subgroup_ar_worker_main(rank, world_size, port)
+    except Exception:
+        error_dict[rank] = traceback.format_exc()
+
+
+def _subgroup_ar_worker_main(rank: int, world_size: int, port: int) -> None:
+    device = torch.device(f"cuda:{rank}")
+    torch.cuda.set_device(device)
+    dist.init_process_group(
+        backend="gloo",
+        init_method=f"tcp://localhost:{port}",
+        rank=rank,
+        world_size=world_size,
+    )
+
+    try:
+        from tokenspeed_kernel.ops.communication.iris import create_iris_state
+
+        groups = (
+            dist.new_group((0, 1)),
+            dist.new_group((2, 3)),
+        )
+        subgroup = groups[rank // 2]
+        state = create_iris_state(
+            group=subgroup,
+            rank_in_group=rank % 2,
+            max_numel=8,
+            dtype=torch.bfloat16,
+        )
+        _check_all_reduce(state, rank % 2, 2, (8,), device)
+    finally:
+        dist.destroy_process_group()
+
+
+def test_iris_all_reduce_correctness_disjoint_subgroups_world4():
+    _skip_if_unsupported(4, "Iris subgroup all-reduce tests")
+    port = _get_open_port()
+    _spawn_and_collect(_subgroup_ar_worker_fn, (4, port), 4)
+
+
 # ---------------------------------------------------------------------------
 # Suite 2: IrisRSAG (reduce-scatter / all-gather)
 # ---------------------------------------------------------------------------

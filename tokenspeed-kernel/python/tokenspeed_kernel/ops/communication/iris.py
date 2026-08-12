@@ -359,8 +359,20 @@ class IrisAllReduce(object):
         self._ready_flags = self._ctx.zeros(
             (self._max_blocks, self.world_size), dtype=torch.int32
         )
+        group_ranks = dist.get_process_group_ranks(group)
+        assert group_ranks[rank_in_group] == dist.get_rank(), (
+            f"rank mismatch: rank_in_group={rank_in_group}, "
+            f"group_ranks={group_ranks}, global_rank={dist.get_rank()}"
+        )
+        all_heap_bases = self._ctx.get_heap_bases()
+        group_rank_indices = torch.tensor(
+            group_ranks,
+            dtype=torch.long,
+            device=all_heap_bases.device,
+        )
+        self._heap_bases = all_heap_bases.index_select(0, group_rank_indices)
         self._heap_base_addresses = tuple(
-            int(address) for address in self._ctx.get_heap_bases().tolist()
+            int(address) for address in self._heap_bases.tolist()
         )
         free_gpu_memory_after = _get_available_gpu_memory(torch.cuda.current_device())
         logger.info(
@@ -370,7 +382,7 @@ class IrisAllReduce(object):
 
         self._rank_start = 0
         self._rank_stride = 1
-        self._iris_rank = dist.get_rank()
+        self._iris_rank = rank_in_group
         self._workspace = None
 
     def all_reduce(
@@ -404,7 +416,7 @@ class IrisAllReduce(object):
             in_view.view(-1),
             tensor.view(-1),
             self._ready_flags,
-            self._ctx.get_heap_bases(),
+            self._heap_bases,
             numel,
             RANK=self._iris_rank,
             WORLD_SIZE=self.world_size,
@@ -495,7 +507,7 @@ class IrisAllReduce(object):
                 first.view(-1),
                 second.view(-1),
                 self._ready_flags,
-                self._ctx.get_heap_bases(),
+                self._heap_bases,
                 first_numel,
                 total_numel,
                 RANK=self._iris_rank,
