@@ -26,12 +26,12 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+from tokenspeed_kernel.ops.communication import allreduce_residual_rmsnorm
 from tokenspeed_kernel.ops.communication import triton as triton_communication
 from tokenspeed_kernel.ops.communication.triton import (
     all_gather,
     all_reduce,
     all_reduce_can_run,
-    allreduce_residual_rmsnorm,
     create_state,
     reduce_scatter,
 )

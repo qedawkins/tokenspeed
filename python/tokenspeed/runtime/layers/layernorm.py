@@ -22,20 +22,16 @@
 
 import torch
 import torch.nn as nn
-from tokenspeed_kernel.ops.communication.triton import (
-    allreduce_residual_rmsnorm as triton_allreduce_residual_rmsnorm,
-)
 from tokenspeed_kernel.ops.communication.trtllm import (
     allgather_dual_rmsnorm,
-)
-from tokenspeed_kernel.ops.communication.trtllm import (
-    allreduce_residual_rmsnorm as trtllm_allreduce_residual_rmsnorm,
-)
-from tokenspeed_kernel.ops.communication.trtllm import (
     reducescatter_residual_rmsnorm,
 )
 from tokenspeed_kernel.platform import current_platform
 
+from tokenspeed.runtime.distributed.comm_ops import (
+    ResidualRMSNormEpilogue,
+    all_reduce_with_epilogue,
+)
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
@@ -171,26 +167,22 @@ class RMSNorm(torch.nn.Module):
         if residual is not None:
 
             if len(group) > 1:
-                if _is_amd:
-                    allreduce_residual_rmsnorm = triton_allreduce_residual_rmsnorm
-                else:
-                    if not current_platform().is_nvidia:
-                        raise RuntimeError("Allreduce RMSNorm requires NVIDIA or AMD.")
-                    allreduce_residual_rmsnorm = trtllm_allreduce_residual_rmsnorm
-                fused_result = allreduce_residual_rmsnorm(
-                    input_tensor=x,
-                    residual=residual,
-                    weight=self.weight,
-                    rank=rank,
-                    group=_get_process_group(group),
-                    eps=self.variance_epsilon,
-                    max_token_num=global_server_args_dict["comm_fusion_max_num_tokens"],
-                    block_quant_fp8=fuse_block_quant_fp8,
-                    residual_reduce_scattered=residual_reduce_scattered,
-                    max_sm_to_use=max_sm_to_use,
-                    trigger_completion_at_end=trigger_completion_at_end,
-                    has_partial_norm_out=has_partial_norm_out,
-                    launch_with_pdl=pdl_enabled(),
+                fused_result = all_reduce_with_epilogue(
+                    x,
+                    group,
+                    ResidualRMSNormEpilogue(
+                        residual=residual,
+                        weight=self.weight,
+                        eps=self.variance_epsilon,
+                        max_token_num=global_server_args_dict[
+                            "comm_fusion_max_num_tokens"
+                        ],
+                        block_quant_fp8=fuse_block_quant_fp8,
+                        residual_reduce_scattered=residual_reduce_scattered,
+                        max_sm_to_use=max_sm_to_use,
+                        trigger_completion_at_end=trigger_completion_at_end,
+                        has_partial_norm_out=has_partial_norm_out,
+                    ),
                 )
                 if fused_result[0] is not None:
                     return fused_result
@@ -326,26 +318,22 @@ class GemmaRMSNorm(torch.nn.Module):
         if residual is not None:
 
             if len(group) > 1:
-                if _is_amd:
-                    allreduce_residual_rmsnorm = triton_allreduce_residual_rmsnorm
-                else:
-                    if not current_platform().is_nvidia:
-                        raise RuntimeError("Allreduce RMSNorm requires NVIDIA or AMD.")
-                    allreduce_residual_rmsnorm = trtllm_allreduce_residual_rmsnorm
-                fused_result = allreduce_residual_rmsnorm(
-                    input_tensor=x,
-                    residual=residual,
-                    weight=self.gemma_weight,
-                    rank=rank,
-                    group=_get_process_group(group),
-                    eps=self.variance_epsilon,
-                    max_token_num=global_server_args_dict["comm_fusion_max_num_tokens"],
-                    block_quant_fp8=fuse_block_quant_fp8,
-                    residual_reduce_scattered=residual_reduce_scattered,
-                    max_sm_to_use=max_sm_to_use,
-                    trigger_completion_at_end=trigger_completion_at_end,
-                    has_partial_norm_out=has_partial_norm_out,
-                    launch_with_pdl=pdl_enabled(),
+                fused_result = all_reduce_with_epilogue(
+                    x,
+                    group,
+                    ResidualRMSNormEpilogue(
+                        residual=residual,
+                        weight=self.gemma_weight,
+                        eps=self.variance_epsilon,
+                        max_token_num=global_server_args_dict[
+                            "comm_fusion_max_num_tokens"
+                        ],
+                        block_quant_fp8=fuse_block_quant_fp8,
+                        residual_reduce_scattered=residual_reduce_scattered,
+                        max_sm_to_use=max_sm_to_use,
+                        trigger_completion_at_end=trigger_completion_at_end,
+                        has_partial_norm_out=has_partial_norm_out,
+                    ),
                 )
                 if fused_result[0] is not None:
                     return fused_result

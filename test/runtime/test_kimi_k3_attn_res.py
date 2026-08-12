@@ -9,6 +9,8 @@ kernel build is present) the CUDA kernel must match the torch fallback.
 import os
 import sys
 import unittest
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import torch
 
@@ -53,6 +55,44 @@ def _reference_apply_attn_res(prefix_sum, block_residual, proj, norm):
 
 
 class AttnResTests(unittest.TestCase):
+    def test_attention_reduce_uses_typed_epilogue(self):
+        layer = SimpleNamespace(
+            _attn_ar_residual_fusion=False,
+            _mlp_wp=torch.empty(_HIDDEN),
+            mapping=SimpleNamespace(
+                attn=SimpleNamespace(tp_group=(0, 1)),
+                nprocs_per_node=2,
+            ),
+        )
+        attn_partial = torch.empty(1, _HIDDEN)
+        prefix_sum = torch.empty_like(attn_partial)
+        scratch = (
+            torch.empty(1),
+            torch.empty(1),
+            torch.empty(1, _HIDDEN),
+        )
+        res_weight = torch.empty(_HIDDEN)
+        rms_weight = torch.empty(_HIDDEN)
+        output_weight = torch.empty(_HIDDEN)
+        expected = (torch.empty_like(attn_partial), torch.empty_like(attn_partial))
+        call = Mock(return_value=expected)
+        with patch.object(kimi_k3, "all_reduce_with_epilogue", call):
+            residual, hidden = kimi_k3.KimiLinearDecoderLayer._reduce_attn_accumulate(
+                layer,
+                attn_partial,
+                prefix_sum,
+                (scratch, res_weight, rms_weight, output_weight, _EPS),
+            )
+
+        self.assertIs(residual, expected[1])
+        self.assertIs(hidden, expected[0])
+        epilogue = call.call_args.args[2]
+        self.assertIsInstance(epilogue, kimi_k3.AttnResEpilogue)
+        self.assertIs(epilogue.res_weight, res_weight)
+        self.assertIs(epilogue.rms_weight, rms_weight)
+        self.assertIs(epilogue.combined_score_weight, layer._mlp_wp)
+        self.assertFalse(epilogue.prepared)
+
     def test_torch_fallback_matches_reference(self):
         prefix_sum, block_residual, proj, norm = _make_inputs(17)
         got = torch_attn_res_fwd(

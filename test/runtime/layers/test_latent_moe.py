@@ -104,7 +104,7 @@ def test_kimi3_join_reduce_moe_selects_lane_norm(
     norm.variance_epsilon = 1e-6
     monkeypatch.setattr(
         latent_module,
-        "all_reduce_latent_norm",
+        "all_reduce_with_epilogue",
         lambda value, *_args, **_kwargs: value + 10,
     )
     monkeypatch.setattr(

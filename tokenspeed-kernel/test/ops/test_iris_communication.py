@@ -201,12 +201,12 @@ def _check_all_reduce_residual_attnres(state, rank: int, device) -> None:
         attnres_combine,
         attnres_partial,
     )
-    from tokenspeed_kernel.ops.communication.iris import (
-        iris_all_reduce,
-    )
-    from tokenspeed_kernel.ops.communication.triton import (
+    from tokenspeed_kernel.ops.communication import (
         allreduce_residual_attnres_combine,
         allreduce_residual_attnres_combine_supported,
+    )
+    from tokenspeed_kernel.ops.communication.iris import (
+        iris_all_reduce,
     )
 
     torch.manual_seed(101)
@@ -244,11 +244,16 @@ def _check_all_reduce_residual_attnres(state, rank: int, device) -> None:
         rank=rank,
         group=state.group,
         local_world_size=8,
+        max_token_num=1,
+        enabled=True,
+        prepared=False,
     )
     for _ in range(4):
         actual_hidden, actual_residual = allreduce_residual_attnres_combine(
             local,
             residual,
+            score_weight,
+            score_weight,
             score_weight,
             output_weight,
             scratch,
@@ -256,6 +261,9 @@ def _check_all_reduce_residual_attnres(state, rank: int, device) -> None:
             group=state.group,
             local_world_size=8,
             eps=1e-6,
+            max_token_num=1,
+            enabled=True,
+            prepared=False,
         )
         torch.testing.assert_close(actual_residual, expected_residual, atol=0, rtol=0)
         torch.testing.assert_close(actual_hidden, expected_hidden, atol=2e-2, rtol=2e-2)
@@ -266,12 +274,17 @@ def _check_all_reduce_residual_attnres(state, rank: int, device) -> None:
             local,
             residual,
             score_weight,
+            score_weight,
+            score_weight,
             output_weight,
             scratch,
             rank=rank,
             group=state.group,
             local_world_size=8,
             eps=1e-6,
+            max_token_num=1,
+            enabled=True,
+            prepared=False,
         )
     graph.replay()
     torch.cuda.synchronize()

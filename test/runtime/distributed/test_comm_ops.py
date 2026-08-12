@@ -394,6 +394,51 @@ def _test_fused_ops(rank, world_size, device, group, ref_group):
     )
     torch.testing.assert_close(result2, expected)
 
+    from tokenspeed.runtime.distributed.comm_ops import (
+        ResidualRMSNormEpilogue,
+        all_reduce_with_epilogue,
+    )
+
+    hidden = 128
+    inp = torch.full((2, hidden), rank + 1, dtype=torch.bfloat16, device=device)
+    residual = torch.linspace(
+        -0.5,
+        0.5,
+        inp.numel(),
+        dtype=torch.float32,
+        device=device,
+    ).reshape_as(inp)
+    weight = torch.linspace(
+        0.5,
+        1.5,
+        hidden,
+        dtype=torch.float32,
+        device=device,
+    )
+    norm_out, residual_out, scale, partial = all_reduce_with_epilogue(
+        inp.clone(),
+        group,
+        ResidualRMSNormEpilogue(
+            residual=residual.to(torch.bfloat16),
+            weight=weight,
+            eps=1e-6,
+            max_token_num=8,
+        ),
+    )
+    reduced = inp.float()
+    dist.all_reduce(reduced, group=ref_group)
+    expected_residual = reduced + residual.to(torch.bfloat16).float()
+    expected_norm = expected_residual * torch.rsqrt(
+        expected_residual.square().mean(dim=-1, keepdim=True) + 1e-6
+    )
+    expected_norm *= weight
+    torch.testing.assert_close(
+        residual_out.float(), expected_residual, atol=2e-2, rtol=2e-2
+    )
+    torch.testing.assert_close(norm_out.float(), expected_norm, atol=2e-2, rtol=2e-2)
+    assert scale is None
+    assert partial is None
+
     # fused_reduce_scatter with NONE
     total_sz = 512 * world_size
     inp = torch.randint(1, 16, (total_sz,), dtype=torch.float32, device=device)
@@ -494,6 +539,154 @@ class TestFusionParams:
                 "hidden_dim": 10752,
             }
         ]
+
+
+class TestAllReduceEpilogues:
+    @pytest.fixture(autouse=True)
+    def process_group(self, monkeypatch):
+        from tokenspeed.runtime.distributed import comm_ops
+
+        process_group = SimpleNamespace(rank=lambda: 0)
+        monkeypatch.setattr(
+            comm_ops, "_get_process_group", lambda _group: process_group
+        )
+        return process_group
+
+    def test_residual_rmsnorm_falls_back_as_one_typed_operation(self, monkeypatch):
+        from tokenspeed.runtime.distributed import comm_ops
+
+        monkeypatch.setattr(
+            comm_ops,
+            "allreduce_residual_rmsnorm",
+            lambda **_kwargs: (None, None, None, None),
+        )
+        backend = Mock()
+        reduced = torch.tensor([[1.0, 2.0, 3.0, 4.0]], dtype=torch.bfloat16)
+        backend.all_reduce.return_value = reduced
+        residual = torch.tensor([[0.51, -0.49, 0.53, -0.47]], dtype=torch.bfloat16)
+        weight = torch.tensor([1.0, 1.5, 0.5, 2.0], dtype=torch.bfloat16)
+
+        normalized, residual_out, scale, partial = comm_ops.all_reduce_with_epilogue(
+            torch.zeros_like(reduced),
+            (0, 1),
+            comm_ops.ResidualRMSNormEpilogue(
+                residual=residual,
+                weight=weight,
+                eps=1e-5,
+            ),
+            backend=backend,
+        )
+
+        expected_fp32 = reduced.float() + residual.float()
+        expected_residual = expected_fp32.to(torch.bfloat16)
+        expected_normalized = expected_fp32 * torch.rsqrt(
+            expected_fp32.square().mean(dim=-1, keepdim=True) + 1e-5
+        )
+        expected_normalized = (expected_normalized * weight.float()).to(torch.bfloat16)
+        torch.testing.assert_close(residual_out, expected_residual)
+        torch.testing.assert_close(normalized, expected_normalized)
+        assert scale is None
+        assert partial is None
+
+    def test_latent_norm_fallback_only_normalizes_routed_prefix(self):
+        from tokenspeed.runtime.distributed import comm_ops
+
+        backend = Mock()
+        reduced = torch.tensor([[3.0, 4.0, 7.0, 8.0]])
+        backend.all_reduce.return_value = reduced
+        weight = torch.tensor([2.0, 0.5])
+
+        result = comm_ops.all_reduce_with_epilogue(
+            torch.zeros_like(reduced),
+            (0, 1),
+            comm_ops.LatentRMSNormEpilogue(
+                weight=weight,
+                latent_width=2,
+                eps=1e-6,
+                max_token_num=8,
+            ),
+            backend=backend,
+        )
+
+        expected_routed = comm_ops._rmsnorm(reduced[:, :2], weight, 1e-6)
+        torch.testing.assert_close(result[:, :2], expected_routed)
+        torch.testing.assert_close(result[:, 2:], reduced[:, 2:])
+
+    def test_attnres_uses_specialized_kernel_when_supported(self, monkeypatch):
+        from tokenspeed.runtime.distributed import comm_ops
+
+        expected = (Mock(), Mock())
+        monkeypatch.setattr(
+            comm_ops,
+            "allreduce_residual_attnres_combine_supported",
+            lambda *_args, **_kwargs: True,
+        )
+        fused = Mock(return_value=expected)
+        monkeypatch.setattr(comm_ops, "allreduce_residual_attnres_combine", fused)
+        tensor = torch.empty(1, 4)
+        scratch = (torch.empty(1), torch.empty(1), torch.empty(1, 4))
+        epilogue = comm_ops.AttnResEpilogue(
+            residual=torch.empty_like(tensor),
+            res_weight=torch.empty(4),
+            rms_weight=torch.empty(4),
+            combined_score_weight=torch.empty(4),
+            output_weight=torch.empty(4),
+            scratch=scratch,
+            eps=1e-5,
+            max_token_num=8,
+            local_world_size=8,
+            prepared=True,
+        )
+
+        result = comm_ops.all_reduce_with_epilogue(
+            tensor,
+            tuple(range(8)),
+            epilogue,
+            backend=Mock(),
+        )
+
+        assert result is expected
+        fused.assert_called_once()
+
+    def test_attnres_fallback_reduces_before_combine(self, monkeypatch):
+        from tokenspeed_kernel.ops.activation import triton as activation_triton
+
+        from tokenspeed.runtime.distributed import comm_ops
+
+        monkeypatch.setattr(
+            comm_ops,
+            "allreduce_residual_attnres_combine_supported",
+            lambda *_args, **_kwargs: False,
+        )
+        combine = Mock(side_effect=lambda prefix, *_args: prefix + 1)
+        monkeypatch.setattr(activation_triton, "attnres_combine", combine)
+        backend = Mock()
+        reduced = torch.tensor([[2.0, 3.0]])
+        backend.all_reduce.return_value = reduced
+        residual = torch.tensor([[0.5, 1.5]])
+        weight = torch.empty(2)
+        scratch = (torch.empty(1), torch.empty(1), torch.empty(1, 2))
+
+        hidden, residual_out = comm_ops.all_reduce_with_epilogue(
+            torch.zeros_like(reduced),
+            (0, 1),
+            comm_ops.AttnResEpilogue(
+                residual=residual,
+                res_weight=weight,
+                rms_weight=weight,
+                combined_score_weight=weight,
+                output_weight=weight,
+                scratch=scratch,
+                eps=1e-5,
+                max_token_num=8,
+                local_world_size=8,
+            ),
+            backend=backend,
+        )
+
+        torch.testing.assert_close(residual_out, residual + reduced)
+        torch.testing.assert_close(hidden, residual_out + 1)
+        assert combine.call_args.args[0] is residual_out
 
 
 # ---------------------------------------------------------------------------

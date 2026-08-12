@@ -28,17 +28,15 @@ from functools import partial
 
 import tokenspeed_kernel
 import torch
-from tokenspeed_kernel.ops.communication import (
-    allreduce_lane_latent_norm_supported,
-)
 from tokenspeed_kernel.ops.moe import native_latent_moe_available
 from torch import nn
 
 from tokenspeed.runtime.distributed.comm_ops import (
     COMM_ONESHOT_MAX_BYTES,
+    LatentRMSNormEpilogue,
     all_reduce,
-    all_reduce_latent_norm,
     all_reduce_two,
+    all_reduce_with_epilogue,
     prepare_all_reduce_fusion,
     prepare_all_reduce_lane,
 )
@@ -114,20 +112,23 @@ def kimi3_join_reduce_moe(
     else:
         fused = torch.cat((routed_partial, shared_partial), dim=-1)
 
-    lane_norm_applied = routed_norm is not None and (
-        allreduce_lane_latent_norm_supported(
-            fused,
-            enabled=enable_lane_norm,
-        )
+    lane_norm_applied = (
+        routed_norm is not None
+        and enable_lane_norm
+        and fused.ndim == 2
+        and fused.shape[0] == 1
     )
     if lane_norm_applied:
-        fused = all_reduce_latent_norm(
+        fused = all_reduce_with_epilogue(
             fused,
-            routed_norm.weight,
-            routed_hidden,
             group,
-            eps=routed_norm.variance_epsilon,
-            max_token_num=max_token_num,
+            LatentRMSNormEpilogue(
+                weight=routed_norm.weight,
+                latent_width=routed_hidden,
+                eps=routed_norm.variance_epsilon,
+                max_token_num=max_token_num,
+                prepared=enable_lane_norm,
+            ),
         )
     else:
         fused = all_reduce(fused, group)

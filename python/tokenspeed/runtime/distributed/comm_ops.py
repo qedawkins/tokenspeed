@@ -36,6 +36,9 @@ from tokenspeed_kernel.ops.communication import (
     allreduce_lane_latent_norm as kernel_allreduce_lane_latent_norm,
 )
 from tokenspeed_kernel.ops.communication import (
+    allreduce_lane_latent_norm_supported,
+    allreduce_residual_attnres_combine,
+    allreduce_residual_attnres_combine_supported,
     allreduce_residual_rmsnorm,
 )
 from tokenspeed_kernel.ops.communication import (
@@ -120,6 +123,53 @@ class FusionParams:
     max_sm_to_use: int | None = None
 
 
+@dataclass(frozen=True)
+class ResidualRMSNormEpilogue:
+    """Operands and options for residual addition followed by RMSNorm."""
+
+    residual: torch.Tensor
+    weight: torch.Tensor
+    eps: float = 1e-6
+    max_token_num: int = 2048
+    block_quant_fp8: bool = False
+    residual_reduce_scattered: bool = False
+    has_partial_norm_out: bool = False
+    trigger_completion_at_end: bool = False
+    fp32_acc: bool = False
+    max_sm_to_use: int | None = None
+
+
+@dataclass(frozen=True)
+class LatentRMSNormEpilogue:
+    """RMSNorm parameters for the routed prefix of a reduced latent lane."""
+
+    weight: torch.Tensor
+    latent_width: int
+    eps: float
+    max_token_num: int
+    prepared: bool = False
+
+
+@dataclass(frozen=True)
+class AttnResEpilogue:
+    """Operands for the Kimi-K3 AttnRes combine after an all-reduce."""
+
+    residual: torch.Tensor
+    res_weight: torch.Tensor
+    rms_weight: torch.Tensor
+    combined_score_weight: torch.Tensor
+    output_weight: torch.Tensor
+    scratch: tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+    eps: float
+    max_token_num: int
+    local_world_size: int
+    enabled: bool = True
+    prepared: bool = False
+
+
+AllReduceEpilogue = ResidualRMSNormEpilogue | LatentRMSNormEpilogue | AttnResEpilogue
+
+
 # ---------------------------------------------------------------------------
 # Basic primitives
 # ---------------------------------------------------------------------------
@@ -196,29 +246,181 @@ def prepare_all_reduce_fusion(
         return False
 
 
-def all_reduce_latent_norm(
-    lane: torch.Tensor,
-    norm_weight: torch.Tensor,
-    latent_width: int,
-    group: Group,
-    *,
-    eps: float,
-    max_token_num: int,
-) -> torch.Tensor:
-    """All-reduce a routed/shared lane and RMS-normalize its routed prefix."""
-
-    process_group = _get_process_group(group)
-    return kernel_allreduce_lane_latent_norm(
-        lane,
-        norm_weight,
-        latent_width,
-        rank=process_group.rank(),
-        group=process_group,
-        eps=eps,
-        max_token_num=max_token_num,
-        launch_with_pdl=pdl_enabled(),
-        trigger_completion_at_end=True,
+def _rmsnorm(value: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+    value_fp32 = value.float()
+    normalized = value_fp32 * torch.rsqrt(
+        value_fp32.square().mean(dim=-1, keepdim=True) + eps
     )
+    return (normalized * weight.float()).to(value.dtype)
+
+
+def _residual_rmsnorm_fallback(
+    tensor: torch.Tensor,
+    rank: int,
+    group: Group,
+    backend: CommBackend,
+    epilogue: ResidualRMSNormEpilogue,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+    if epilogue.residual_reduce_scattered:
+        raise RuntimeError(
+            "residual_reduce_scattered requires a fused all-reduce implementation"
+        )
+    reduced = backend.all_reduce(tensor, group)
+    residual_fp32 = reduced.float() + epilogue.residual.float()
+    residual_out = residual_fp32.to(tensor.dtype)
+    normalized = residual_fp32 * torch.rsqrt(
+        residual_fp32.square().mean(dim=-1, keepdim=True) + epilogue.eps
+    )
+    norm_out = (normalized * epilogue.weight.float()).to(tensor.dtype)
+
+    partial_norm_out = None
+    if epilogue.has_partial_norm_out:
+        world_size = len(group)
+        base, remainder = divmod(norm_out.shape[0], world_size)
+        counts = [base + (index < remainder) for index in range(world_size)]
+        start = sum(counts[:rank])
+        partial_norm_out = norm_out[start : start + counts[rank]].contiguous()
+
+    if not epilogue.block_quant_fp8:
+        return norm_out, residual_out, None, partial_norm_out
+
+    from tokenspeed_kernel.ops.gemm.fp8_utils import per_token_group_quant_fp8
+
+    quant_out, scale_out = per_token_group_quant_fp8(
+        norm_out,
+        group_size=128,
+        column_major_scales=True,
+        scale_tma_aligned=True,
+        scale_ue8m0=False,
+    )
+    return quant_out, residual_out, scale_out, partial_norm_out
+
+
+def all_reduce_with_epilogue(
+    tensor: torch.Tensor,
+    group: Group,
+    epilogue: AllReduceEpilogue,
+    backend: CommBackend | None = None,
+) -> torch.Tensor | tuple:
+    """All-reduce ``tensor`` and apply one typed, backend-fusible epilogue.
+
+    Platform kernels may fuse the collective and epilogue. Unsupported calls
+    preserve the same operation through an ordinary all-reduce followed by the
+    descriptor's epilogue.
+
+    Args:
+        tensor: Per-rank partial to all-reduce.
+        group: Global ranks participating in the reduction.
+        epilogue: Typed operands and options for the post-reduction operation.
+        backend: Optional ordinary-collective backend used by fallbacks.
+
+    Returns:
+        The result contract defined by ``epilogue``.
+    """
+
+    if backend is None:
+        backend = get_global_backend()
+    process_group = _get_process_group(group)
+    rank = process_group.rank()
+
+    if isinstance(epilogue, ResidualRMSNormEpilogue):
+        result = allreduce_residual_rmsnorm(
+            input_tensor=tensor,
+            residual=epilogue.residual,
+            weight=epilogue.weight,
+            rank=rank,
+            group=process_group,
+            eps=epilogue.eps,
+            max_token_num=epilogue.max_token_num,
+            block_quant_fp8=epilogue.block_quant_fp8,
+            residual_reduce_scattered=epilogue.residual_reduce_scattered,
+            has_partial_norm_out=epilogue.has_partial_norm_out,
+            trigger_completion_at_end=epilogue.trigger_completion_at_end,
+            fp32_acc=epilogue.fp32_acc,
+            max_sm_to_use=epilogue.max_sm_to_use,
+            launch_with_pdl=pdl_enabled(),
+        )
+        if result[0] is not None:
+            return result
+        return _residual_rmsnorm_fallback(tensor, rank, group, backend, epilogue)
+
+    if isinstance(epilogue, LatentRMSNormEpilogue):
+        if allreduce_lane_latent_norm_supported(
+            tensor,
+            group=process_group,
+            max_token_num=epilogue.max_token_num,
+            prepared=epilogue.prepared,
+        ):
+            return kernel_allreduce_lane_latent_norm(
+                tensor,
+                epilogue.weight,
+                epilogue.latent_width,
+                rank=rank,
+                group=process_group,
+                eps=epilogue.eps,
+                max_token_num=epilogue.max_token_num,
+                launch_with_pdl=pdl_enabled(),
+                trigger_completion_at_end=True,
+            )
+        reduced = backend.all_reduce(tensor, group)
+        return torch.cat(
+            (
+                _rmsnorm(
+                    reduced[:, : epilogue.latent_width],
+                    epilogue.weight,
+                    epilogue.eps,
+                ),
+                reduced[:, epilogue.latent_width :],
+            ),
+            dim=-1,
+        )
+
+    if isinstance(epilogue, AttnResEpilogue):
+        if allreduce_residual_attnres_combine_supported(
+            tensor,
+            epilogue.residual,
+            epilogue.combined_score_weight,
+            epilogue.output_weight,
+            epilogue.scratch,
+            rank=rank,
+            group=process_group,
+            local_world_size=epilogue.local_world_size,
+            max_token_num=epilogue.max_token_num,
+            enabled=epilogue.enabled,
+            prepared=epilogue.prepared,
+        ):
+            return allreduce_residual_attnres_combine(
+                tensor,
+                epilogue.residual,
+                epilogue.res_weight,
+                epilogue.rms_weight,
+                epilogue.combined_score_weight,
+                epilogue.output_weight,
+                epilogue.scratch,
+                rank=rank,
+                group=process_group,
+                local_world_size=epilogue.local_world_size,
+                eps=epilogue.eps,
+                max_token_num=epilogue.max_token_num,
+                enabled=epilogue.enabled,
+                prepared=epilogue.prepared,
+                launch_with_pdl=pdl_enabled(),
+            )
+
+        from tokenspeed_kernel.ops.activation.triton import attnres_combine
+
+        residual_out = epilogue.residual + backend.all_reduce(tensor, group)
+        hidden = attnres_combine(
+            residual_out,
+            epilogue.combined_score_weight,
+            epilogue.output_weight,
+            epilogue.eps,
+            epilogue.scratch,
+            torch.empty_like(residual_out),
+        )
+        return hidden, residual_out
+
+    raise TypeError(f"Unsupported all-reduce epilogue: {type(epilogue).__name__}")
 
 
 def all_gather(
@@ -288,20 +490,22 @@ def fused_all_reduce(
         return backend.all_reduce(tensor, group)
 
     if fusion_params.fusion_op == FusionOp.RESIDUAL_RMS_NORM:
-        return allreduce_residual_rmsnorm(
-            input_tensor=tensor,
-            residual=fusion_params.residual,
-            weight=fusion_params.norm_weight,
-            rank=rank,
-            group=_get_process_group(group),
-            eps=fusion_params.eps,
-            fp32_acc=fusion_params.fp32_acc,
-            block_quant_fp8=fusion_params.block_quant_fp8,
-            residual_reduce_scattered=fusion_params.residual_reduce_scattered,
-            has_partial_norm_out=fusion_params.has_partial_norm_out,
-            trigger_completion_at_end=fusion_params.trigger_completion_at_end,
-            max_sm_to_use=fusion_params.max_sm_to_use,
-            launch_with_pdl=pdl_enabled(),
+        return all_reduce_with_epilogue(
+            tensor,
+            group,
+            ResidualRMSNormEpilogue(
+                residual=fusion_params.residual,
+                weight=fusion_params.norm_weight,
+                eps=fusion_params.eps,
+                max_token_num=fusion_params.max_token_num or 2048,
+                fp32_acc=fusion_params.fp32_acc,
+                block_quant_fp8=fusion_params.block_quant_fp8,
+                residual_reduce_scattered=fusion_params.residual_reduce_scattered,
+                has_partial_norm_out=fusion_params.has_partial_norm_out,
+                trigger_completion_at_end=fusion_params.trigger_completion_at_end,
+                max_sm_to_use=fusion_params.max_sm_to_use,
+            ),
+            backend=backend,
         )
 
     raise ValueError(
