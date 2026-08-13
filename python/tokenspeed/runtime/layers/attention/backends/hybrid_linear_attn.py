@@ -27,6 +27,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
+from tokenspeed_kernel.ops.activation.triton import rmsnorm_gated_sigmoid
 from tokenspeed_kernel.ops.attention import (
     gdn_chunk_prefill,
     gdn_decode_mtp,
@@ -1318,6 +1319,13 @@ class MambaAttnBackend(AttentionBackend):
         f_b_weight = kwargs.get("f_b_weight")
         g_raw = kwargs.get("g_raw")
         beta_raw = kwargs.get("beta_raw")
+        output_gate = kwargs.get("output_gate")
+        norm_weight = kwargs.get("norm_weight")
+        norm_eps = kwargs.get("norm_eps")
+        if output_gate is not None and (norm_weight is None or norm_eps is None):
+            raise ValueError(
+                "norm_weight and norm_eps are required with a KDA output gate"
+            )
         kda_lower_bound = kwargs.get("lower_bound")
         A_log = kwargs["A_log"]
         dt_bias = kwargs["dt_bias"]
@@ -1332,7 +1340,7 @@ class MambaAttnBackend(AttentionBackend):
 
         if self.is_kda and f_a_out is not None:
             num_value_heads = value_dim // attn_tp_size // head_v_dim
-            core_attn_out = try_kda_fused_paged_decode(
+            fused_result = try_kda_fused_paged_decode(
                 mixed_qkv,
                 conv_weights,
                 conv_states,
@@ -1348,9 +1356,24 @@ class MambaAttnBackend(AttentionBackend):
                 head_dim=head_v_dim,
                 cu_seqlens=self.forward_metadata.query_start_loc,
                 lower_bound=kda_lower_bound,
+                output_gate=output_gate,
+                norm_weight=norm_weight,
+                norm_eps=norm_eps,
             )
-            if core_attn_out is not None:
-                return core_attn_out
+            if fused_result is not None:
+                core_attn_out = fused_result.out
+                if fused_result.output_norm_applied or output_gate is None:
+                    return core_attn_out
+                return rmsnorm_gated_sigmoid(
+                    core_attn_out.reshape(
+                        -1, num_value_heads * head_v_dim
+                    ).contiguous(),
+                    output_gate.contiguous(),
+                    norm_weight,
+                    norm_eps,
+                    num_value_heads,
+                    head_v_dim,
+                ).view(1, -1, num_value_heads, head_v_dim)
 
         mixed_qkv = causal_conv1d_update(
             mixed_qkv,
@@ -1390,7 +1413,7 @@ class MambaAttnBackend(AttentionBackend):
             value = value.view(1, seq_len, num_value_heads, head_v_dim)
             g_kda = g_raw.view(1, seq_len, num_value_heads, head_k_dim)
             beta_kda = beta_raw.view(1, seq_len, num_value_heads)
-            return kda_paged_decode(
+            core_attn_out = kda_paged_decode(
                 query,
                 key,
                 value,
@@ -1403,7 +1426,19 @@ class MambaAttnBackend(AttentionBackend):
                 write_indices=state_out_pages,
                 cu_seqlens=query_start_loc,
                 lower_bound=kda_lower_bound,
-            ).squeeze(0)
+            )
+            if output_gate is not None:
+                core_attn_out = rmsnorm_gated_sigmoid(
+                    core_attn_out.reshape(
+                        -1, num_value_heads * head_v_dim
+                    ).contiguous(),
+                    output_gate.contiguous(),
+                    norm_weight,
+                    norm_eps,
+                    num_value_heads,
+                    head_v_dim,
+                ).view(1, -1, num_value_heads, head_v_dim)
+            return core_attn_out.squeeze(0)
 
         (
             decode_initial_indices,
