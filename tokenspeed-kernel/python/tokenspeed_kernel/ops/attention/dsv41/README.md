@@ -16,3 +16,16 @@ retain the explicit gather, row codec and concatenation reference.
 The DSpark workspace producer also accepts deferred RMSNorm weights and epsilon.
 It preserves the BF16 normalization boundary before RoPE and the row codec;
 normalization is applied only to current rows, never cached history.
+
+`rope_weights_inplace` combines the indexer query rotation with its per-head
+projection weight scaling for grids of at most 4096 token-head pairs. Larger
+grids use the ordinary RoPE launch and a separate in-place weight scale: MI355X
+measurements show the extra scalar store ceases to help at 32 heads and 192
+rows and regresses at 257 rows. This shape dispatch keeps runtime row counts
+out of the JIT key. The indexer projections replicate all `index_n_heads`
+heads, so TP4/TP8 both use 32 heads for the current model. Both inputs are
+fresh, owned projection outputs.
+The projection rounds before the scalar multiplication, and that product rounds
+back to the projection dtype before score kernels read it. The operation keeps
+the ordinary `rope_inplace` rotation numerics and handles strided token/head
+views without a layout copy. CPU reference inference retains the separate steps.
