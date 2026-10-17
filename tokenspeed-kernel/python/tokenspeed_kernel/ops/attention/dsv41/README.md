@@ -29,3 +29,9 @@ The projection rounds before the scalar multiplication, and that product rounds
 back to the projection dtype before score kernels read it. The operation keeps
 the ordinary `rope_inplace` rotation numerics and handles strided token/head
 views without a layout copy. CPU reference inference retains the separate steps.
+
+AMD index-query packing writes FP4 values, packed E8M0 scale words, and FP32
+weights directly into dense 32-head scorer inputs. Missing heads are zero in
+all three outputs. Packing reads query and weight strides directly; its FP4
+codes and scale exponents match `cache_pack(..., "index", ...)`, including the
+FP32 multiply by the reciprocal of six before exponent rounding.

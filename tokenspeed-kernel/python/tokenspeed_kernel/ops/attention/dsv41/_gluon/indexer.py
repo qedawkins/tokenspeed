@@ -26,10 +26,9 @@ import torch
 from tokenspeed_kernel.ops.attention.dsv41.triton import (
     _index_gather_heads,
     _index_topk_outputs,
-    cache_pack,
+    pack_index_queries_padded,
 )
 
-_MFMA_HEADS = 32
 _PAGE_SIZE = 64
 # Match the native paged scorer's transient score budget. Heads are gathered
 # once per API chunk; only score/selection work is split at wider histories.
@@ -46,20 +45,7 @@ def _score_query_tile(queries: int, width: int) -> int:
 
 
 def _pack_index_q(q: torch.Tensor, weights: torch.Tensor):
-    tokens, heads, _ = q.shape
-    packed = cache_pack(q.contiguous().reshape(tokens * heads, 128), "index", None)
-    values = packed[:, :64].reshape(tokens, heads, 64)
-    scales = packed[:, 64:68].contiguous().view(torch.int32).reshape(tokens, heads)
-    pad = _MFMA_HEADS - heads
-    if pad < 0:
-        raise ValueError(f"AMD CSA2 MXFP4 indexer supports at most {_MFMA_HEADS} heads")
-    if pad:
-        values = torch.nn.functional.pad(values, (0, 0, 0, pad))
-        scales = torch.nn.functional.pad(scales, (0, pad))
-        weights = torch.nn.functional.pad(weights.float(), (0, pad))
-    else:
-        weights = weights.float()
-    return values.contiguous(), scales.contiguous(), weights.contiguous()
+    return pack_index_queries_padded(q, weights)
 
 
 def _select_sorted(scores: torch.Tensor, k: int, out: torch.Tensor, lens: torch.Tensor):
